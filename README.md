@@ -8,6 +8,18 @@ Nuvi is a native macOS menu-bar dictation app featuring a floating pill, a Metal
 
 Built purely in Swift, AppKit, SwiftUI, AVFoundation, and Metal. No Electron. No Python runtime dependencies.
 
+## Quick Install
+
+You can install Nuvi instantly using Homebrew Cask:
+
+```bash
+brew tap ForLess01/tap
+brew install --cask nuvi
+```
+
+> [!NOTE]
+> **Transcription Models**: Speech-to-text models (such as Apple's native on-device speech models or WhisperKit's CoreML models) are **not** bundled with the app download to keep the size small. They are loaded or downloaded automatically in the background on the first run, meaning no manual setup is required.
+
 ## Demo
 
 <p align="center">
