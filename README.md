@@ -8,6 +8,12 @@ Nuvi is a native macOS menu-bar dictation app featuring a floating pill, a Metal
 
 Built purely in Swift, AppKit, SwiftUI, AVFoundation, and Metal. No Electron. No Python runtime dependencies.
 
+## Demo
+
+<p align="center">
+  <img src="Resources/NUVI_STT.gif" alt="Nuvi Demo" width="100%">
+</p>
+
 ## Verified status
 
 Verified in this repository on **2026-06-16**:

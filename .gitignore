@@ -18,3 +18,7 @@ Thumbs.db
 # Environment files
 .env
 .env.*
+
+# Media / Screen recordings
+*.mov
+*.mp4
