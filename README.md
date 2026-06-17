@@ -43,6 +43,27 @@ Nuvi exposes three engine preferences:
 This matters because older docs in the repo incorrectly said that `auto` was
 the default. It is **not** the default right now; `speechAnalyzer` is.
 
+## Models and offline dictation
+
+Transcription models are **not** bundled directly inside the Git repository to keep the download size lightweight. Instead, Nuvi manages and downloads models dynamically:
+
+- **`speechAnalyzer` (Apple Speech)**: 
+  Uses the native macOS on-device speech recognizer.
+  - **Models used**: Apple's native Siri/Dictation on-device models.
+  - **Setup**: To ensure high-quality offline dictation without internet connectivity, make sure your target language is downloaded locally on your Mac:
+    1. Open **System Settings (Ajustes del Sistema) → Keyboard (Teclado) → Dictation (Dictado)**.
+    2. Turn on Dictation and select/download your preferred languages.
+  
+- **`whisperKit` / `auto`**:
+  Uses CoreML-optimized Whisper models running natively on Apple Silicon.
+  - **Models used**:
+    - **Default**: `openai_whisper-tiny` (Fast, low resource footprint).
+    - **Supported variants**: You can download and run other sizes (such as `base`, `small`, `medium`, or `large`) directly through the application's built-in models manager.
+  - **Setup**: The model is downloaded automatically from Hugging Face the first time you record or when you open the **Models library** in the Settings UI. 
+  - **Cache location**: Models are saved and cached locally in:
+    `~/Library/Application Support/Nuvi/WhisperKit/`
+  - *No manual downloads or terminal installations are required* for the models.
+
 ## Architecture
 
 ```text
@@ -83,27 +104,43 @@ Design intent is hexagonal around the transcription port:
 One correction versus older docs: `AudioCaptureService` is currently a
 **concrete infrastructure service**, not a domain port.
 
-## Build and run
+## Installation and Setup
 
-```bash
-./scripts/build-app.sh release
-open build/Nuvi.app
-```
+### 1. Build and Install
 
-What the script does:
+Nuvi is compiled directly from the source code. Follow these simple steps to install it:
 
-1. Runs `swift build -c release`
-2. Assembles `build/Nuvi.app`
-3. Signs the bundle ad-hoc unless `NUVI_SIGN_IDENTITY` is provided
+1. Clone this repository to your local machine:
+   ```bash
+   git clone git@github.com:ForLess01/Nuvi_STT.git
+   cd Nuvi_STT
+   ```
+2. Build the production app bundle using the release script:
+   ```bash
+   ./scripts/build-app.sh release
+   ```
+3. Open the compiled application:
+   ```bash
+   open build/Nuvi.app
+   ```
+   *Tip: You can drag and drop `Nuvi.app` from the `build` folder into your `/Applications` directory to install it permanently.*
 
-## First-run permissions
+---
 
-Grant in **System Settings → Privacy & Security**:
+### 2. macOS System Permissions
 
-- **Microphone** — required to capture speech
-- **Accessibility** — required to paste into the focused app
+Since Nuvi runs as a menu-bar agent that captures audio and automatically types the transcribed text for you, macOS requires the following permissions to be granted on its first launch:
 
-Without Accessibility, Nuvi falls back to **clipboard-only** insertion.
+- **Microphone (Micrófono)**:
+  - **Why**: Required to capture your voice input for transcription.
+  - **How to grant**: Go to **System Settings (Ajustes del Sistema) → Privacy & Security (Privacidad y Seguridad) → Microphone (Micrófono)** and toggle the switch on for **Nuvi**.
+  
+- **Accessibility (Accesibilidad)**:
+  - **Why**: Required to automatically inject and paste the transcribed text directly at the cursor location of whichever app you are currently using.
+  - **How to grant**: Go to **System Settings (Ajustes del Sistema) → Privacy & Security (Privacidad y Seguridad) → Accessibility (Accesibilidad)** and add/enable **Nuvi** in the allowed applications list.
+  
+> [!NOTE]
+> If you do not grant **Accessibility** permissions, Nuvi will fallback to copying the transcribed text to your **Clipboard** so you can paste it manually.
 
 ## Usage
 
