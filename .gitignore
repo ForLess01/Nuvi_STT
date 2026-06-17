@@ -1,0 +1,20 @@
+# Build artifacts
+.build/
+build/
+.swiftpm/
+*.xcodeproj/
+*.xcworkspace/
+DerivedData/
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Agent & AI tool configurations
+.atl/
+.gemini/
+*.log
+
+# Environment files
+.env
+.env.*
