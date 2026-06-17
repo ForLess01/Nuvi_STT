@@ -47,22 +47,36 @@ the default. It is **not** the default right now; `speechAnalyzer` is.
 
 Transcription models are **not** bundled directly inside the Git repository to keep the download size lightweight. Instead, Nuvi manages and downloads models dynamically:
 
-- **`speechAnalyzer` (Apple Speech)**: 
-  Uses the native macOS on-device speech recognizer.
-  - **Models used**: Apple's native Siri/Dictation on-device models.
-  - **Setup**: To ensure high-quality offline dictation without internet connectivity, make sure your target language is downloaded locally on your Mac:
-    1. Open **System Settings (Ajustes del Sistema) → Keyboard (Teclado) → Dictation (Dictado)**.
-    2. Turn on Dictation and select/download your preferred languages.
-  
-- **`whisperKit` / `auto`**:
-  Uses CoreML-optimized Whisper models running natively on Apple Silicon.
-  - **Models used**:
-    - **Default**: `openai_whisper-tiny` (Fast, low resource footprint).
-    - **Supported variants**: You can download and run other sizes (such as `base`, `small`, `medium`, or `large`) directly through the application's built-in models manager.
-  - **Setup**: The model is downloaded automatically from Hugging Face the first time you record or when you open the **Models library** in the Settings UI. 
-  - **Cache location**: Models are saved and cached locally in:
-    `~/Library/Application Support/Nuvi/WhisperKit/`
-  - *No manual downloads or terminal installations are required* for the models.
+### 1. `speechAnalyzer` (Apple Speech Engine)
+Uses Apple's native `SFSpeechRecognizer` framework.
+* **macOS Compatibility**:
+  - **Requisitos**: Disponible a partir de macOS 10.15 (Catalina).
+  - **On-Device (Offline)**: Para que el reconocimiento sea 100% local, privado y sin conexión a internet, se requiere **Apple Silicon (M1/M2/M3/M4/etc.)** o macOS 12 (Monterey) en adelante con soporte de dictado local activado.
+* **Modelos**: Utiliza los modelos de redes neuronales propietarios de Apple (Siri/Dictation) integrados y optimizados directamente en macOS.
+* **Idiomas y Configuración**:
+  1. Abrí **System Settings (Ajustes del Sistema) → Keyboard (Teclado) → Dictation (Dictado)**.
+  2. Activá el Dictado y seleccioná los idiomas que quieras utilizar. Asegurate de que se descarguen localmente para usarlos sin internet.
+
+### 2. `whisperKit` / `auto` (Whisper Engine)
+Utiliza el framework de código abierto `WhisperKit` de Argmax, ejecutando modelos Whisper de OpenAI optimizados para CoreML (Apple Neural Engine).
+* **macOS Compatibility**:
+  - **Requisitos**: macOS 14.0 (Sonoma) o superior. Altamente recomendado para procesadores Apple Silicon para aprovechar la aceleración por hardware del Neural Engine (ANE).
+* **Modelos Soportados**:
+  - **Predeterminado**: `openai_whisper-tiny` (Transcribe muy rápido con un uso de memoria extremadamente bajo, ~75MB).
+  - **Compatibilidad**: Es compatible con cualquier variante de Whisper oficial de OpenAI optimizada para CoreML por Argmax en formato de 16-bits (Float16) y 8-bits (cuantizado para ANE):
+    - `openai_whisper-tiny` / `openai_whisper-tiny.en`
+    - `openai_whisper-base` / `openai_whisper-base.en`
+    - `openai_whisper-small` / `openai_whisper-small.en`
+    - `openai_whisper-medium` / `openai_whisper-medium.en`
+    - `openai_whisper-large-v2`
+    - `openai_whisper-large-v3` / `openai_whisper-large-v3-turbo`
+* **Instalación y Cache**:
+  - Los modelos se descargan de Hugging Face automáticamente la primera vez que se realiza una transcripción o cuando los seleccionás en la sección **Models library** de los Ajustes.
+  - Se guardan localmente en:
+    `~/Library/Application Support/com.nuvi.app/WhisperKit/`
+  - *No se requiere ninguna acción manual de consola para descargarlos.*
+
+---
 
 ## Architecture
 
