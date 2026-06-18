@@ -14,14 +14,16 @@ final class PillWindowController {
     }
 
     private enum Motion {
-        static let showDuration: TimeInterval = 0.20
-        static let hideDuration: TimeInterval = 0.17
-        static let showStartScale: CGFloat = 0.972
-        static let hideEndScale: CGFloat = 0.988
-        static let visibleNebulaOpacity: Float = 0.82
-        static let hiddenNebulaOpacity: Float = 0
-        static let entranceTiming = CAMediaTimingFunction(controlPoints: 0.18, 0.92, 0.22, 1.0)
-        static let exitTiming = CAMediaTimingFunction(controlPoints: 0.38, 0.0, 0.24, 1.0)
+        static let showDuration: CFTimeInterval = 0.26
+        static let hideDuration: CFTimeInterval = 0.22
+        // Entrance starts narrowed at the left and grows right; exit shrinks back
+        // toward the left. Subtle so it reads as a soft reveal, not a pop.
+        static let startScale: CGFloat = 0.85
+        static let exitScale: CGFloat = 0.93
+        static let nebulaVisible: Float = 0.82
+        // Smooth deceleration in, gentle in-out on the way out — no abrupt cuts.
+        static let entrance = CAMediaTimingFunction(name: .easeOut)
+        static let exit = CAMediaTimingFunction(name: .easeInEaseOut)
     }
 
     private let panel: NSPanel
@@ -50,11 +52,14 @@ final class PillWindowController {
 
         container.wantsLayer = true
         container.layer?.masksToBounds = false
+        container.layer?.opacity = 0   // starts hidden; show() fades it in
         container.autoresizingMask = [.width, .height]
 
         nebulaView.wantsLayer = true
         nebulaView.layer?.masksToBounds = false
-        nebulaView.layer?.opacity = Motion.hiddenNebulaOpacity
+        // The glow is a steady part of the pill; the container's opacity fade
+        // handles show/hide for the whole stack at once.
+        nebulaView.layer?.opacity = Motion.nebulaVisible
 
         hosting.wantsLayer = true
         hosting.layer?.masksToBounds = false
@@ -66,56 +71,112 @@ final class PillWindowController {
 
     func show() {
         animationToken += 1
-        let token = animationToken
 
+        // Size and position before animating. resizeToContent() does an immediate
+        // pass plus a deferred one on the next runloop — the deferred pass is
+        // what re-anchors top-left once SwiftUI commits the real content, so the
+        // pill never settles shifted to the right.
         resizeToContent()
-        positionTopLeft()
-        panel.contentView?.layoutSubtreeIfNeeded()
+        panel.alphaValue = 1
         panel.orderFrontRegardless()
 
-        prepareLayerAnimation(fromScale: Motion.showStartScale,
-                              nebulaOpacity: Motion.hiddenNebulaOpacity)
-        panel.alphaValue = 0
+        guard let layer = container.layer else { return }
 
-        animatePanelAlpha(to: 1, duration: Motion.showDuration, timing: Motion.entranceTiming)
-        animateLayers(duration: Motion.showDuration, timing: Motion.entranceTiming) {
-            self.container.layer?.transform = CATransform3DIdentity
-            self.nebulaView.layer?.opacity = Motion.visibleNebulaOpacity
-        } completion: {
-            guard self.animationToken == token else { return }
-            self.panel.alphaValue = 1
-        }
+        // Continue from whatever is on screen right now (e.g. mid hide-out), so
+        // rapid push-to-talk reversals are seamless instead of snapping.
+        let fromOpacity = layer.presentation()?.opacity ?? layer.opacity
+        let fromTransform = layer.presentation()?.transform ?? leftAnchored(Motion.startScale)
+
+        layer.removeAllAnimations()
+        layer.opacity = 1
+        layer.transform = CATransform3DIdentity
+
+        animate(layer, key: "show",
+                fromOpacity: fromOpacity, toOpacity: 1,
+                fromTransform: fromTransform, toTransform: CATransform3DIdentity,
+                duration: Motion.showDuration, timing: Motion.entrance,
+                completion: nil)
     }
 
     func hide() {
-        guard panel.isVisible else { return }
+        guard panel.isVisible, let layer = container.layer else { return }
         animationToken += 1
         let token = animationToken
 
-        prepareLayerAnimation(fromScale: 1,
-                              nebulaOpacity: Motion.visibleNebulaOpacity)
-        animatePanelAlpha(to: 0, duration: Motion.hideDuration, timing: Motion.exitTiming)
-        animateLayers(duration: Motion.hideDuration, timing: Motion.exitTiming) {
-            self.container.layer?.transform = CATransform3DMakeScale(Motion.hideEndScale, Motion.hideEndScale, 1)
-            self.nebulaView.layer?.opacity = Motion.hiddenNebulaOpacity
-        } completion: {
-            guard self.animationToken == token else { return }
+        let fromOpacity = layer.presentation()?.opacity ?? layer.opacity
+        let fromTransform = layer.presentation()?.transform ?? CATransform3DIdentity
+        let toTransform = leftAnchored(Motion.exitScale)
+
+        layer.removeAllAnimations()
+        layer.opacity = 0
+        layer.transform = toTransform
+
+        animate(layer, key: "hide",
+                fromOpacity: fromOpacity, toOpacity: 0,
+                fromTransform: fromTransform, toTransform: toTransform,
+                duration: Motion.hideDuration, timing: Motion.exit) { [weak self] in
+            guard let self, self.animationToken == token else { return }
             self.panel.orderOut(nil)
-            self.panel.alphaValue = 1
-            self.container.layer?.transform = CATransform3DIdentity
-            self.nebulaView.layer?.opacity = Motion.hiddenNebulaOpacity
         }
     }
 
-    /// Keep the panel hugging the SwiftUI content as the transcript grows.
+    /// A transform that scales `container` while pinning its left edge, so growth
+    /// reads as left-to-right (and shrink as right-to-left). Anchored via a
+    /// translation rather than mutating the layer's anchorPoint, which AppKit
+    /// resets on layer-backed views.
+    private func leftAnchored(_ scale: CGFloat) -> CATransform3D {
+        let width = container.bounds.width
+        let dx = -(width * (1 - scale)) / 2
+        return CATransform3DConcat(CATransform3DMakeScale(scale, scale, 1),
+                                   CATransform3DMakeTranslation(dx, 0, 0))
+    }
+
+    private func animate(_ layer: CALayer, key: String,
+                         fromOpacity: Float, toOpacity: Float,
+                         fromTransform: CATransform3D, toTransform: CATransform3D,
+                         duration: CFTimeInterval, timing: CAMediaTimingFunction,
+                         completion: (() -> Void)?) {
+        let opacity = CABasicAnimation(keyPath: "opacity")
+        opacity.fromValue = fromOpacity
+        opacity.toValue = toOpacity
+
+        let transform = CABasicAnimation(keyPath: "transform")
+        transform.fromValue = NSValue(caTransform3D: fromTransform)
+        transform.toValue = NSValue(caTransform3D: toTransform)
+
+        let group = CAAnimationGroup()
+        group.animations = [opacity, transform]
+        group.duration = duration
+        group.timingFunction = timing
+        group.isRemovedOnCompletion = true
+
+        CATransaction.begin()
+        if let completion { CATransaction.setCompletionBlock(completion) }
+        layer.add(group, forKey: key)
+        CATransaction.commit()
+    }
+
+    /// Keep the panel hugging the SwiftUI content as the transcript grows or a
+    /// notification widens the pill.
+    ///
+    /// Runs once now and once on the next runloop. SwiftUI commits content
+    /// changes asynchronously, so an immediate measure can read a stale (wider)
+    /// layout — sizing to that and letting the hosting view center the real
+    /// content is what made the pill drift right after a notification. The
+    /// deferred pass measures the committed content and re-anchors top-left.
     func resizeToContent() {
+        applyContentSize()
+        DispatchQueue.main.async { [weak self] in self?.applyContentSize() }
+    }
+
+    private func applyContentSize() {
+        hosting.layoutSubtreeIfNeeded()
         let contentSize = hosting.fittingSize
         guard contentSize.width > 0, contentSize.height > 0 else { return }
 
         let padding = Layout.nebulaPadding
         let panelSize = NSSize(width: contentSize.width + padding * 2,
                                height: contentSize.height + padding * 2)
-        let wasVisible = panel.isVisible
         var frame = panel.frame
         frame.size = panelSize
         panel.setFrame(frame, display: true)
@@ -127,7 +188,9 @@ final class PillWindowController {
                                                  dy: -Layout.nebulaVerticalBleed)
         nebulaView.needsDisplay = true
 
-        if wasVisible { positionTopLeft() }
+        // Always re-anchor to the top-left. X is constant, so any width change
+        // grows rightward and the pill never separates from the left margin.
+        positionTopLeft()
     }
 
     private func positionTopLeft() {
@@ -140,38 +203,6 @@ final class PillWindowController {
         panel.setFrameOrigin(origin)
     }
 
-    private func prepareLayerAnimation(fromScale scale: CGFloat, nebulaOpacity: Float) {
-        container.layer?.removeAllAnimations()
-        nebulaView.layer?.removeAllAnimations()
-
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        container.layer?.transform = CATransform3DMakeScale(scale, scale, 1)
-        nebulaView.layer?.opacity = nebulaOpacity
-        CATransaction.commit()
-    }
-
-    private func animatePanelAlpha(to alpha: CGFloat,
-                                   duration: TimeInterval,
-                                   timing: CAMediaTimingFunction) {
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = duration
-            context.timingFunction = timing
-            panel.animator().alphaValue = alpha
-        }
-    }
-
-    private func animateLayers(duration: TimeInterval,
-                               timing: CAMediaTimingFunction,
-                               changes: @escaping () -> Void,
-                               completion: @escaping () -> Void) {
-        CATransaction.begin()
-        CATransaction.setAnimationDuration(duration)
-        CATransaction.setAnimationTimingFunction(timing)
-        CATransaction.setCompletionBlock(completion)
-        changes()
-        CATransaction.commit()
-    }
 }
 
 /// Draws a soft, irregular ambient haze behind the pill.

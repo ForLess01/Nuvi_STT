@@ -8,6 +8,15 @@ Nuvi is a native macOS menu-bar dictation app featuring a floating pill, a Metal
 
 Built purely in Swift, AppKit, SwiftUI, AVFoundation, and Metal. No Electron. No Python runtime dependencies.
 
+## What's new in v2
+
+- **Models Library** — browse, download, select and delete models for **two engines**: Whisper (WhisperKit) and **Parakeet** (FluidAudio). Selecting a model switches the active engine automatically.
+- **English / Spanish interface** — switch the Settings language at runtime (no relaunch) from *Configuration → Interface*.
+- **Ferrofluid visualizer** — fluid/background **color pickers**, curated **presets**, and a **live mic preview** to tune it against your voice.
+- **Home landing** with an app-icon watermark and a real-time view of your configured shortcut; **ferrofluid “N” menu-bar icon**.
+- **Privacy & hardening** — Hardened Runtime signing, history opt-out (`history.json` written `0600`), and password fields never transit the clipboard.
+- **Performance** — the visualizer pauses while the pill is hidden.
+
 ## Quick Install
 
 You can install Nuvi instantly using Homebrew Cask:
@@ -28,11 +37,11 @@ brew install --cask nuvi
 
 ## Verified status
 
-Verified in this repository on **2026-06-16**:
+Verified in this repository on **2026-06-18**:
 
 - `swift build` ✅
-- `./scripts/build-app.sh release` ✅
-- `swift test` ✅ 5 regression tests
+- `./scripts/build-app.sh release` ✅ (Hardened Runtime)
+- `swift test` ✅ 13 regression tests
 
 Important: the repo currently documents some historical engine claims, but it
 does **not** include benchmark artifacts that prove relative WER/speed numbers.
@@ -46,11 +55,12 @@ This README keeps only what is verifiable from the codebase.
 
 ## Current engine behavior
 
-Nuvi exposes three engine preferences:
+Nuvi exposes four engine preferences:
 
 - **`speechAnalyzer`** — current default in `SettingsStore`
 - **`auto`** — `HybridTranscriptionEngine` (SpeechAnalyzer primary, WhisperKit fallback)
 - **`whisperKit`** — direct WhisperKit selection
+- **`parakeet`** — Parakeet TDT via FluidAudio (selected automatically when you activate a Parakeet model in the Models Library)
 
 This matters because older docs in the repo incorrectly said that `auto` was
 the default. It is **not** the default right now; `speechAnalyzer` is.
@@ -87,6 +97,18 @@ Utiliza el framework de código abierto `WhisperKit` de Argmax, ejecutando model
   - Se guardan localmente en:
     `~/Library/Application Support/com.nuvi.app/WhisperKit/`
   - *No se requiere ninguna acción manual de consola para descargarlos.*
+
+### 3. `parakeet` (Parakeet TDT via FluidAudio)
+Uses the open-source `FluidAudio` framework running NVIDIA Parakeet TDT 0.6B models compiled for CoreML — very fast on Apple Silicon, with a small RAM footprint (~200MB in use).
+* **Modelos Soportados**:
+  - **Parakeet TDT v3** — multilingüe (25 idiomas europeos + japonés), ~461 MB en disco.
+  - **Parakeet TDT v2** — optimizado para inglés (mayor recall), ~443 MB en disco.
+* **Instalación y Cache**:
+  - FluidAudio gestiona la descarga; se selecciona desde **Models library** y al activarlo Nuvi cambia el motor a `parakeet` automáticamente.
+  - Se guardan en `~/Library/Application Support/FluidAudio/Models/`.
+
+> [!NOTE]
+> En **Models library** cada modelo muestra su peso real en disco y un consumo de RAM **referencial** (marcado con `~`). La RAM de Parakeet está medida; la de Whisper es una estimación de pico.
 
 ---
 
@@ -179,26 +201,31 @@ Shortcuts are configured in **Settings → Configuration → Keyboard Shortcuts*
 
 ## Implemented features
 
-- Floating pill (`NSPanel`) that stays out of the way of the focused app
-- Live ferrofluid visualizer rendered with Metal
-- Menu-bar control surface
+- Floating pill (`NSPanel`) with a smooth left-to-right fade animation, pinned top-left
+- Live ferrofluid visualizer rendered with Metal — color pickers, presets, and a live mic preview
+- Menu-bar control surface with a ferrofluid "N" icon
 - SpeechAnalyzer adapter
 - WhisperKit adapter
+- Parakeet (FluidAudio) adapter
 - Hybrid engine adapter
+- **Models Library** — download / select / delete models for both engines, with real disk sizes and referential RAM
+- **English / Spanish interface** with runtime switching
 - Vocabulary replacement rules
-- History persistence
+- History persistence (opt-out, owner-only file permissions)
 - Modes with formatting / affixes / optional auto-activation by frontmost app
 - Launch-at-login toggle
-- Shortcut recording, including modifier-only push-to-talk
+- Shortcut recording (full modifier+key combos), including modifier-only push-to-talk
 - Headless probe mode (`Nuvi --probe <audio-file> [locale]`)
 
 ## Known gaps
 
-- Test coverage is still small; the initial regression suite covers vocabulary,
-  mode resolution, retry after engine errors, and cancel-without-delivery
-- WhisperKit currently transcribes in batch after recording stops; it does not
-  stream partials
+- Test coverage is still modest (13 regression tests): vocabulary, mode
+  resolution, retry after engine errors, cancel-without-delivery, the models
+  catalog, and the ferrofluid shader/uniform layout
+- WhisperKit and Parakeet both transcribe in batch after recording stops; they
+  do not stream partials
 - SpeechAnalyzer probe results are machine/asset dependent
+- Model RAM figures are referential: Parakeet is measured, Whisper is estimated
 
 ## Engine verification workflow
 

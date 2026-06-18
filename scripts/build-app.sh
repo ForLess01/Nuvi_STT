@@ -31,6 +31,12 @@ for bundle in "$BIN_PATH"/*.bundle; do
     [ -e "$bundle" ] && cp -R "$bundle" "$APP/Contents/Resources/"
 done
 
+# Also copy the models catalog loose into Resources. SPM's Bundle.module accessor
+# does not look in Contents/Resources, so the app resolves the catalog via
+# Bundle.main instead; this guarantees it's found in the packaged .app.
+CATALOG="$ROOT/Sources/Nuvi/Infrastructure/Settings/ModelsCatalog.json"
+[ -f "$CATALOG" ] && cp "$CATALOG" "$APP/Contents/Resources/ModelsCatalog.json"
+
 # Sign with a STABLE identity so macOS keeps the Microphone / Speech Recognition /
 # Accessibility TCC grants across rebuilds. This is not cosmetic: an ad-hoc signature
 # changes the code identity on every rebuild, which invalidates the Speech Recognition
@@ -54,9 +60,11 @@ else
     echo "==> Signing with identity: $SIGN_ID"
 fi
 
-codesign --force --deep --sign "$SIGN_ID" \
+# --options runtime enables the Hardened Runtime (library-validation, no unsigned
+# code injection) — required for notarization and a real hardening baseline.
+codesign --force --options runtime --deep --sign "$SIGN_ID" \
     --entitlements "$ROOT/Resources/Nuvi.entitlements" \
-    "$APP" 2>/dev/null || codesign --force --deep --sign "$SIGN_ID" "$APP"
+    "$APP" 2>/dev/null || codesign --force --options runtime --deep --sign "$SIGN_ID" "$APP"
 
 # Install into /Applications so `open -a Nuvi` / Spotlight always launch THIS build.
 # Skipping this is how a stale /Applications/Nuvi.app silently shadows new builds.

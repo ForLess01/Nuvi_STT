@@ -6,12 +6,14 @@ public enum EnginePreference: String, CaseIterable, Sendable {
     case auto
     case speechAnalyzer
     case whisperKit
+    case parakeet
 
     public var label: String {
         switch self {
         case .auto: return "Auto (SpeechAnalyzer → WhisperKit)"
         case .speechAnalyzer: return "SpeechAnalyzer (native)"
         case .whisperKit: return "WhisperKit"
+        case .parakeet: return "Parakeet (FluidAudio)"
         }
     }
 }
@@ -27,9 +29,23 @@ public final class SettingsStore: @unchecked Sendable {
         set { defaults.set(newValue, forKey: Keys.locale) }
     }
 
+    /// UI language for the Settings window ("en" | "es"). Empty → follow system
+    /// on first launch.
+    public var interfaceLanguage: String {
+        get { defaults.string(forKey: Keys.interfaceLanguage) ?? "" }
+        set { defaults.set(newValue, forKey: Keys.interfaceLanguage) }
+    }
+
     public var restoreClipboard: Bool {
         get { defaults.object(forKey: Keys.restoreClipboard) as? Bool ?? true }
         set { defaults.set(newValue, forKey: Keys.restoreClipboard) }
+    }
+
+    /// Whether transcriptions are persisted to the on-disk history. Off keeps
+    /// dictated text out of `history.json` entirely (privacy).
+    public var saveHistory: Bool {
+        get { defaults.object(forKey: Keys.saveHistory) as? Bool ?? true }
+        set { defaults.set(newValue, forKey: Keys.saveHistory) }
     }
 
     public var soundEffects: Bool {
@@ -54,6 +70,22 @@ public final class SettingsStore: @unchecked Sendable {
         set { defaults.set(newValue.rawValue, forKey: Keys.engine) }
     }
 
+    public var selectedModelID: String {
+        get { defaults.string(forKey: Keys.selectedModelID) ?? "openai_whisper-tiny" }
+        set { defaults.set(newValue, forKey: Keys.selectedModelID) }
+    }
+
+    /// Parakeet model ids that finished downloading at least once. FluidAudio
+    /// owns its model cache (no documented path), so we track "downloaded" with
+    /// our own persisted flag rather than scanning disk.
+    public var downloadedParakeetModels: Set<String> {
+        get {
+            let array = defaults.stringArray(forKey: Keys.downloadedParakeet) ?? []
+            return Set(array)
+        }
+        set { defaults.set(Array(newValue), forKey: Keys.downloadedParakeet) }
+    }
+
     public func soundPreset(for event: SoundEvent) -> SoundPreset {
         SoundPreset(rawValue: defaults.string(forKey: Keys.soundPreset(event)) ?? "") ?? event.defaultPreset
     }
@@ -64,10 +96,14 @@ public final class SettingsStore: @unchecked Sendable {
 
     private enum Keys {
         static let locale = "nuvi.locale"
+        static let interfaceLanguage = "nuvi.interfaceLanguage"
         static let restoreClipboard = "nuvi.restoreClipboard"
+        static let saveHistory = "nuvi.saveHistory"
         static let engine = "nuvi.engine"
         static let soundEffects = "nuvi.soundEffects"
         static let inputDeviceUID = "nuvi.inputDeviceUID"
+        static let selectedModelID = "nuvi.selectedModelID"
+        static let downloadedParakeet = "nuvi.downloadedParakeetModels"
 
         static func soundPreset(_ event: SoundEvent) -> String {
             "nuvi.sound.\(event.rawValue)"

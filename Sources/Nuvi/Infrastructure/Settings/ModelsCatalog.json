@@ -1,0 +1,89 @@
+[
+  {
+    "id": "openai_whisper-tiny",
+    "name": "Whisper Tiny",
+    "desc": "The fastest and lightest. Ideal for quick dictation on basic machines.",
+    "descEs": "El más rápido y liviano. Ideal para dictados rápidos en equipos básicos.",
+    "engine": "whisperKit",
+    "accuracy": 0.70,
+    "speed": 0.95,
+    "sizeBytes": 76635397,
+    "ramBytes": 262144000,
+    "icon": "bolt.horizontal.fill"
+  },
+  {
+    "id": "openai_whisper-base",
+    "name": "Whisper Base",
+    "desc": "Great balance of footprint and accuracy for everyday use.",
+    "descEs": "Excelente balance entre consumo y precisión para uso diario.",
+    "engine": "whisperKit",
+    "accuracy": 0.80,
+    "speed": 0.85,
+    "sizeBytes": 146719453,
+    "ramBytes": 367001600,
+    "icon": "waveform.path"
+  },
+  {
+    "id": "openai_whisper-small",
+    "name": "Whisper Small",
+    "desc": "Higher accuracy with moderate requirements on Apple Silicon.",
+    "descEs": "Mayor precisión con requerimientos moderados en Apple Silicon.",
+    "engine": "whisperKit",
+    "accuracy": 0.90,
+    "speed": 0.65,
+    "sizeBytes": 486487465,
+    "ramBytes": 838860800,
+    "icon": "sparkles"
+  },
+  {
+    "id": "openai_whisper-medium",
+    "name": "Whisper Medium",
+    "desc": "Outstanding accuracy. Recommended for long, complex transcriptions.",
+    "descEs": "Precisión sobresaliente. Recomendado para transcripciones largas y complejas.",
+    "engine": "whisperKit",
+    "accuracy": 0.96,
+    "speed": 0.40,
+    "sizeBytes": 1529654233,
+    "ramBytes": 2147483648,
+    "icon": "brain.head.profile"
+  },
+  {
+    "id": "openai_whisper-large-v3",
+    "name": "Whisper Large v3",
+    "desc": "Maximum accuracy of the standard model. High resource usage.",
+    "descEs": "Máxima precisión del modelo estándar. Alto consumo de recursos.",
+    "engine": "whisperKit",
+    "accuracy": 0.98,
+    "speed": 0.20,
+    "sizeBytes": 3090319899,
+    "ramBytes": 4080218931,
+    "icon": "cpu.fill"
+  },
+  {
+    "id": "parakeet-tdt-0.6b-v3",
+    "name": "Parakeet TDT v3",
+    "desc": "Multilingual model (25 European languages + Japanese). Extremely fast on Apple Silicon via FluidAudio.",
+    "descEs": "Modelo multilingüe (25 idiomas europeos + japonés). Altísima velocidad en Apple Silicon vía FluidAudio.",
+    "engine": "parakeet",
+    "parakeetVersion": "v3",
+    "accuracy": 0.95,
+    "speed": 0.98,
+    "sizeBytes": 483311616,
+    "ramBytes": 209715200,
+    "icon": "globe",
+    "downloadUrl": null
+  },
+  {
+    "id": "parakeet-tdt-0.6b-v2",
+    "name": "Parakeet TDT v2",
+    "desc": "Optimized for English with the highest recall. Best if you dictate mainly in English.",
+    "descEs": "Optimizado para inglés con el mayor recall. Ideal si dictás principalmente en inglés.",
+    "engine": "parakeet",
+    "parakeetVersion": "v2",
+    "accuracy": 0.96,
+    "speed": 0.98,
+    "sizeBytes": 464413250,
+    "ramBytes": 209715200,
+    "icon": "character.book.closed.fill"
+  }
+]

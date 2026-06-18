@@ -19,6 +19,15 @@ struct Uniforms {
     float viscosity;
     float speed;
     float spikeCount;
+    // Colors as individual floats (not float3) to keep the Swift/Metal struct
+    // layout identical — float3 would force 16-byte alignment and corrupt the
+    // uniform buffer when appended after a run of scalars.
+    float fluidR;
+    float fluidG;
+    float fluidB;
+    float bgR;
+    float bgG;
+    float bgB;
 };
 
 struct VOut {
@@ -173,10 +182,13 @@ fragment float4 nuvi_fragment(VOut in [[stage_in]],
     float ink = smoothstep(1.05 - edgeWidth, 1.05 + edgeWidth, field);
     ink *= smoothstep(0.97, 0.76, distFromCenter);
 
-    // Contact shadow on the backlit white chamber before fluid appears.
+    float3 bgColor = float3(u.bgR, u.bgG, u.bgB);
+    float3 fluidColor = float3(u.fluidR, u.fluidG, u.fluidB);
+
+    // Contact shadow on the backlit chamber before fluid appears.
     float contact = smoothstep(0.20, 1.08, field) * (1.0 - ink);
     float vignette = smoothstep(1.0, 0.15, distFromCenter);
-    float3 chamber = float3(0.965) - vignette * 0.045 - contact * 0.20;
+    float3 chamber = bgColor - vignette * 0.045 - contact * 0.20;
 
     // Surface normal from field derivatives for wet highlights.
     float2 eps = float2(0.010, 0.0);
@@ -192,17 +204,30 @@ fragment float4 nuvi_fragment(VOut in [[stage_in]],
     float specB = pow(max(dot(reflect(-lightB, normal), view), 0.0), 24.0) * 0.24;
 
     float rim = smoothstep(1.10, 1.45, field) * (1.0 - smoothstep(1.48, 2.3, field));
-    float3 fluid = float3(0.010, 0.011, 0.012) + diffuse * 0.10;
-    fluid += (specA + specB) * float3(0.92, 0.96, 1.0);
-    fluid += rim * float3(0.035, 0.038, 0.040) * (0.5 + lvl);
+
+    // Base fluid is the chosen color, lifted slightly by diffuse light. Darker
+    // fluids get a touch more lift so they don't read as a flat silhouette.
+    float fluidLum = dot(fluidColor, float3(0.299, 0.587, 0.114));
+    float darkLift = mix(0.16, 0.06, smoothstep(0.0, 0.5, fluidLum));
+    float3 fluid = fluidColor + diffuse * darkLift;
+
+    // Specular stays near-white but is tinted toward the fluid so colored fluids
+    // keep wet, believable highlights instead of washing out to gray.
+    float3 specTint = mix(float3(0.95, 0.97, 1.0), normalize(fluidColor + 0.001), 0.35);
+    fluid += (specA + specB) * specTint;
+
+    // Rim light picks up the fluid hue so the edge glows in-color.
+    fluid += rim * (fluidColor * 0.35 + 0.03) * (0.6 + lvl);
 
     float3 color = mix(chamber, fluid, ink);
 
-    // Subtle glass/chamber boundary shading.
+    // Subtle glass/chamber boundary shading, scaled by background brightness so
+    // it darkens light chambers without crushing dark ones to black.
+    float bgLum = dot(bgColor, float3(0.299, 0.587, 0.114));
     float rimShade = smoothstep(0.78, 1.0, distFromCenter);
-    color -= rimShade * 0.11;
-    color += smoothstep(0.22, 0.0, length(uv - float2(-0.32, -0.42))) * 0.045;
+    color -= rimShade * mix(0.04, 0.11, smoothstep(0.2, 0.9, bgLum));
+    color += smoothstep(0.22, 0.0, length(uv - float2(-0.32, -0.42))) * 0.045 * (0.3 + bgLum);
 
-    return float4(color, disk);
+    return float4(clamp(color, 0.0, 1.0), disk);
 }
 """

@@ -20,13 +20,16 @@ import WhisperKit
 public final class WhisperKitEngine: TranscriptionEngine, @unchecked Sendable {
     public let identifier = "whisperkit"
 
-    /// Explicit WhisperKit model variant. Keep this deterministic so the app
-    /// does not depend on a remote device-support config before it can even
-    /// start transcribing.
-    private let modelName: String
+    /// Explicit WhisperKit model variant. If not provided, falls back dynamically
+    /// to the model selected in SettingsStore.
+    private let customModelName: String?
+    
+    private var modelName: String {
+        customModelName ?? SettingsStore.shared.selectedModelID
+    }
 
     public init(modelName: String? = nil) {
-        self.modelName = modelName ?? "openai_whisper-tiny"
+        self.customModelName = modelName
     }
 
 #if canImport(WhisperKit)
@@ -55,32 +58,15 @@ public final class WhisperKitEngine: TranscriptionEngine, @unchecked Sendable {
         try await WhisperKit(
             WhisperKitConfig(
                 model: modelName,
-                downloadBase: Self.modelDownloadBase(),
+                downloadBase: ModelStorage.whisperKitBase(),
                 verbose: false,
                 logLevel: .error
             )
         )
     }
 
-    private static func modelDownloadBase() throws -> URL {
-        let manager = FileManager.default
-        let applicationSupport = try manager.url(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: true
-        )
-        let appFolderName = Bundle.main.bundleIdentifier ?? "Nuvi"
-        let downloadBase = applicationSupport
-            .appendingPathComponent(appFolderName, isDirectory: true)
-            .appendingPathComponent("WhisperKit", isDirectory: true)
-
-        try manager.createDirectory(at: downloadBase, withIntermediateDirectories: true)
-        return downloadBase
-    }
-
     private static func resetAppOwnedWhisperCache() throws {
-        let downloadBase = try modelDownloadBase()
+        let downloadBase = try ModelStorage.whisperKitBase()
         if FileManager.default.fileExists(atPath: downloadBase.path) {
             try FileManager.default.removeItem(at: downloadBase)
         }

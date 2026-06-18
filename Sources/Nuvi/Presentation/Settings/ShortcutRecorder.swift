@@ -32,9 +32,11 @@ final class ShortcutRecording: ObservableObject {
     private func handle(_ event: NSEvent) {
         switch event.type {
         case .keyDown:
-            let mods = event.modifierFlags.intersection(KeyCombo.relevantMask)
+            // Merge any modifiers we've been tracking via flagsChanged so a held
+            // ⌘/⌥/⇧/⌃ is always part of the captured combo, not dropped.
+            let mods = event.modifierFlags.union(accumulated).intersection(KeyCombo.relevantMask)
             if event.keyCode == 53 && mods.isEmpty { stop(); return } // Esc cancels
-            onCommit?(KeyCombo(event: event))
+            onCommit?(KeyCombo(event: event, extraModifiers: accumulated))
             stop()
 
         case .flagsChanged:
