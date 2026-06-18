@@ -1,0 +1,83 @@
+[
+  {
+    "id": "openai_whisper-tiny",
+    "name": "Whisper Tiny",
+    "desc": "El más rápido y liviano. Ideal para dictados rápidos en equipos básicos.",
+    "engine": "whisperKit",
+    "accuracy": 0.70,
+    "speed": 0.95,
+    "sizeBytes": 78643200,
+    "ramBytes": 157286400,
+    "icon": "bolt.horizontal.fill"
+  },
+  {
+    "id": "openai_whisper-base",
+    "name": "Whisper Base",
+    "desc": "Excelente balance entre consumo y precisión para uso diario.",
+    "engine": "whisperKit",
+    "accuracy": 0.80,
+    "speed": 0.85,
+    "sizeBytes": 152043520,
+    "ramBytes": 314572800,
+    "icon": "waveform.path"
+  },
+  {
+    "id": "openai_whisper-small",
+    "name": "Whisper Small",
+    "desc": "Mayor precisión con requerimientos moderados en Apple Silicon.",
+    "engine": "whisperKit",
+    "accuracy": 0.90,
+    "speed": 0.65,
+    "sizeBytes": 482344960,
+    "ramBytes": 838860800,
+    "icon": "sparkles"
+  },
+  {
+    "id": "openai_whisper-medium",
+    "name": "Whisper Medium",
+    "desc": "Precisión sobresaliente. Recomendado para transcripciones largas y complejas.",
+    "engine": "whisperKit",
+    "accuracy": 0.96,
+    "speed": 0.40,
+    "sizeBytes": 1572864000,
+    "ramBytes": 2147483648,
+    "icon": "brain.head.profile"
+  },
+  {
+    "id": "openai_whisper-large-v3",
+    "name": "Whisper Large v3",
+    "desc": "Máxima precisión del modelo estándar. Alto consumo de recursos.",
+    "engine": "whisperKit",
+    "accuracy": 0.98,
+    "speed": 0.20,
+    "sizeBytes": 3145728000,
+    "ramBytes": 4294967296,
+    "icon": "cpu.fill"
+  },
+  {
+    "id": "parakeet-tdt-0.6b-v3",
+    "name": "Parakeet TDT v3",
+    "desc": "Modelo multilingüe (25 idiomas europeos + japonés). Altísima velocidad en Apple Silicon vía FluidAudio.",
+    "engine": "parakeet",
+    "parakeetVersion": "v3",
+    "accuracy": 0.95,
+    "speed": 0.98,
+    "sizeBytes": 644245094,
+    "ramBytes": 1610612736,
+    "icon": "globe",
+    "downloadUrl": null
+  },
+  {
+    "id": "parakeet-tdt-0.6b-v2",
+    "name": "Parakeet TDT v2",
+    "desc": "Optimizado para inglés con el mayor recall. Ideal si dictás principalmente en inglés.",
+    "engine": "parakeet",
+    "parakeetVersion": "v2",
+    "accuracy": 0.96,
+    "speed": 0.98,
+    "sizeBytes": 644245094,
+    "ramBytes": 1610612736,
+    "icon": "character.book.closed.fill",
+    "downloadUrl": null
+  }
+]

@@ -10,6 +10,8 @@ public enum TranscriptionEngineFactory {
             return SpeechAnalyzerEngine()
         case .whisperKit:
             return WhisperKitEngine()
+        case .parakeet:
+            return ParakeetEngine()
         case .auto:
             return HybridTranscriptionEngine(
                 primary: SpeechAnalyzerEngine(),
