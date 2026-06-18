@@ -21,9 +21,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     private func configureButton() {
         if let button = statusItem.button {
-            button.image = NSImage(systemSymbolName: "waveform.circle.fill",
-                                   accessibilityDescription: "Nuvi")
-            button.image?.isTemplate = true
+            // The Nuvi mark: a rounded tile with an "N" made of ferrofluid.
+            button.image = FerrofluidBlobImage.menuBarNImage()
         }
     }
 
