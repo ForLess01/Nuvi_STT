@@ -24,9 +24,17 @@ public struct KeyCombo: Codable, Equatable, Sendable {
     }
 
     /// From a recorded key-down event (a normal key, optionally with modifiers).
-    public init(event: NSEvent) {
+    ///
+    /// `extraModifiers` are merged in: the recorder tracks held modifiers via
+    /// `flagsChanged`, and some key-down events don't carry every held modifier
+    /// in `modifierFlags`. Merging guarantees combos like ⌘⇧K are captured whole
+    /// instead of collapsing to a single key.
+    public init(event: NSEvent, extraModifiers: NSEvent.ModifierFlags = []) {
         keyCode = UInt32(event.keyCode)
-        cocoaModifierRaw = event.modifierFlags.intersection(KeyCombo.relevantMask).rawValue
+        let merged = event.modifierFlags
+            .union(extraModifiers)
+            .intersection(KeyCombo.relevantMask)
+        cocoaModifierRaw = merged.rawValue
         keyLabel = KeyCombo.label(for: event)
     }
 
@@ -51,6 +59,19 @@ public struct KeyCombo: Codable, Equatable, Sendable {
         if f.contains(.control) { c |= UInt32(controlKey) }
         if f.contains(.shift)   { c |= UInt32(shiftKey) }
         return c
+    }
+
+    /// Individual keycaps for rendering, e.g. ["⌥", "⇧", "K"] or ["fn"].
+    public var keyCaps: [String] {
+        let f = cocoaModifiers
+        var caps: [String] = []
+        if f.contains(.function) { caps.append("fn") }
+        if f.contains(.control)  { caps.append("⌃") }
+        if f.contains(.option)   { caps.append("⌥") }
+        if f.contains(.shift)    { caps.append("⇧") }
+        if f.contains(.command)  { caps.append("⌘") }
+        if !keyLabel.isEmpty { caps.append(keyLabel) }
+        return caps.isEmpty ? ["—"] : caps
     }
 
     /// Human-readable, e.g. "⌥⇧K", "⌘Space", or "fn".
