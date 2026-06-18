@@ -35,6 +35,9 @@ public final class HistoryStore: ObservableObject {
     }
 
     public func add(_ text: String) {
+        // Respect the privacy setting: when history is off, dictated text is
+        // never stored (not in memory, not on disk).
+        guard SettingsStore.shared.saveHistory else { return }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         entries.insert(HistoryEntry(text: trimmed), at: 0)
@@ -64,6 +67,9 @@ public final class HistoryStore: ObservableObject {
         persistenceQueue.async {
             if let data = try? JSONEncoder().encode(snapshot) {
                 try? data.write(to: url, options: .atomic)
+                // Owner-only permissions: the file holds dictated speech.
+                try? FileManager.default.setAttributes([.posixPermissions: 0o600],
+                                                        ofItemAtPath: url.path)
             }
         }
     }

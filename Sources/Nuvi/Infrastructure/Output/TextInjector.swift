@@ -41,6 +41,23 @@ public enum TextInjector {
         let editable = element.flatMap(editableElement(startingAt:))
         NSLog("Nuvi/inject: focused role=\(role), subrole=\(subrole), editableTarget=\(editable != nil)")
 
+        // Web content (browsers / AXWebArea) FIRST: AX text insertion frequently
+        // reports success but silently does nothing in web inputs (e.g. the
+        // YouTube search box). Trying it first would short-circuit and leave the
+        // user with nothing — not even on the clipboard. So route web straight to
+        // the reliable path: clipboard paste, or direct typing for secure fields.
+        if isWebContext(frontmost: frontmost, focusedRole: role, focusedSubrole: subrole) {
+            if subrole == "AXSecureTextField" {
+                NSLog("Nuvi/inject: secure web field → direct typing")
+                typeUnicode(text)
+            } else {
+                NSLog("Nuvi/inject: web target → clipboard paste")
+                pasteViaClipboard(text, restoreClipboard: restoreClipboard)
+            }
+            return .inserted
+        }
+
+        // Native apps: direct Accessibility insertion where supported.
         if let element, axInsert(element, text) {
             NSLog("Nuvi/inject: direct AX insert")
             return .inserted
@@ -51,21 +68,8 @@ public enum TextInjector {
                 NSLog("Nuvi/inject: direct AX insert via editable ancestor")
                 return .inserted
             }
-
-            if shouldUsePasteFallback(frontmost: frontmost, focusedRole: role, focusedSubrole: subrole) {
-                NSLog("Nuvi/inject: browser/web editable target → clipboard paste")
-                pasteViaClipboard(text, restoreClipboard: restoreClipboard)
-                return .inserted
-            }
-
             NSLog("Nuvi/inject: direct Unicode typing")
             typeUnicode(text)
-            return .inserted
-        }
-
-        if shouldUsePasteFallback(frontmost: frontmost, focusedRole: role, focusedSubrole: subrole) {
-            NSLog("Nuvi/inject: browser/web focus → clipboard paste")
-            pasteViaClipboard(text, restoreClipboard: restoreClipboard)
             return .inserted
         }
 
@@ -156,7 +160,11 @@ public enum TextInjector {
         return ref as? String
     }
 
-    private static func shouldUsePasteFallback(frontmost: String, focusedRole: String, focusedSubrole: String) -> Bool {
+    /// True when the focus is inside web content (a browser app or an AXWebArea),
+    /// where AX text insertion is unreliable. `insert(_:)` decides the actual
+    /// strategy: clipboard paste normally, or direct typing for secure fields so
+    /// a password never transits the pasteboard.
+    private static func isWebContext(frontmost: String, focusedRole: String, focusedSubrole: String) -> Bool {
         if focusedRole == "AXWebArea" || focusedSubrole == "AXWebArea" { return true }
         return browserBundleIdentifiers.contains(frontmost)
     }
