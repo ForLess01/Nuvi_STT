@@ -2,16 +2,23 @@ import SwiftUI
 
 struct ModelsLibraryView: View {
     @ObservedObject private var downloadService = ModelDownloadService.shared
+    @ObservedObject private var loc = LocalizationStore.shared
     @State private var selectedFilter: FilterType = .all
     @State private var activeModelId: String = SettingsStore.shared.selectedModelID
 
     enum FilterType: String, CaseIterable, Identifiable {
-        case all = "Todos"
-        case whisper = "Whisper"
-        case parakeet = "Parakeet"
-        case downloaded = "Descargados"
+        case all, whisper, parakeet, downloaded
 
-        var id: String { self.rawValue }
+        var id: String { rawValue }
+
+        var label: String {
+            switch self {
+            case .all: return tr("All", "Todos")
+            case .whisper: return "Whisper"
+            case .parakeet: return "Parakeet"
+            case .downloaded: return tr("Downloaded", "Descargados")
+            }
+        }
     }
 
     var filteredModels: [AppModel] {
@@ -33,7 +40,7 @@ struct ModelsLibraryView: View {
         VStack(alignment: .leading, spacing: 16) {
             // Cabecera: Título y Selector de Filtros
             HStack {
-                Text("Biblioteca de Modelos")
+                Text(tr("Models Library", "Biblioteca de Modelos"))
                     .font(.title2)
                     .bold()
 
@@ -41,7 +48,7 @@ struct ModelsLibraryView: View {
 
                 Picker("", selection: $selectedFilter) {
                     ForEach(FilterType.allCases) { filter in
-                        Text(filter.rawValue).tag(filter)
+                        Text(filter.label).tag(filter)
                     }
                 }
                 .pickerStyle(.segmented)
@@ -49,7 +56,8 @@ struct ModelsLibraryView: View {
             }
 
             // Descripción general
-            Text("Elegí el motor y modelo que mejor se adapte a tu flujo. Whisper (OpenAI) ofrece variantes de mayor precisión a más costo; Parakeet (FluidAudio) prioriza velocidad multilingüe. Al activar un modelo, Nuvi cambia automáticamente al motor correspondiente.")
+            Text(tr("Choose the engine and model that fit your workflow. Whisper (OpenAI) offers higher-accuracy variants at more cost; Parakeet (FluidAudio) prioritizes multilingual speed. Activating a model switches Nuvi to its engine automatically.",
+                    "Elegí el motor y modelo que mejor se adapte a tu flujo. Whisper (OpenAI) ofrece variantes de mayor precisión a más costo; Parakeet (FluidAudio) prioriza velocidad multilingüe. Al activar un modelo, Nuvi cambia automáticamente al motor correspondiente."))
                 .font(.subheadline)
                 .foregroundColor(.secondary)
 

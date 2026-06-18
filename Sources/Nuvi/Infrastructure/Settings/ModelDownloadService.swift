@@ -18,7 +18,10 @@ public enum ModelEngine: String, Codable, Equatable {
 public struct AppModel: Identifiable, Codable, Equatable {
     public var id: String
     public var name: String
+    /// English description.
     public var desc: String
+    /// Spanish description; falls back to `desc` when absent.
+    public var descEs: String?
     public var engine: ModelEngine
     public var accuracy: Double
     public var speed: Double
@@ -31,10 +34,15 @@ public struct AppModel: Identifiable, Codable, Equatable {
     /// FluidAudio model version ("v2" | "v3"). Only set for Parakeet models.
     public var parakeetVersion: String?
 
+    /// Description in the requested language; English when no Spanish is set.
+    public func localizedDesc(spanish: Bool) -> String {
+        spanish ? (descEs ?? desc) : desc
+    }
+
     // Backwards-compatible default so older JSON without an `engine` key still
     // decodes as a WhisperKit model.
     enum CodingKeys: String, CodingKey {
-        case id, name, desc, engine, accuracy, speed, sizeBytes, ramBytes, icon, downloadUrl, parakeetVersion
+        case id, name, desc, descEs, engine, accuracy, speed, sizeBytes, ramBytes, icon, downloadUrl, parakeetVersion
     }
 
     public init(from decoder: Decoder) throws {
@@ -42,6 +50,7 @@ public struct AppModel: Identifiable, Codable, Equatable {
         id = try c.decode(String.self, forKey: .id)
         name = try c.decode(String.self, forKey: .name)
         desc = try c.decode(String.self, forKey: .desc)
+        descEs = try c.decodeIfPresent(String.self, forKey: .descEs)
         engine = try c.decodeIfPresent(ModelEngine.self, forKey: .engine) ?? .whisperKit
         accuracy = try c.decode(Double.self, forKey: .accuracy)
         speed = try c.decode(Double.self, forKey: .speed)
@@ -52,12 +61,13 @@ public struct AppModel: Identifiable, Codable, Equatable {
         parakeetVersion = try c.decodeIfPresent(String.self, forKey: .parakeetVersion)
     }
 
-    public init(id: String, name: String, desc: String, engine: ModelEngine,
+    public init(id: String, name: String, desc: String, descEs: String? = nil, engine: ModelEngine,
                 accuracy: Double, speed: Double, sizeBytes: Int64, ramBytes: Int64,
                 icon: String, downloadUrl: String? = nil, parakeetVersion: String? = nil) {
         self.id = id
         self.name = name
         self.desc = desc
+        self.descEs = descEs
         self.engine = engine
         self.accuracy = accuracy
         self.speed = speed

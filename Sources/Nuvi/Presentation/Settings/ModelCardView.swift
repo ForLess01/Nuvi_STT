@@ -20,6 +20,7 @@ struct ModelCardView: View {
     let onDelete: () -> Void
 
     @State private var showDeleteConfirmation = false
+    @ObservedObject private var loc = LocalizationStore.shared
 
     private var isWhisper: Bool { model.engine == .whisperKit }
     private var accentColor: Color { isWhisper ? .blue : .purple }
@@ -55,7 +56,7 @@ struct ModelCardView: View {
                             .cornerRadius(4)
                     }
                     
-                    Text(model.desc)
+                    Text(model.localizedDesc(spanish: loc.language == .spanish))
                         .font(.subheadline)
                         .foregroundColor(.secondary)
                         .lineLimit(2)
@@ -74,28 +75,28 @@ struct ModelCardView: View {
             // Estadísticas: Precisión y Velocidad en barras
             VStack(spacing: 12) {
                 metricBar(
-                    title: "Precisión",
+                    title: tr("Accuracy", "Precisión"),
                     value: model.accuracy,
                     valueText: String(format: "%.0f%%", model.accuracy * 100),
                     gradient: Gradient(colors: [.yellow, .green])
                 )
-                
+
                 metricBar(
-                    title: "Velocidad",
+                    title: tr("Speed", "Velocidad"),
                     value: model.speed,
                     valueText: String(format: "%.1fx RT", model.speed * 10),
                     gradient: Gradient(colors: [.blue, .cyan])
                 )
             }
-            
-            // Footer: RAM, Tamaño en disco y botón eliminar
+
+            // Footer: RAM, disk size and delete button
             HStack {
-                Text("RAM: \(formatBytes(model.ramBytes))  •  Disco: \(formatBytes(model.sizeBytes))")
+                Text("RAM: ~\(formatBytes(model.ramBytes))  •  \(tr("Disk", "Disco")): \(formatBytes(model.sizeBytes))")
                     .font(.system(size: 10))
                     .foregroundColor(.secondary)
-                
+
                 Spacer()
-                
+
                 if isDownloaded && !isActive {
                     Button(action: { showDeleteConfirmation = true }) {
                         Image(systemName: "trash")
@@ -103,15 +104,15 @@ struct ModelCardView: View {
                             .font(.system(size: 11))
                     }
                     .buttonStyle(.plain)
-                    .help("Eliminar del disco")
+                    .help(tr("Delete from disk", "Eliminar del disco"))
                     .alert(isPresented: $showDeleteConfirmation) {
                         Alert(
-                            title: Text("¿Eliminar modelo?"),
-                            message: Text("¿Seguro que querés eliminar el modelo '\(model.name)' del almacenamiento local?"),
-                            primaryButton: .destructive(Text("Eliminar")) {
+                            title: Text(tr("Delete model?", "¿Eliminar modelo?")),
+                            message: Text(tr("Remove '\(model.name)' from local storage?", "¿Seguro que querés eliminar el modelo '\(model.name)' del almacenamiento local?")),
+                            primaryButton: .destructive(Text(tr("Delete", "Eliminar"))) {
                                 onDelete()
                             },
-                            secondaryButton: .cancel(Text("Cancelar"))
+                            secondaryButton: .cancel(Text(tr("Cancel", "Cancelar")))
                         )
                     }
                 }
@@ -163,7 +164,7 @@ struct ModelCardView: View {
                 HStack(spacing: 4) {
                     Image(systemName: "checkmark.circle.fill")
                         .foregroundColor(.green)
-                    Text("Activo")
+                    Text(tr("Active", "Activo"))
                         .font(.system(size: 11, weight: .bold))
                         .foregroundColor(.green)
                 }
@@ -173,7 +174,7 @@ struct ModelCardView: View {
                 .cornerRadius(8)
             } else {
                 Button(action: onSelect) {
-                    Text("Usar")
+                    Text(tr("Use", "Usar"))
                         .font(.system(size: 11, weight: .bold))
                         .foregroundColor(.primary)
                         .padding(.horizontal, 12)
@@ -187,7 +188,7 @@ struct ModelCardView: View {
             Button(action: onDownload) {
                 HStack(spacing: 4) {
                     Image(systemName: "arrow.down.to.line")
-                    Text("Descargar")
+                    Text(tr("Download", "Descargar"))
                 }
                 .font(.system(size: 11, weight: .bold))
                 .foregroundColor(.black)

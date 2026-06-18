@@ -29,6 +29,13 @@ public final class SettingsStore: @unchecked Sendable {
         set { defaults.set(newValue, forKey: Keys.locale) }
     }
 
+    /// UI language for the Settings window ("en" | "es"). Empty → follow system
+    /// on first launch.
+    public var interfaceLanguage: String {
+        get { defaults.string(forKey: Keys.interfaceLanguage) ?? "" }
+        set { defaults.set(newValue, forKey: Keys.interfaceLanguage) }
+    }
+
     public var restoreClipboard: Bool {
         get { defaults.object(forKey: Keys.restoreClipboard) as? Bool ?? true }
         set { defaults.set(newValue, forKey: Keys.restoreClipboard) }
@@ -89,6 +96,7 @@ public final class SettingsStore: @unchecked Sendable {
 
     private enum Keys {
         static let locale = "nuvi.locale"
+        static let interfaceLanguage = "nuvi.interfaceLanguage"
         static let restoreClipboard = "nuvi.restoreClipboard"
         static let saveHistory = "nuvi.saveHistory"
         static let engine = "nuvi.engine"
