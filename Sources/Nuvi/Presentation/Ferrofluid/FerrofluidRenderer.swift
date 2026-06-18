@@ -27,6 +27,12 @@ final class FerrofluidRenderer: NSObject, MTKViewDelegate {
         var viscosity: Float
         var speed: Float
         var spikeCount: Float
+        var fluidR: Float
+        var fluidG: Float
+        var fluidB: Float
+        var bgR: Float
+        var bgG: Float
+        var bgB: Float
     }
 
     init?(mtkView: MTKView) {
@@ -98,7 +104,13 @@ final class FerrofluidRenderer: NSObject, MTKViewDelegate {
             spikiness: settings.spikiness,
             viscosity: settings.viscosity,
             speed: settings.speed,
-            spikeCount: settings.spikeCount
+            spikeCount: settings.spikeCount,
+            fluidR: settings.fluidColor.r,
+            fluidG: settings.fluidColor.g,
+            fluidB: settings.fluidColor.b,
+            bgR: settings.backgroundColor.r,
+            bgG: settings.backgroundColor.g,
+            bgB: settings.backgroundColor.b
         )
 
         encoder.setRenderPipelineState(pipeline)
