@@ -112,6 +112,35 @@ Uses the open-source `FluidAudio` framework running NVIDIA Parakeet TDT 0.6B mod
 
 ---
 
+## Releasing (free, via Homebrew)
+
+Nuvi is **not notarized** — notarization needs a paid Apple Developer Program
+membership, and Nuvi stays free. That's fine for a Homebrew tap; it just means
+macOS Gatekeeper flags the app on first launch, which the user clears once.
+
+To cut a release:
+
+1. Build the app bundle and zip it:
+   ```bash
+   ./scripts/build-app.sh release
+   ditto -c -k --sequesterRsrc --keepParent build/Nuvi.app build/Nuvi.zip
+   shasum -a 256 build/Nuvi.zip   # note the sha256
+   ```
+2. Create the GitHub release with `build/Nuvi.zip` attached (tag `vX.Y.Z`).
+3. Update `version` and `sha256` in `Casks/nuvi.rb` of the `ForLess01/homebrew-tap` repo.
+
+### First launch (clearing Gatekeeper, free)
+
+Because the app isn't notarized, after `brew install --cask nuvi` macOS may say
+it "cannot be opened". Clear the download quarantine once:
+
+```bash
+xattr -dr com.apple.quarantine "/Applications/Nuvi.app"
+```
+
+…or right-click **Nuvi.app → Open → Open**. The Homebrew cask prints this hint
+automatically after install.
+
 ## Architecture
 
 ```text
