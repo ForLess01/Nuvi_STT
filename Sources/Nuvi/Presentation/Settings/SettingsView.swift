@@ -1,5 +1,6 @@
 import SwiftUI
 import ServiceManagement
+import AppKit
 
 /// Sidebar sections, mirroring SuperWhisper's layout. Functional panels are
 /// built; the rest are honest "coming soon" placeholders so navigation matches.
@@ -57,8 +58,13 @@ struct SettingsView: View {
             }
             .navigationSplitViewColumnWidth(min: 190, ideal: 200, max: 240)
         } detail: {
-            ScrollView { detail.padding(24) }
-                .background(NuviTheme.background)
+            if selection == .models {
+                ModelsLibraryView()
+                    .background(NuviTheme.background)
+            } else {
+                ScrollView { detail.padding(24) }
+                    .background(NuviTheme.background)
+            }
         }
         .frame(width: 780, height: 580)
         .preferredColorScheme(.dark)
@@ -74,7 +80,7 @@ struct SettingsView: View {
         case .history: HistoryPanel()
         case .modes: ModesPanel()
         case .sound: SoundPanel()
-        default: ComingSoonPanel(title: selection.rawValue)
+        case .models: EmptyView()
         }
     }
 }
@@ -97,17 +103,50 @@ private struct PanelScaffold<Content: View>: View {
 // MARK: - Home
 
 private struct HomePanel: View {
+    private var appVersion: String {
+        let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.0"
+        return "v\(v)"
+    }
+
     var body: some View {
         PanelScaffold(title: "Home") {
-            Text("Press ⌥ Space anywhere to start dictating. The pill appears top-left and the ferrofluid reacts to your voice.")
-                .font(.system(size: 13))
-                .foregroundStyle(.secondary)
+            // Landing hero
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(alignment: .firstTextBaseline, spacing: 10) {
+                    Text("Nuvi")
+                        .font(.system(size: 34, weight: .bold))
+                    Text(appVersion)
+                        .font(.system(size: 11, weight: .semibold))
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(Color.white.opacity(0.08))
+                        .cornerRadius(6)
+                        .foregroundStyle(.secondary)
+                }
+                Text("Hands-free dictation, anywhere. Press ⌥ Space to start — the pill appears top-left and the ferrofluid reacts to your voice.")
+                    .font(.system(size: 13))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.bottom, 4)
 
             SectionHeader(text: "Shortcuts")
             Card {
                 SettingRow(title: "Toggle dictation") { Shortcut(keys: ["⌥", "Space"]) }
                 RowDivider()
                 SettingRow(title: "Cancel") { Shortcut(keys: ["esc"]) }
+            }
+
+            SectionHeader(text: "Connect")
+            Card {
+                Link(destination: URL(string: "https://github.com/forless01")!) {
+                    SettingRow(title: "GitHub", subtitle: "@forless01") {
+                        Image(systemName: "arrow.up.right")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .buttonStyle(.plain)
             }
         }
     }
@@ -118,6 +157,7 @@ private struct HomePanel: View {
 private struct ConfigurationPanel: View {
     @State private var locale = SettingsStore.shared.localeIdentifier
     @State private var restoreClipboard = SettingsStore.shared.restoreClipboard
+    @State private var saveHistory = SettingsStore.shared.saveHistory
     @State private var inputDeviceUID = SettingsStore.shared.inputDeviceUID
     @State private var inputDevices = AudioInputDevice.inputDevices()
     @State private var launchAtLogin = (SMAppService.mainApp.status == .enabled)
@@ -180,6 +220,15 @@ private struct ConfigurationPanel: View {
                 SettingRow(title: "Restore clipboard after pasting") {
                     Toggle("", isOn: $restoreClipboard).labelsHidden()
                         .onChange(of: restoreClipboard) { _, new in SettingsStore.shared.restoreClipboard = new }
+                }
+                RowDivider()
+                SettingRow(title: "Save dictation history",
+                           subtitle: "Off keeps transcribed text off disk and clears existing history") {
+                    Toggle("", isOn: $saveHistory).labelsHidden()
+                        .onChange(of: saveHistory) { _, new in
+                            SettingsStore.shared.saveHistory = new
+                            if !new { HistoryStore.shared.clear() }
+                        }
                 }
                 RowDivider()
                 SettingRow(title: "Launch at login",
@@ -261,6 +310,7 @@ private struct ConfigurationPanel: View {
 
 private struct AppearancePanel: View {
     @ObservedObject private var store = FerrofluidSettingsStore.shared
+    @StateObject private var mic = FerrofluidMicProbe()
 
     var body: some View {
         PanelScaffold(title: "Appearance") {
@@ -269,6 +319,13 @@ private struct AppearancePanel: View {
                 HStack(alignment: .top, spacing: 28) {
                     preview
                     VStack(alignment: .leading, spacing: 14) {
+                        presetRow
+                        RowDivider()
+                        ColorPicker("Fluid color", selection: colorBinding(\.fluidColor), supportsOpacity: false)
+                            .font(.system(size: 12))
+                        ColorPicker("Background", selection: colorBinding(\.backgroundColor), supportsOpacity: false)
+                            .font(.system(size: 12))
+                        RowDivider()
                         slider("Core size", value: $store.settings.coreSize, range: 0.05...0.4)
                         slider("Reach", value: $store.settings.reach, range: 0.1...1.2)
                         slider("Spikiness", value: $store.settings.spikiness, range: 1...8)
@@ -284,15 +341,67 @@ private struct AppearancePanel: View {
         }
     }
 
-    private var preview: some View {
-        ZStack {
-            Circle().fill(Color.white)
-            FerrofluidView(level: 0, settings: store.settings, simulate: true)
-                .clipShape(Circle())
+    private var presetRow: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Presets")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
+            HStack(spacing: 6) {
+                ForEach(FerrofluidSettings.presets) { preset in
+                    Button(preset.name) { store.settings = preset.settings }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                }
+            }
         }
-        .frame(width: 150, height: 150)
-        .overlay(Circle().strokeBorder(.white.opacity(0.12), lineWidth: 1))
-        .shadow(color: .black.opacity(0.4), radius: 8, y: 2)
+    }
+
+    /// Bridges a stored `RGBColor` to SwiftUI's `Color` for the ColorPicker,
+    /// resolving the picked color in sRGB so it matches the shader uniforms.
+    private func colorBinding(_ keyPath: WritableKeyPath<FerrofluidSettings, RGBColor>) -> Binding<Color> {
+        Binding(
+            get: {
+                let c = store.settings[keyPath: keyPath]
+                return Color(.sRGB, red: Double(c.r), green: Double(c.g), blue: Double(c.b))
+            },
+            set: { newValue in
+                let ns = NSColor(newValue).usingColorSpace(.sRGB) ?? .black
+                store.settings[keyPath: keyPath] = RGBColor(
+                    Float(ns.redComponent), Float(ns.greenComponent), Float(ns.blueComponent))
+            }
+        )
+    }
+
+    private var preview: some View {
+        VStack(spacing: 10) {
+            ZStack {
+                Circle().fill(Color.white)
+                FerrofluidView(level: mic.active ? mic.level : 0,
+                               settings: store.settings,
+                               simulate: !mic.active)
+                    .clipShape(Circle())
+            }
+            .frame(width: 150, height: 150)
+            .overlay(Circle().strokeBorder(.white.opacity(0.12), lineWidth: 1))
+            .shadow(color: .black.opacity(0.4), radius: 8, y: 2)
+
+            Button { mic.toggle() } label: {
+                Label(mic.active ? "Stop mic" : "Test with mic",
+                      systemImage: mic.active ? "mic.slash.fill" : "mic.fill")
+                    .font(.system(size: 12))
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .tint(mic.active ? .red : .accentColor)
+
+            if mic.denied {
+                Text("Microphone access denied.\nEnable it in System Settings.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+        }
+        .onDisappear { mic.stop() }
     }
 
     private func slider(_ title: String, value: Binding<Float>,
