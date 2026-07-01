@@ -41,6 +41,14 @@ public enum TextInjector {
         let editable = element.flatMap(editableElement(startingAt:))
         NSLog("Nuvi/inject: focused role=\(role), subrole=\(subrole), editableTarget=\(editable != nil)")
 
+        if isAIEditorTarget(frontmost), let element {
+            if axValueInsertVerified(element, text, insertion: .appendToEnd) {
+                return .inserted
+            }
+            pasteViaClipboard(text, restoreClipboard: restoreClipboard)
+            return .inserted
+        }
+
         // Web content (browsers / AXWebArea) FIRST: AX text insertion frequently
         // reports success but silently does nothing in web inputs (e.g. the
         // YouTube search box). Trying it first would short-circuit and leave the
@@ -120,6 +128,121 @@ public enum TextInjector {
         return AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString, text as CFString) == .success
     }
 
+    private enum AXValueInsertion {
+        case selectedRange
+        case appendToEnd
+    }
+
+    private static func axValueInsertVerified(_ element: AXUIElement, _ text: String, insertion: AXValueInsertion = .selectedRange) -> Bool {
+        var settable = DarwinBoolean(false)
+        guard AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &settable) == .success,
+              settable.boolValue else {
+            return false
+        }
+
+        let rawBefore = stringAttribute(element, kAXValueAttribute as String) ?? ""
+        let ghostTexts = editorGhostTexts(startingAt: element)
+        let before = editableValueRemovingGhostText(rawBefore, ghostTexts: ghostTexts)
+        let range = insertion == .appendToEnd || before.isEmpty ? nil : selectedTextRange(of: element)
+        let replacement = replacingSelection(in: before, range: range, with: text)
+        let next = replacement.value
+
+        let status = AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, next as CFString)
+        guard status == .success else {
+            return false
+        }
+
+        usleep(80_000)
+        let rawAfter = stringAttribute(element, kAXValueAttribute as String) ?? ""
+        let after = editableValueRemovingGhostText(rawAfter, ghostTexts: ghostTexts)
+        if rawAfter != after {
+            _ = AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, after as CFString)
+        }
+        let verified = after == next || after.contains(text)
+        if verified {
+            moveCaret(of: element, to: replacement.caretLocation, in: after.isEmpty ? next : after)
+        }
+        return verified
+    }
+
+    private static func editableValueRemovingGhostText(_ value: String, ghostTexts: Set<String>) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return "" }
+        if ghostTexts.contains(trimmed) { return "" }
+
+        var lines = value.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        var removedGhostLine = false
+        while let last = lines.last {
+            let trimmedLine = last.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard ghostTexts.contains(trimmedLine) else { break }
+            lines.removeLast()
+            removedGhostLine = true
+        }
+
+        guard removedGhostLine else { return value }
+        return lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func editorGhostTexts(startingAt element: AXUIElement) -> Set<String> {
+        var values = ignoredEditorGhostValues
+        var current: AXUIElement? = element
+        var depth = 0
+
+        while let candidate = current, depth < 4 {
+            for attribute in ["AXPlaceholderValue", kAXDescriptionAttribute as String] {
+                if let value = stringAttribute(candidate, attribute) {
+                    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if isEditorGhostText(trimmed) { values.insert(trimmed) }
+                }
+            }
+            current = parent(of: candidate)
+            depth += 1
+        }
+
+        return values
+    }
+
+    private static func isEditorGhostText(_ value: String) -> Bool {
+        if value.isEmpty { return false }
+        if ignoredEditorGhostValues.contains(value) { return true }
+        let lowercased = value.lowercased()
+        return lowercased.hasPrefix("type /")
+            || lowercased.hasPrefix("ask ")
+            || lowercased.hasPrefix("message ")
+            || lowercased.hasPrefix("reply ")
+    }
+
+    private static func selectedTextRange(of element: AXUIElement) -> CFRange? {
+        var ref: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &ref) == .success,
+              let ref, CFGetTypeID(ref) == AXValueGetTypeID() else { return nil }
+        let value = ref as! AXValue
+        guard AXValueGetType(value) == .cfRange else { return nil }
+        var range = CFRange(location: 0, length: 0)
+        guard AXValueGetValue(value, .cfRange, &range) else { return nil }
+        return range
+    }
+
+    private static func replacingSelection(in value: String, range: CFRange?, with text: String) -> (value: String, caretLocation: Int) {
+        let insertedLength = (text as NSString).length
+        guard let range, range.location >= 0, range.length >= 0 else {
+            let nsLength = (value as NSString).length
+            return (value + text, nsLength + insertedLength)
+        }
+        let nsValue = value as NSString
+        let maxLocation = min(range.location, nsValue.length)
+        let maxLength = min(range.length, nsValue.length - maxLocation)
+        let next = nsValue.replacingCharacters(in: NSRange(location: maxLocation, length: maxLength), with: text)
+        return (next, maxLocation + insertedLength)
+    }
+
+    private static func moveCaret(of element: AXUIElement, to desiredLocation: Int, in text: String) {
+        let nsLength = (text as NSString).length
+        var range = CFRange(location: min(max(desiredLocation, 0), nsLength), length: 0)
+        guard let value = AXValueCreate(.cfRange, &range) else { return }
+        _ = AXUIElementSetAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, value)
+    }
+
     /// Broad editable test, biased toward "yes" (the failure we care about is a
     /// real field not being pasted into).
     private static func isEditable(_ element: AXUIElement) -> Bool {
@@ -178,6 +301,22 @@ public enum TextInjector {
         "com.microsoft.edgemac",
         "org.mozilla.firefox",
         "com.kagi.kagimacOS"
+    ]
+
+    private static func isAIEditorTarget(_ bundleIdentifier: String) -> Bool {
+        aiEditorBundleIdentifiers.contains(bundleIdentifier)
+    }
+
+    private static let aiEditorBundleIdentifiers: Set<String> = [
+        "com.openai.codex",
+        "com.anthropic.claudefordesktop",
+        "com.google.antigravity",
+        "com.google.antigravity-ide"
+    ]
+
+    private static let ignoredEditorGhostValues: Set<String> = [
+        "Ask for follow-up changes",
+        "Type / for commands"
     ]
 
     private static func typeUnicode(_ text: String) {
