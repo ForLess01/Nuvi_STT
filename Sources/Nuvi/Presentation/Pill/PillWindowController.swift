@@ -32,8 +32,8 @@ final class PillWindowController {
     private let hosting: NSHostingView<PillView>
     private var animationToken = 0
 
-    init(controller: DictationController) {
-        hosting = NSHostingView(rootView: PillView(controller: controller))
+    init(controller: DictationController, translation: TranslationCoordinator) {
+        hosting = NSHostingView(rootView: PillView(controller: controller, translation: translation))
 
         panel = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: 268, height: 132),
@@ -247,9 +247,9 @@ private final class NebulaGlowView: NSView {
         let radiusY = max(bounds.height * blob.ry, 1)
 
         let colors = [
-            NSColor.black.withAlphaComponent(blob.alpha).cgColor,
-            NSColor.black.withAlphaComponent(blob.alpha * 0.42).cgColor,
-            NSColor.black.withAlphaComponent(blob.alpha * 0.12).cgColor,
+            NuviPalette.nsCharcoal.withAlphaComponent(blob.alpha).cgColor,
+            NuviPalette.nsCharcoal.withAlphaComponent(blob.alpha * 0.42).cgColor,
+            NuviPalette.nsCharcoal.withAlphaComponent(blob.alpha * 0.12).cgColor,
             NSColor.clear.cgColor
         ] as CFArray
         let locations: [CGFloat] = [0.0, 0.36, 0.70, 1.0]

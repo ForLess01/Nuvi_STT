@@ -1,0 +1,4 @@
+*.bat text eol=crlf
+*.sh text eol=lf
+*.kt text eol=lf
+*.swift text eol=lf

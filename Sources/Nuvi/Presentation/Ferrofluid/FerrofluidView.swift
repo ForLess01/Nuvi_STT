@@ -8,6 +8,7 @@ struct FerrofluidView: NSViewRepresentable {
     var level: Float
     var settings: FerrofluidSettings
     var simulate: Bool = false
+    var paused: Bool = false
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -25,6 +26,7 @@ struct FerrofluidView: NSViewRepresentable {
         context.coordinator.renderer?.level = level
         context.coordinator.renderer?.settings = settings
         context.coordinator.renderer?.simulate = simulate
+        (nsView as? AutoPauseMTKView)?.explicitlyPaused = paused
     }
 
     final class Coordinator {
@@ -37,6 +39,10 @@ struct FerrofluidView: NSViewRepresentable {
 /// while the pill is hidden (`orderOut` doesn't pause it) — a constant battery
 /// and GPU drain. Resumes the instant the window becomes visible again.
 final class AutoPauseMTKView: MTKView {
+    var explicitlyPaused = false {
+        didSet { updatePauseState() }
+    }
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         NotificationCenter.default.removeObserver(self)
@@ -49,6 +55,10 @@ final class AutoPauseMTKView: MTKView {
     }
 
     @objc private func updatePauseState() {
+        guard !explicitlyPaused else {
+            isPaused = true
+            return
+        }
         guard let window, window.occlusionState.contains(.visible) else {
             isPaused = true
             return

@@ -36,9 +36,12 @@ public extension NuviError {
     static let speechAuthDenied    = NuviError("NUVI-T04", "Speech recognition is not authorized")
     static let noSpeechDetected    = NuviError("NUVI-T05", "No speech detected")
     static func engineFailed(_ reason: String) -> NuviError { NuviError("NUVI-T06", reason) }
+    static func translationFailed(_ reason: String) -> NuviError { NuviError("NUVI-T07", "Translation failed: \(reason)") }
 
     // MARK: Output (O)
     static func clipboardFallback(_ reason: String) -> NuviError { NuviError("NUVI-O01", reason) }
+    static func manualOutputRequired(_ reason: String) -> NuviError { NuviError("NUVI-O02", reason) }
+    static func liveTargetUnavailable(_ reason: String) -> NuviError { NuviError("NUVI-O03", reason) }
 
     // MARK: Unexpected (X)
     static func unexpected(_ reason: String) -> NuviError { NuviError("NUVI-X01", reason) }

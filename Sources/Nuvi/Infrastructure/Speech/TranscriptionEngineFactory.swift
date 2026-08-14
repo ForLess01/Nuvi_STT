@@ -4,23 +4,28 @@ import Foundation
 /// engine preference. `auto` builds the hybrid composite (native first, Whisper
 /// fallback). Everything else returns a single adapter.
 public enum TranscriptionEngineFactory {
-    public static func make(preference: EnginePreference) -> TranscriptionEngine {
-        switch preference {
+    static func normalizedConfiguration(_ configuration: TranscriptionConfiguration) -> TranscriptionConfiguration {
+        configuration.normalized
+    }
+
+    public static func make(configuration: TranscriptionConfiguration) -> TranscriptionEngine {
+        let configuration = normalizedConfiguration(configuration)
+        switch configuration.engine {
         case .speechAnalyzer:
             return SpeechAnalyzerEngine()
         case .whisperKit:
-            return WhisperKitEngine()
+            return WhisperKitEngine(modelName: configuration.modelID)
         case .parakeet:
-            return ParakeetEngine()
+            return ParakeetEngine(modelId: configuration.modelID)
         case .auto:
             return HybridTranscriptionEngine(
                 primary: SpeechAnalyzerEngine(),
-                fallback: WhisperKitEngine()
+                fallback: WhisperKitEngine(modelName: configuration.modelID)
             )
         }
     }
 
     public static func makeDefault() -> TranscriptionEngine {
-        make(preference: SettingsStore.shared.enginePreference)
+        make(configuration: SettingsStore.shared.transcriptionConfiguration)
     }
 }

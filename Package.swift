@@ -21,7 +21,8 @@ let package = Package(
             ],
             path: "Sources/Nuvi",
             resources: [
-                .process("Infrastructure/Settings/ModelsCatalog.json")
+                .process("Infrastructure/Settings/ModelsCatalog.json"),
+                .process("Presentation/Brand/Assets")
             ],
             // AppKit / AVFoundation / Metal interop is far smoother under the
             // Swift 5 language mode. We still build with the Swift 6.3 toolchain;

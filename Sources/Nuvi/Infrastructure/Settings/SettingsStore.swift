@@ -1,5 +1,40 @@
 import Foundation
 
+extension Notification.Name {
+    static let nuviTranscriptionConfigurationDidChange = Notification.Name("nuvi.transcriptionConfigurationDidChange")
+    static let nuviOutputPreferencesDidChange = Notification.Name("nuvi.outputPreferencesDidChange")
+    static let nuviPresentationPreferencesDidChange = Notification.Name("nuvi.presentationPreferencesDidChange")
+}
+
+public struct TranscriptionConfiguration: Equatable, Sendable {
+    public static let defaultWhisperModelID = "openai_whisper-tiny"
+    public static let defaultParakeetModelID = "parakeet-tdt-0.6b-v3"
+
+    public let engine: EnginePreference
+    public let modelID: String
+
+    public init(engine: EnginePreference, modelID: String) {
+        self.engine = engine
+        self.modelID = modelID
+    }
+
+    public var identity: String { "\(engine.rawValue):\(modelID)" }
+
+    /// Keeps incompatible model families out of their engine adapters. This is
+    /// deliberately enforced below the UI because preferences can survive app
+    /// upgrades and can also be edited outside the model library.
+    public var normalized: TranscriptionConfiguration {
+        let expectedModelID: String
+        switch engine {
+        case .parakeet:
+            expectedModelID = modelID.hasPrefix("parakeet-") ? modelID : Self.defaultParakeetModelID
+        case .auto, .speechAnalyzer, .whisperKit:
+            expectedModelID = modelID.hasPrefix("openai_whisper-") ? modelID : Self.defaultWhisperModelID
+        }
+        return TranscriptionConfiguration(engine: engine, modelID: expectedModelID)
+    }
+}
+
 /// Which transcription engine the app uses. `auto` is the true hybrid: try the
 /// native SpeechAnalyzer, fall back to WhisperKit when it can't serve a locale.
 public enum EnginePreference: String, CaseIterable, Sendable {
@@ -22,7 +57,11 @@ public enum EnginePreference: String, CaseIterable, Sendable {
 public final class SettingsStore: @unchecked Sendable {
     public static let shared = SettingsStore()
 
-    private let defaults = UserDefaults.standard
+    private let defaults: UserDefaults
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+    }
 
     public var localeIdentifier: String {
         get { defaults.string(forKey: Keys.locale) ?? "es-ES" }
@@ -53,6 +92,60 @@ public final class SettingsStore: @unchecked Sendable {
         set { defaults.set(newValue, forKey: Keys.soundEffects) }
     }
 
+    /// Keeps the floating transcription pill available by default, while
+    /// allowing users who prefer a menu-bar-only workflow to suppress it.
+    public var showPill: Bool {
+        get { defaults.object(forKey: Keys.showPill) as? Bool ?? true }
+        set {
+            guard newValue != showPill else { return }
+            defaults.set(newValue, forKey: Keys.showPill)
+            notifyPresentationPreferencesChanged()
+        }
+    }
+
+    /// When enabled, the status item expands beside the isologo while Nuvi is
+    /// active (for example, "Listening…"). Idle always remains icon-only.
+    public var showMenuBarStatus: Bool {
+        get { defaults.object(forKey: Keys.showMenuBarStatus) as? Bool ?? true }
+        set {
+            guard newValue != showMenuBarStatus else { return }
+            defaults.set(newValue, forKey: Keys.showMenuBarStatus)
+            notifyPresentationPreferencesChanged()
+        }
+    }
+
+    /// Final language delivered to the focused app. Original is deliberately
+    /// the privacy-preserving, zero-latency default.
+    public var translationTarget: TranslationTarget {
+        get {
+            TranslationTarget(rawValue: defaults.string(forKey: Keys.translationTarget) ?? "") ?? .original
+        }
+        set {
+            guard newValue != translationTarget else { return }
+            defaults.set(newValue.rawValue, forKey: Keys.translationTarget)
+            notifyOutputPreferencesChanged()
+        }
+    }
+
+    /// Standard delivers one settled result. Live writes provisional partials
+    /// into the focused editor and reconciles them as recognition stabilizes.
+    public var dictationDeliveryMode: DictationDeliveryMode {
+        get {
+            DictationDeliveryMode(rawValue: defaults.string(forKey: Keys.dictationDeliveryMode) ?? "")
+                ?? .standard
+        }
+        set {
+            guard newValue != dictationDeliveryMode else { return }
+            defaults.set(newValue.rawValue, forKey: Keys.dictationDeliveryMode)
+            notifyOutputPreferencesChanged()
+        }
+    }
+
+    public var hasAcknowledgedLiveMode: Bool {
+        get { defaults.bool(forKey: Keys.hasAcknowledgedLiveMode) }
+        set { defaults.set(newValue, forKey: Keys.hasAcknowledgedLiveMode) }
+    }
+
     /// Which input device to capture from, by CoreAudio device UID.
     ///   ""        → Automatic: built-in mic if present, else system default. Keeps
     ///               a Bluetooth headset in A2DP so its music is never degraded.
@@ -67,12 +160,50 @@ public final class SettingsStore: @unchecked Sendable {
         // Default to the native engine: reliable, no downloads. WhisperKit (and
         // the hybrid that can fall back to it) are opt-in from Settings.
         get { EnginePreference(rawValue: defaults.string(forKey: Keys.engine) ?? "") ?? .speechAnalyzer }
-        set { defaults.set(newValue.rawValue, forKey: Keys.engine) }
+        set {
+            updateTranscriptionConfiguration(
+                TranscriptionConfiguration(engine: newValue, modelID: selectedModelID)
+            )
+        }
     }
 
     public var selectedModelID: String {
-        get { defaults.string(forKey: Keys.selectedModelID) ?? "openai_whisper-tiny" }
-        set { defaults.set(newValue, forKey: Keys.selectedModelID) }
+        get { defaults.string(forKey: Keys.selectedModelID) ?? TranscriptionConfiguration.defaultWhisperModelID }
+        set {
+            updateTranscriptionConfiguration(
+                TranscriptionConfiguration(engine: enginePreference, modelID: newValue)
+            )
+        }
+    }
+
+    public var transcriptionConfiguration: TranscriptionConfiguration {
+        TranscriptionConfiguration(engine: enginePreference, modelID: selectedModelID).normalized
+    }
+
+    /// Updates model and engine as one logical operation so observers never
+    /// construct an adapter for an intermediate configuration.
+    public func selectModel(id: String, engine: EnginePreference) {
+        updateTranscriptionConfiguration(TranscriptionConfiguration(engine: engine, modelID: id))
+    }
+
+    private func updateTranscriptionConfiguration(_ proposed: TranscriptionConfiguration) {
+        let before = transcriptionConfiguration
+        let normalized = proposed.normalized
+        defaults.set(normalized.modelID, forKey: Keys.selectedModelID)
+        defaults.set(normalized.engine.rawValue, forKey: Keys.engine)
+        if normalized != before { notifyTranscriptionConfigurationChanged() }
+    }
+
+    private func notifyTranscriptionConfigurationChanged() {
+        NotificationCenter.default.post(name: .nuviTranscriptionConfigurationDidChange, object: self)
+    }
+
+    private func notifyOutputPreferencesChanged() {
+        NotificationCenter.default.post(name: .nuviOutputPreferencesDidChange, object: self)
+    }
+
+    private func notifyPresentationPreferencesChanged() {
+        NotificationCenter.default.post(name: .nuviPresentationPreferencesDidChange, object: self)
     }
 
     /// Parakeet model ids that finished downloading at least once. FluidAudio
@@ -101,6 +232,14 @@ public final class SettingsStore: @unchecked Sendable {
         static let saveHistory = "nuvi.saveHistory"
         static let engine = "nuvi.engine"
         static let soundEffects = "nuvi.soundEffects"
+        static let showPill = "nuvi.showPill"
+        static let showMenuBarStatus = "nuvi.showMenuBarStatus"
+        static let translationTarget = "nuvi.translationTarget"
+        static let dictationDeliveryMode = "nuvi.dictationDeliveryMode"
+        // Versioned because the original warning incorrectly said Parakeet
+        // could not stream. Every user must see the corrected engine-specific
+        // resource notice once.
+        static let hasAcknowledgedLiveMode = "nuvi.hasAcknowledgedLiveModeV2"
         static let inputDeviceUID = "nuvi.inputDeviceUID"
         static let selectedModelID = "nuvi.selectedModelID"
         static let downloadedParakeet = "nuvi.downloadedParakeetModels"

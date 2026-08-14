@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # Builds Nuvi.app from the SwiftPM executable: compiles, assembles the bundle,
-# and ad-hoc signs it with the entitlements. Usage: ./scripts/build-app.sh [debug|release]
+# and signs it with the entitlements. It never modifies /Applications.
+# Usage: ./scripts/build-app.sh [debug|release]
 #
 set -euo pipefail
 
@@ -66,17 +67,10 @@ codesign --force --options runtime --deep --sign "$SIGN_ID" \
     --entitlements "$ROOT/Resources/Nuvi.entitlements" \
     "$APP" 2>/dev/null || codesign --force --options runtime --deep --sign "$SIGN_ID" "$APP"
 
-# Install into /Applications so `open -a Nuvi` / Spotlight always launch THIS build.
-# Skipping this is how a stale /Applications/Nuvi.app silently shadows new builds.
-# Same signing identity keeps the TCC grants across reinstalls.
-INSTALLED="/Applications/Nuvi.app"
-echo "==> Installing to $INSTALLED"
-rm -rf "$INSTALLED"
-cp -R "$APP" "$INSTALLED"
-
 echo "==> Done."
-echo "    Installed: $INSTALLED"
-echo "    Launch:    open \"$INSTALLED\"   (or just: open -a Nuvi)"
+echo "    Built:  $APP"
+echo "    Launch: open \"$APP\""
+echo "    Install: ./scripts/install-app.sh $CONFIG"
 echo
 echo "    Do NOT run the inner binary directly (\"$APP/Contents/MacOS/Nuvi\"):"
 echo "    launched that way the process is not bound to the app bundle, so TCC"

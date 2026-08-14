@@ -1,0 +1,3 @@
+-keep class app.nuvi.android.infrastructure.whisper.WhisperNativeEngine { *; }
+-keep class com.k2fsa.sherpa.onnx.** { *; }
+-keepclasseswithmembernames class * { native <methods>; }

@@ -15,6 +15,12 @@ public final class HybridTranscriptionEngine: TranscriptionEngine, @unchecked Se
     private let fallback: TranscriptionEngine
     private var active: TranscriptionEngine
 
+    /// Internal observability seam for the factory's configured fallback. This
+    /// avoids exposing composition details through the public engine protocol.
+    var configuredFallbackModelID: String? {
+        (fallback as? WhisperKitEngine)?.configuredModelID
+    }
+
     public init(primary: TranscriptionEngine, fallback: TranscriptionEngine) {
         self.primary = primary
         self.fallback = fallback
@@ -36,5 +42,12 @@ public final class HybridTranscriptionEngine: TranscriptionEngine, @unchecked Se
         _ audio: AsyncStream<AVAudioPCMBuffer>
     ) -> AsyncThrowingStream<TranscriptionEvent, Error> {
         active.transcribe(audio)
+    }
+
+    public func transcribe(
+        _ audio: AsyncStream<AVAudioPCMBuffer>,
+        reportingPartials: Bool
+    ) -> AsyncThrowingStream<TranscriptionEvent, Error> {
+        active.transcribe(audio, reportingPartials: reportingPartials)
     }
 }

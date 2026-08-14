@@ -14,6 +14,7 @@ final class AppEnvironment {
     }
 
     let controller: DictationController
+    private let translation: TranslationCoordinator
     private let pill: PillWindowController
     private let statusItem: StatusItemController
     private let settingsWindow = SettingsWindowController()
@@ -23,14 +24,19 @@ final class AppEnvironment {
 
     init() {
         let audio = AudioCaptureService()
-        let engine = TranscriptionEngineFactory.makeDefault()
+        let translation = TranslationCoordinator()
+        let configuration = SettingsStore.shared.transcriptionConfiguration
+        let engine = TranscriptionEngineFactory.make(configuration: configuration)
 
         controller = DictationController(audio: audio,
                                          engine: engine,
                                          history: .shared,
                                          vocabulary: .shared,
-                                         modes: .shared)
-        pill = PillWindowController(controller: controller)
+                                         modes: .shared,
+                                         textTranslator: translation,
+                                         engineConfigurationID: configuration.identity)
+        self.translation = translation
+        pill = PillWindowController(controller: controller, translation: translation)
         statusItem = StatusItemController()
     }
 
@@ -47,6 +53,20 @@ final class AppEnvironment {
         hotkeyManager = manager
 
         observeState()
+        observeTranscriptionConfiguration()
+        observePresentationPreferences()
+    }
+
+    private func observeTranscriptionConfiguration() {
+        NotificationCenter.default.publisher(for: .nuviTranscriptionConfigurationDidChange)
+            .sink { [weak self] _ in
+                let configuration = SettingsStore.shared.transcriptionConfiguration
+                self?.controller.reconfigure(
+                    engine: TranscriptionEngineFactory.make(configuration: configuration),
+                    configurationID: configuration.identity
+                )
+            }
+            .store(in: &cancellables)
     }
 
     // Esc-to-cancel is only live while recording, so it never swallows Escape
@@ -65,7 +85,11 @@ final class AppEnvironment {
     }
 
     private func showTransient(_ state: DictationState, duration: TimeInterval) {
-        pill.show()
+        if SettingsStore.shared.showPill {
+            pill.show()
+        } else {
+            pill.hide()
+        }
         disableCancelHotkey()
         let expected = state
         DispatchQueue.main.async { [weak self] in
@@ -84,10 +108,25 @@ final class AppEnvironment {
             .removeDuplicates()
             .sink { [weak self] state in
                 guard let self else { return }
+                self.statusItem.update(state: state, isLiveSession: self.controller.isLiveSession)
                 switch state {
                 case .listening, .transcribing:
-                    self.pill.show()
+                    if SettingsStore.shared.showPill {
+                        self.pill.show()
+                    } else {
+                        self.pill.hide()
+                    }
                     self.enableCancelHotkey()
+                case .inserted, .copied:
+                    if SettingsStore.shared.showPill {
+                        self.pill.show()
+                    } else {
+                        self.pill.hide()
+                    }
+                    self.disableCancelHotkey()
+                    if SettingsStore.shared.showPill {
+                        self.pill.resizeToContent()
+                    }
                 case .idle:
                     self.pill.hide()
                     self.disableCancelHotkey()
@@ -99,10 +138,41 @@ final class AppEnvironment {
             }
             .store(in: &cancellables)
 
+        controller.$isLiveSession
+            .removeDuplicates()
+            .sink { [weak self] isLiveSession in
+                guard let self else { return }
+                self.statusItem.update(state: self.controller.state, isLiveSession: isLiveSession)
+            }
+            .store(in: &cancellables)
+
         // Grow the pill as the transcript streams in.
         controller.$transcript
             .removeDuplicates()
-            .sink { [weak self] _ in self?.pill.resizeToContent() }
+            .sink { [weak self] _ in
+                guard SettingsStore.shared.showPill else { return }
+                self?.pill.resizeToContent()
+            }
+            .store(in: &cancellables)
+    }
+
+    private func observePresentationPreferences() {
+        NotificationCenter.default.publisher(for: .nuviPresentationPreferencesDidChange)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                self.statusItem.refreshPresentation()
+                guard SettingsStore.shared.showPill else {
+                    self.pill.hide()
+                    return
+                }
+                switch self.controller.state {
+                case .listening, .transcribing, .inserted, .copied, .notice, .error:
+                    self.pill.show()
+                    self.pill.resizeToContent()
+                case .idle:
+                    self.pill.hide()
+                }
+            }
             .store(in: &cancellables)
     }
 }
