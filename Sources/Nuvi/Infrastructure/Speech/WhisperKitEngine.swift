@@ -13,10 +13,9 @@ import WhisperKit
 ///      and the product `.product(name: "WhisperKit", package: "argmax-oss-swift")`.
 ///   2. Rebuild. `canImport(WhisperKit)` flips on and this becomes live.
 ///
-/// Strategy: WhisperKit is batch-oriented, so we accumulate the mic stream into a
-/// 16kHz mono Float buffer and transcribe once on stop, emitting a final result.
-/// That is exactly what a "fallback for hard audio" needs — robustness over
-/// streaming partials.
+/// Standard mode runs one settled pass after capture. Live mode periodically
+/// decodes the accumulated 16 kHz audio and emits provisional revisions, so all
+/// currently catalogued Whisper model sizes participate in progressive delivery.
 public final class WhisperKitEngine: TranscriptionEngine, @unchecked Sendable {
     public let identifier = "whisperkit"
 
@@ -25,11 +24,19 @@ public final class WhisperKitEngine: TranscriptionEngine, @unchecked Sendable {
     private let customModelName: String?
     
     private var modelName: String {
-        customModelName ?? SettingsStore.shared.selectedModelID
+        Self.normalizedModelName(customModelName ?? SettingsStore.shared.selectedModelID)
     }
+
+    /// Internal observability seam for verifying factory wiring without loading
+    /// WhisperKit models or widening the public engine contract.
+    var configuredModelID: String { modelName }
 
     public init(modelName: String? = nil) {
         self.customModelName = modelName
+    }
+
+    static func normalizedModelName(_ modelName: String) -> String {
+        TranscriptionConfiguration(engine: .whisperKit, modelID: modelName).normalized.modelID
     }
 
 #if canImport(WhisperKit)
@@ -133,6 +140,99 @@ public final class WhisperKitEngine: TranscriptionEngine, @unchecked Sendable {
             }
             continuation.onTermination = { _ in task.cancel() }
         }
+    }
+
+    public func transcribe(
+        _ audio: AsyncStream<AVAudioPCMBuffer>,
+        reportingPartials: Bool
+    ) -> AsyncThrowingStream<TranscriptionEvent, Error> {
+        guard reportingPartials else { return transcribe(audio) }
+
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    guard let pipe else {
+                        throw TranscriptionError.engineUnavailable("WhisperKit not prepared")
+                    }
+                    guard let target = AVAudioFormat(
+                        commonFormat: .pcmFormatFloat32,
+                        sampleRate: 16_000,
+                        channels: 1,
+                        interleaved: false
+                    ) else {
+                        throw TranscriptionError.underlying("Could not build 16kHz format")
+                    }
+
+                    let converter = BufferConverter(targetFormat: target)
+                    let options = DecodingOptions(language: languageCode)
+                    let cadence = Self.liveCadenceSamples(for: modelName)
+                    let minimumHypothesisSamples = 16_000 * 2
+                    let maxSamples = 16_000 * 10 * 60
+                    var nextHypothesisAt = minimumHypothesisSamples
+                    var samples: [Float] = []
+                    var lastPartial = ""
+
+                    for await buffer in audio {
+                        guard !Task.isCancelled else { throw CancellationError() }
+                        guard let converted = converter.convert(buffer),
+                              let channel = converted.floatChannelData else { continue }
+                        let count = Int(converted.frameLength)
+                        if samples.count + count > maxSamples {
+                            throw TranscriptionError.underlying(
+                                "WhisperKit input exceeded 10 minute limit"
+                            )
+                        }
+                        samples.append(
+                            contentsOf: UnsafeBufferPointer(start: channel[0], count: count)
+                        )
+
+                        guard samples.count >= nextHypothesisAt else { continue }
+                        let results = try await pipe.transcribe(
+                            audioArray: samples,
+                            decodeOptions: options
+                        )
+                        let hypothesis = Self.joinedText(results)
+                        if !hypothesis.isEmpty, hypothesis != lastPartial {
+                            lastPartial = hypothesis
+                            continuation.yield(.partial(hypothesis))
+                        }
+                        nextHypothesisAt = samples.count + cadence
+                    }
+
+                    guard !samples.isEmpty else { throw NuviError.noAudioReceived }
+                    let results = try await pipe.transcribe(
+                        audioArray: samples,
+                        decodeOptions: options
+                    )
+                    continuation.yield(.final(Self.joinedText(results)))
+                    continuation.finish()
+                } catch is CancellationError {
+                    continuation.finish(throwing: CancellationError())
+                } catch {
+                    continuation.finish(
+                        throwing: TranscriptionError.underlying(String(describing: error))
+                    )
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    static func liveCadenceSamples(for modelID: String) -> Int {
+        let seconds: Double
+        if modelID.contains("large") || modelID.contains("medium") {
+            seconds = 3.0
+        } else if modelID.contains("small") {
+            seconds = 2.0
+        } else {
+            seconds = 1.5
+        }
+        return Int(16_000 * seconds)
+    }
+
+    private static func joinedText(_ results: [TranscriptionResult]) -> String {
+        results.map(\.text).joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 #else
     public func prepare(locale: Locale) async throws {

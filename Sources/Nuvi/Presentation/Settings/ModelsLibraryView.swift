@@ -65,7 +65,7 @@ struct ModelsLibraryView: View {
             if let error = downloadService.lastError {
                 HStack(spacing: 8) {
                     Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundColor(.orange)
+                        .foregroundColor(NuviPalette.lavender)
                     Text(error)
                         .font(.caption)
                         .foregroundColor(.secondary)
@@ -78,7 +78,7 @@ struct ModelsLibraryView: View {
                     .buttonStyle(.plain)
                 }
                 .padding(10)
-                .background(Color.orange.opacity(0.12))
+                .background(NuviPalette.lavender.opacity(0.12))
                 .cornerRadius(8)
             }
 

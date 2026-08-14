@@ -1,14 +1,13 @@
 import SwiftUI
 
-/// Small design system that gives the Settings UI a SuperWhisper-like feel:
-/// dark cards, colored sidebar icon tiles, section headers, keycap chips.
-/// Centralizing it keeps the panels declarative and consistent.
+/// Nuvi's Settings surfaces use only the approved brand palette. Opacity is
+/// used for hierarchy instead of introducing unrelated semantic hues.
 enum NuviTheme {
-    static let background = Color(white: 0.11)
-    static let card = Color(white: 0.16)
-    static let cardStroke = Color.white.opacity(0.06)
-    static let separator = Color.white.opacity(0.07)
-    static let keycap = Color(white: 0.26)
+    static let background = NuviPalette.charcoal
+    static let card = NuviPalette.softWhite.opacity(0.055)
+    static let cardStroke = NuviPalette.softWhite.opacity(0.10)
+    static let separator = NuviPalette.softWhite.opacity(0.08)
+    static let keycap = NuviPalette.lavender.opacity(0.16)
 }
 
 /// Colored rounded-square icon, like the sidebar tiles in SuperWhisper.
@@ -19,9 +18,9 @@ struct IconTile: View {
     var body: some View {
         Image(systemName: symbol)
             .font(.system(size: 12, weight: .semibold))
-            .foregroundStyle(.white)
+            .foregroundStyle(NuviPalette.charcoal)
             .frame(width: 22, height: 22)
-            .background(color, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+            .background(NuviPalette.lavender, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
     }
 }
 

@@ -94,6 +94,21 @@ enum FerrofluidBlobImage {
         return image
     }
 
+    /// Alpha-only ferrofluid spectrum glyph for the macOS menu bar. It reuses
+    /// the same static metaball/noise field as Nuvi's renderer, while template
+    /// tinting lets AppKit keep it legible in light, dark, highlighted, and
+    /// increased-contrast menu bar appearances.
+    static func menuBarSpectrumImage(pointSize: CGFloat = 20, scale: CGFloat = 2) -> NSImage {
+        let pixels = max(1, Int(pointSize * scale))
+        let cg = renderSpectrumGlyph(pixels: pixels)
+        let rep = NSBitmapImageRep(cgImage: cg)
+        rep.size = NSSize(width: pointSize, height: pointSize)
+        let image = NSImage(size: NSSize(width: pointSize, height: pointSize))
+        image.addRepresentation(rep)
+        image.isTemplate = true
+        return image
+    }
+
     // MARK: - Menu bar "N" mark
 
     /// Rounded-square tile with an "N" made of ferrofluid: the letterform
@@ -222,6 +237,48 @@ enum FerrofluidBlobImage {
                 ptr[i + 1] = p
                 ptr[i + 2] = p
                 ptr[i + 3] = UInt8(max(0, min(255, alpha * 255)))
+            }
+        }
+        return ctx.makeImage()!
+    }
+
+    private static func renderSpectrumGlyph(pixels n: Int) -> CGImage {
+        let space = CGColorSpace(name: CGColorSpace.sRGB)!
+        let ctx = CGContext(data: nil, width: n, height: n, bitsPerComponent: 8,
+                            bytesPerRow: n * 4, space: space,
+                            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        let ptr = ctx.data!.bindMemory(to: UInt8.self, capacity: n * n * 4)
+        let size = Double(n)
+        let bars: [(x: Double, halfHeight: Double, radius: Double)] = [
+            (-0.72, 0.18, 0.11),
+            (-0.36, 0.42, 0.11),
+            ( 0.00, 0.68, 0.12),
+            ( 0.36, 0.50, 0.11),
+            ( 0.72, 0.27, 0.11),
+        ]
+
+        for y in 0..<n {
+            for x in 0..<n {
+                let ux = (Double(x) + 0.5) / size * 2 - 1
+                let uy = (Double(y) + 0.5) / size * 2 - 1
+                var distance = Double.greatestFiniteMagnitude
+                for bar in bars {
+                    distance = min(
+                        distance,
+                        sdSegment(ux, uy, bar.x, -bar.halfHeight, bar.x, bar.halfHeight) - bar.radius
+                    )
+                }
+
+                // Preserve the ferrofluid identity with a subtle noisy edge,
+                // but keep five distinct lobes so the 20-point mark reads as an
+                // audio spectrum rather than another generic status dot.
+                let wobble = (fbm(ux * 4.5 + 1.7, uy * 5.0 - 0.8) - 0.5) * 0.055
+                let alpha = smoothstep(0.055, -0.035, distance - wobble)
+                let index = (y * n + x) * 4
+                ptr[index + 0] = 0
+                ptr[index + 1] = 0
+                ptr[index + 2] = 0
+                ptr[index + 3] = UInt8(max(0, min(255, alpha * 255)))
             }
         }
         return ctx.makeImage()!

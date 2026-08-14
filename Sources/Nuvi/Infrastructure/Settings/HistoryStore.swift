@@ -18,26 +18,44 @@ public struct HistoryEntry: Identifiable, Codable, Sendable, Hashable {
 /// never grows unbounded.
 @MainActor
 public final class HistoryStore: ObservableObject {
-    public static let shared = HistoryStore()
+    public static let shared = HistoryStore(
+        persistenceURL: productionPersistenceURL(),
+        isHistoryEnabled: { SettingsStore.shared.saveHistory }
+    )
 
     @Published public private(set) var entries: [HistoryEntry] = []
 
     private let maxEntries = 500
-    private let url: URL
+    let persistenceURL: URL?
+    private let isHistoryEnabled: () -> Bool
     private let persistenceQueue = DispatchQueue(label: "nuvi.history.persistence", qos: .utility)
 
-    public init() {
+    /// A nil URL is deliberately memory-only. Production uses `shared`, while
+    /// tests and previews can construct an isolated store without ever touching
+    /// the user's Application Support directory.
+    public init(
+        persistenceURL: URL? = nil,
+        isHistoryEnabled: @escaping () -> Bool = { SettingsStore.shared.saveHistory }
+    ) {
+        self.persistenceURL = persistenceURL
+        self.isHistoryEnabled = isHistoryEnabled
+        guard isHistoryEnabled() else { return }
+        if let directory = persistenceURL?.deletingLastPathComponent() {
+            try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
+        load()
+    }
+
+    private static func productionPersistenceURL() -> URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         let dir = base.appendingPathComponent("Nuvi", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        url = dir.appendingPathComponent("history.json")
-        load()
+        return dir.appendingPathComponent("history.json")
     }
 
     public func add(_ text: String) {
         // Respect the privacy setting: when history is off, dictated text is
         // never stored (not in memory, not on disk).
-        guard SettingsStore.shared.saveHistory else { return }
+        guard isHistoryEnabled() else { return }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         entries.insert(HistoryEntry(text: trimmed), at: 0)
@@ -52,25 +70,39 @@ public final class HistoryStore: ObservableObject {
 
     public func clear() {
         entries.removeAll()
-        save()
+        guard let persistenceURL else { return }
+        persistenceQueue.async {
+            try? FileManager.default.removeItem(at: persistenceURL)
+        }
     }
 
     private func load() {
-        guard let data = try? Data(contentsOf: url),
+        guard let persistenceURL,
+              let data = try? Data(contentsOf: persistenceURL),
               let decoded = try? JSONDecoder().decode([HistoryEntry].self, from: data) else { return }
         entries = decoded
     }
 
     private func save() {
+        guard isHistoryEnabled(), let persistenceURL else { return }
         let snapshot = entries
-        let url = url
         persistenceQueue.async {
             if let data = try? JSONEncoder().encode(snapshot) {
-                try? data.write(to: url, options: .atomic)
+                try? FileManager.default.createDirectory(
+                    at: persistenceURL.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+                try? data.write(to: persistenceURL, options: .atomic)
                 // Owner-only permissions: the file holds dictated speech.
                 try? FileManager.default.setAttributes([.posixPermissions: 0o600],
-                                                        ofItemAtPath: url.path)
+                                                        ofItemAtPath: persistenceURL.path)
             }
         }
+    }
+
+    /// Test seam for deterministic persistence assertions. Production never
+    /// needs to block on the utility queue.
+    func flushPersistence() {
+        persistenceQueue.sync {}
     }
 }

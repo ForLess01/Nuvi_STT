@@ -17,16 +17,101 @@ public enum InjectionResult: Sendable {
 ///   3. Clipboard fallback only after a trusted AX inspection establishes that
 ///      the target is not a secure field.
 public enum TextInjector {
+    struct LiveRevision: Equatable {
+        let backspaceCount: Int
+        let suffix: String
+    }
+
+    enum LiveDeliveryConfirmation: Equatable {
+        case inserted
+        case clipboardOnly
+    }
+
+    @MainActor
+    final class LiveSession {
+        let processIdentifier: pid_t
+        let editableElement: AXUIElement
+        let clipboardSnapshot: PasteboardSnapshot
+        var text = ""
+        var isValid = true
+        var lastClipboardWrite: String?
+        var lastUpdateWasVerified = false
+
+        init(
+            processIdentifier: pid_t,
+            editableElement: AXUIElement,
+            clipboardSnapshot: PasteboardSnapshot
+        ) {
+            self.processIdentifier = processIdentifier
+            self.editableElement = editableElement
+            self.clipboardSnapshot = clipboardSnapshot
+        }
+    }
+
     enum PreflightPolicy: Equatable {
         case classifyFocusedTarget
         case directTypingWithoutClipboard
     }
 
     enum InjectionRoute: Equatable {
+        case unknownFocusedTarget
         case secureDirectTyping
         case aiEditorAXValue
         case webClipboardPaste
         case nativeAccessibility
+    }
+
+    enum AXWriteOutcome: Equatable {
+        case unavailable
+        case unsafePrewrite
+        case verified
+        case attemptedUnverified
+    }
+
+    enum AXPrewriteValue: Equatable {
+        case available(String)
+        case unsafe
+    }
+
+    enum AXUnavailableFallback: CaseIterable, Equatable {
+        case clipboardPaste
+        case nextAXTarget
+        case directTyping
+    }
+
+    enum AXContinuation: Equatable {
+        case inserted
+        case manualFallback
+        case continueWith(AXUnavailableFallback)
+    }
+
+    enum AXStringAttributeRead: Equatable {
+        case value(String)
+        case absent
+        case unreadable
+
+        var stringValue: String? {
+            guard case .value(let value) = self else { return nil }
+            return value
+        }
+    }
+
+    enum TargetSecurityClassification: Equatable {
+        case unknown
+        case secure
+        case nonSecure
+    }
+
+    struct EditorNodeMetadata: Equatable {
+        var semanticPlaceholder: String?
+        var committedCharacterCount: Int?
+        var description: String?
+    }
+
+    struct EditorTextMetadata: Equatable {
+        var semanticPlaceholder: String?
+        var committedCharacterCount: Int?
+        var descriptionGhostTexts: Set<String>
     }
 
     @discardableResult
@@ -36,6 +121,90 @@ public enum TextInjector {
     }
 
     public static var isTrusted: Bool { AXIsProcessTrusted() }
+
+    @MainActor
+    static func beginLiveSession() -> LiveSession? {
+        guard AXIsProcessTrusted(),
+              let element = focusedElement() else { return nil }
+
+        guard let editable = editableElement(startingAt: element) else { return nil }
+        var targetProcessIdentifier: pid_t = 0
+        guard AXUIElementGetPid(editable, &targetProcessIdentifier) == .success,
+              targetProcessIdentifier > 0 else { return nil }
+        let focusedRole = stringAttributeRead(element, kAXRoleAttribute as String)
+        let focusedSubrole = stringAttributeRead(element, kAXSubroleAttribute as String)
+        let editableRole = stringAttributeRead(editable, kAXRoleAttribute as String)
+        let editableSubrole = stringAttributeRead(editable, kAXSubroleAttribute as String)
+        guard classifyTargetSecurity(
+            focusedRole: focusedRole,
+            focusedSubrole: focusedSubrole,
+            editableRole: editableRole,
+            editableSubrole: editableSubrole
+        ) == .nonSecure else { return nil }
+
+        return LiveSession(
+            processIdentifier: targetProcessIdentifier,
+            editableElement: editable,
+            clipboardSnapshot: PasteboardSnapshot.capture(from: .general)
+        )
+    }
+
+    @MainActor
+    static func updateLiveSession(_ session: LiveSession, with text: String) -> Bool {
+        guard session.isValid, liveTargetIsStillFocused(session) else {
+            session.isValid = false
+            return false
+        }
+        let revision = liveRevision(from: session.text, to: text)
+        guard postBackspaces(revision.backspaceCount) else {
+            session.isValid = false
+            return false
+        }
+        if revision.backspaceCount > 0, !revision.suffix.isEmpty {
+            usleep(20_000)
+        }
+        if !revision.suffix.isEmpty {
+            guard pasteViaClipboard(revision.suffix, restoreClipboard: false) else {
+                session.isValid = false
+                return false
+            }
+            session.lastClipboardWrite = revision.suffix
+        }
+        usleep(100_000)
+        session.text = text
+        session.lastUpdateWasVerified = liveReadbackContains(session, text: text) == true
+        return true
+    }
+
+    @MainActor
+    static func cancelLiveSession(_ session: LiveSession) {
+        if session.isValid {
+            _ = updateLiveSession(session, with: "")
+        }
+        restoreLiveClipboard(session)
+    }
+
+    static func liveRevision(from previous: String, to next: String) -> LiveRevision {
+        let oldCharacters = Array(previous)
+        let newCharacters = Array(next)
+        var commonCount = 0
+        while commonCount < oldCharacters.count,
+              commonCount < newCharacters.count,
+              oldCharacters[commonCount] == newCharacters[commonCount] {
+            commonCount += 1
+        }
+        return LiveRevision(
+            backspaceCount: oldCharacters.count - commonCount,
+            suffix: String(newCharacters.dropFirst(commonCount))
+        )
+    }
+
+    static func liveDeliveryConfirmation(
+        updateSucceeded: Bool,
+        readbackVerified: Bool
+    ) -> LiveDeliveryConfirmation {
+        updateSucceeded && readbackVerified ? .inserted : .clipboardOnly
+    }
 
     @MainActor
     public static func insert(_ text: String, restoreClipboard: Bool) -> InjectionResult {
@@ -54,14 +223,41 @@ public enum TextInjector {
         }
 
         let element = focusedElement()
-        let role = element.flatMap { stringAttribute($0, kAXRoleAttribute as String) } ?? "?"
-        let subrole = element.flatMap { stringAttribute($0, kAXSubroleAttribute as String) } ?? "?"
+        let focusedRoleRead = element.map {
+            stringAttributeRead($0, kAXRoleAttribute as String)
+        } ?? .unreadable
+        let focusedSubroleRead = element.map {
+            stringAttributeRead($0, kAXSubroleAttribute as String)
+        } ?? .unreadable
+        let role = focusedRoleRead.stringValue ?? "?"
+        let subrole = focusedSubroleRead.stringValue ?? "?"
         let editable = element.flatMap(editableElement(startingAt:))
-        let editableSubrole = editable.flatMap { stringAttribute($0, kAXSubroleAttribute as String) }
-        let secure = isSecureTextField(focusedSubrole: subrole, editableSubrole: editableSubrole)
+        let editableRoleRead = editable.map { stringAttributeRead($0, kAXRoleAttribute as String) }
+        let editableSubroleRead = editable.map { stringAttributeRead($0, kAXSubroleAttribute as String) }
+        let security = classifyTargetSecurity(
+            focusedRole: focusedRoleRead,
+            focusedSubrole: focusedSubroleRead,
+            editableRole: editableRoleRead,
+            editableSubrole: editableSubroleRead
+        )
+        let secure = security == .secure
+        let isInsideWebArea = element.map { containsWebArea(ancestorRoles: ancestorRoles(startingAt: $0)) } ?? false
+        let hasReadableAXMetadata = security != .unknown
         NSLog("Nuvi/inject: focused role=\(role), subrole=\(subrole), editableTarget=\(editable != nil)")
 
-        switch route(frontmost: frontmost, focusedRole: role, focusedSubrole: subrole, isSecure: secure) {
+        switch route(
+            frontmost: frontmost,
+            focusedRole: role,
+            focusedSubrole: subrole,
+            isSecure: secure,
+            hasFocusedElement: element != nil,
+            hasReadableAXMetadata: hasReadableAXMetadata,
+            isInsideWebArea: isInsideWebArea
+        ) {
+        case .unknownFocusedTarget:
+            NSLog("Nuvi/inject: focused target unavailable → manual fallback")
+            return .manualFallback("Focused target could not be classified — nothing was copied")
+
         case .secureDirectTyping:
             // This MUST precede every route that touches NSPasteboard. AI editors
             // and browsers can both expose secure descendants.
@@ -72,14 +268,23 @@ public enum TextInjector {
 
         case .aiEditorAXValue:
             guard let element else {
-                writeClipboardOnly(text)
-                return .clipboardOnly("Copied to clipboard — no text field focused")
+                return .manualFallback("Focused target could not be classified — nothing was copied")
             }
-            if axValueInsertVerified(element, text, insertion: .appendToEnd) {
+            let target = editable ?? element
+            let outcome = axValueInsertVerified(target, text, insertion: .appendToEnd)
+            switch continuation(after: outcome, whenUnavailable: .clipboardPaste) {
+            case .inserted:
                 return .inserted
+            case .manualFallback:
+                return .manualFallback(
+                    manualFallbackReason(for: outcome, targetName: "editor")
+                )
+            case .continueWith(.clipboardPaste):
+                pasteViaClipboard(text, restoreClipboard: restoreClipboard)
+                return .inserted
+            case .continueWith:
+                return .manualFallback("Editor insertion stopped before an unsafe fallback — nothing was copied or typed")
             }
-            pasteViaClipboard(text, restoreClipboard: restoreClipboard)
-            return .inserted
 
         case .webClipboardPaste:
             NSLog("Nuvi/inject: web target → clipboard paste")
@@ -91,15 +296,37 @@ public enum TextInjector {
         }
 
         // Native apps: direct Accessibility insertion where supported.
-        if let element, axInsert(element, text) {
-            NSLog("Nuvi/inject: direct AX insert")
-            return .inserted
+        if let element {
+            let outcome = axSelectedTextInsertVerified(element, text)
+            switch continuation(after: outcome, whenUnavailable: .nextAXTarget) {
+            case .inserted:
+                NSLog("Nuvi/inject: verified direct AX insert")
+                return .inserted
+            case .manualFallback:
+                return .manualFallback(
+                    manualFallbackReason(for: outcome, targetName: "focused field")
+                )
+            case .continueWith(.nextAXTarget):
+                break
+            case .continueWith:
+                return .manualFallback("Focused-field insertion stopped before an unsafe fallback — nothing was copied or typed")
+            }
         }
 
         if let editable {
-            if axInsert(editable, text) {
-                NSLog("Nuvi/inject: direct AX insert via editable ancestor")
+            let outcome = axSelectedTextInsertVerified(editable, text)
+            switch continuation(after: outcome, whenUnavailable: .directTyping) {
+            case .inserted:
+                NSLog("Nuvi/inject: verified direct AX insert via editable ancestor")
                 return .inserted
+            case .manualFallback:
+                return .manualFallback(
+                    manualFallbackReason(for: outcome, targetName: "editable field")
+                )
+            case .continueWith(.directTyping):
+                break
+            case .continueWith:
+                return .manualFallback("Editable-field insertion stopped before an unsafe fallback — nothing was copied or typed")
             }
             NSLog("Nuvi/inject: direct Unicode typing")
             return typeUnicode(text)
@@ -138,6 +365,38 @@ public enum TextInjector {
         return (raw as! AXUIElement)
     }
 
+    @MainActor
+    private static func liveTargetIsStillFocused(_ session: LiveSession) -> Bool {
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == session.processIdentifier,
+              let current = focusedElement(),
+              let currentEditable = editableElement(startingAt: current) else { return false }
+        return CFEqual(currentEditable, session.editableElement)
+    }
+
+    @MainActor
+    private static func liveReadbackContains(_ session: LiveSession, text: String) -> Bool? {
+        guard !text.isEmpty else { return true }
+        guard case .value(let rawValue) = stringAttributeRead(
+            session.editableElement,
+            kAXValueAttribute as String
+        ) else { return nil }
+        let metadata = editorTextMetadata(startingAt: session.editableElement)
+        let value = sanitizedEditableValue(
+            rawValue,
+            semanticPlaceholder: metadata.semanticPlaceholder,
+            committedCharacterCount: metadata.committedCharacterCount,
+            descriptionGhostTexts: metadata.descriptionGhostTexts
+        )
+        return value.contains(text)
+    }
+
+    @MainActor
+    static func restoreLiveClipboard(_ session: LiveSession) {
+        guard let expected = session.lastClipboardWrite else { return }
+        session.clipboardSnapshot.restore(to: .general, ifCurrentStringIs: expected)
+        session.lastClipboardWrite = nil
+    }
+
     private static func editableElement(startingAt element: AXUIElement) -> AXUIElement? {
         var current: AXUIElement? = element
         var depth = 0
@@ -159,14 +418,46 @@ public enum TextInjector {
         return (raw as! AXUIElement)
     }
 
-    /// Insert text at the current selection/cursor. Returns true on success.
-    private static func axInsert(_ element: AXUIElement, _ text: String) -> Bool {
+    /// Inserts through AX only when the resulting value can be calculated and
+    /// read back. Once a write was attempted, callers must not retry via another
+    /// route because that could duplicate text that the target accepted slowly.
+    private static func axSelectedTextInsertVerified(_ element: AXUIElement, _ text: String) -> AXWriteOutcome {
         var settable: DarwinBoolean = false
         guard AXUIElementIsAttributeSettable(element, kAXSelectedTextAttribute as CFString, &settable) == .success,
               settable.boolValue else {
-            return false
+            return .unavailable
         }
-        return AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString, text as CFString) == .success
+
+        let rawBefore: String
+        switch prewriteValue(from: stringAttributeRead(element, kAXValueAttribute as String)) {
+        case .available(let value):
+            rawBefore = value
+        case .unsafe:
+            return .unsafePrewrite
+        }
+        let beforeMetadata = editorTextMetadata(startingAt: element)
+        let before = sanitizedEditableValue(
+            rawBefore,
+            semanticPlaceholder: beforeMetadata.semanticPlaceholder,
+            committedCharacterCount: beforeMetadata.committedCharacterCount,
+            descriptionGhostTexts: beforeMetadata.descriptionGhostTexts
+        )
+        let range = selectedTextRange(of: element)
+        guard range != nil || before.isEmpty else { return .unavailable }
+        let expected = replacingSelection(in: before, range: range, with: text).value
+
+        let status = AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString, text as CFString)
+        guard status == .success else {
+            return writeOutcome(didAttempt: true, setSucceeded: false, readbackMatches: nil)
+        }
+
+        usleep(80_000)
+        guard let rawAfter = stringAttribute(element, kAXValueAttribute as String) else {
+            return writeOutcome(didAttempt: true, setSucceeded: true, readbackMatches: nil)
+        }
+        let afterMetadata = editorTextMetadata(startingAt: element)
+        let matches = readbackMatchesExpected(rawAfter, expected: expected, metadata: afterMetadata)
+        return writeOutcome(didAttempt: true, setSucceeded: true, readbackMatches: matches)
     }
 
     private enum AXValueInsertion {
@@ -174,83 +465,214 @@ public enum TextInjector {
         case appendToEnd
     }
 
-    private static func axValueInsertVerified(_ element: AXUIElement, _ text: String, insertion: AXValueInsertion = .selectedRange) -> Bool {
+    private static func axValueInsertVerified(
+        _ element: AXUIElement,
+        _ text: String,
+        insertion: AXValueInsertion = .selectedRange
+    ) -> AXWriteOutcome {
         var settable = DarwinBoolean(false)
         guard AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &settable) == .success,
               settable.boolValue else {
-            return false
+            return .unavailable
         }
 
-        let rawBefore = stringAttribute(element, kAXValueAttribute as String) ?? ""
-        let ghostTexts = editorGhostTexts(startingAt: element)
-        let before = editableValueRemovingGhostText(rawBefore, ghostTexts: ghostTexts)
+        let rawBefore: String
+        switch prewriteValue(from: stringAttributeRead(element, kAXValueAttribute as String)) {
+        case .available(let value):
+            rawBefore = value
+        case .unsafe:
+            return .unsafePrewrite
+        }
+        let metadata = editorTextMetadata(startingAt: element)
+        let before = sanitizedEditableValue(
+            rawBefore,
+            semanticPlaceholder: metadata.semanticPlaceholder,
+            committedCharacterCount: metadata.committedCharacterCount,
+            descriptionGhostTexts: metadata.descriptionGhostTexts
+        )
+        // A non-empty AXValue in an AI editor is not trustworthy enough to
+        // synthesize a replacement: Electron/web editors may expose visual
+        // prompts as AXValue (sometimes even counting their characters). Let
+        // the editor's native paste path decide what is committed instead. It
+        // naturally dismisses placeholders while preserving real text and the
+        // current caret/selection. Direct AXValue writes remain available for
+        // editors that are provably empty.
+        if requiresNativeEditorInput(sanitizedValue: before) {
+            return .unavailable
+        }
         let range = insertion == .appendToEnd || before.isEmpty ? nil : selectedTextRange(of: element)
         let replacement = replacingSelection(in: before, range: range, with: text)
         let next = replacement.value
 
         let status = AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, next as CFString)
         guard status == .success else {
-            return false
+            return writeOutcome(didAttempt: true, setSucceeded: false, readbackMatches: nil)
         }
 
         usleep(80_000)
-        let rawAfter = stringAttribute(element, kAXValueAttribute as String) ?? ""
-        let after = editableValueRemovingGhostText(rawAfter, ghostTexts: ghostTexts)
-        if rawAfter != after {
-            _ = AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, after as CFString)
+        guard let rawAfter = stringAttribute(element, kAXValueAttribute as String) else {
+            return writeOutcome(didAttempt: true, setSucceeded: true, readbackMatches: nil)
         }
-        let verified = after == next || after.contains(text)
-        if verified {
-            moveCaret(of: element, to: replacement.caretLocation, in: after.isEmpty ? next : after)
+        let afterMetadata = editorTextMetadata(startingAt: element)
+        let matches = readbackMatchesExpected(rawAfter, expected: next, metadata: afterMetadata)
+        let outcome = writeOutcome(didAttempt: true, setSucceeded: true, readbackMatches: matches)
+        if outcome == .verified {
+            moveCaret(of: element, to: replacement.caretLocation, in: next)
         }
-        return verified
+        return outcome
+    }
+
+    static func writeOutcome(
+        didAttempt: Bool,
+        setSucceeded: Bool,
+        readbackMatches: Bool?
+    ) -> AXWriteOutcome {
+        guard didAttempt else { return .unavailable }
+        guard setSucceeded, readbackMatches == true else { return .attemptedUnverified }
+        return .verified
+    }
+
+    static func prewriteValue(from read: AXStringAttributeRead) -> AXPrewriteValue {
+        switch read {
+        case .value(let value):
+            return .available(value)
+        case .absent:
+            return .available("")
+        case .unreadable:
+            return .unsafe
+        }
+    }
+
+    static func requiresNativeEditorInput(sanitizedValue: String) -> Bool {
+        !sanitizedValue.isEmpty
+    }
+
+    static func continuation(
+        after outcome: AXWriteOutcome,
+        whenUnavailable fallback: AXUnavailableFallback
+    ) -> AXContinuation {
+        switch outcome {
+        case .verified:
+            return .inserted
+        case .unavailable:
+            return .continueWith(fallback)
+        case .unsafePrewrite, .attemptedUnverified:
+            return .manualFallback
+        }
+    }
+
+    private static func manualFallbackReason(
+        for outcome: AXWriteOutcome,
+        targetName: String
+    ) -> String {
+        switch outcome {
+        case .unsafePrewrite:
+            return "Could not safely read the \(targetName)'s existing text — nothing was copied or typed"
+        case .attemptedUnverified:
+            return "Text may have been inserted, but the \(targetName) did not confirm it — nothing else was copied or typed"
+        case .unavailable, .verified:
+            return "Insertion stopped before an unsafe fallback — nothing was copied or typed"
+        }
+    }
+
+    static func readbackMatchesExpected(
+        _ rawReadback: String,
+        expected: String,
+        metadata: EditorTextMetadata
+    ) -> Bool {
+        sanitizedEditableValue(
+            rawReadback,
+            semanticPlaceholder: metadata.semanticPlaceholder,
+            committedCharacterCount: metadata.committedCharacterCount,
+            descriptionGhostTexts: metadata.descriptionGhostTexts
+        ) == expected
     }
 
     static func editableValueRemovingGhostText(_ value: String, ghostTexts: Set<String>) -> String {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty { return "" }
-        if ghostTexts.contains(trimmed) { return "" }
-
-        var lines = value.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-        var removedGhostLine = false
-        while let last = lines.last {
-            let trimmedLine = last.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard ghostTexts.contains(trimmedLine) else { break }
-            lines.removeLast()
-            removedGhostLine = true
-        }
-
-        guard removedGhostLine else { return value }
-        return lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        sanitizedEditableValue(
+            value,
+            semanticPlaceholder: nil,
+            committedCharacterCount: nil,
+            descriptionGhostTexts: ghostTexts
+        )
     }
 
-    private static func editorGhostTexts(startingAt element: AXUIElement) -> Set<String> {
-        var values = ignoredEditorGhostValues
+    static func sanitizedEditableValue(
+        _ value: String,
+        semanticPlaceholder: String?,
+        committedCharacterCount: Int?,
+        descriptionGhostTexts: Set<String>
+    ) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return "" }
+
+        // AXPlaceholderValue is semantic metadata, not committed content. Some
+        // web editors mirror it into AXValue, but we remove it only when AX also
+        // proves there are zero actual characters. Identical real user text is
+        // therefore preserved.
+        if committedCharacterCount == 0,
+           let semanticPlaceholder,
+           trimmed == semanticPlaceholder.trimmingCharacters(in: .whitespacesAndNewlines) {
+            return ""
+        }
+
+        if committedCharacterCount == 0, descriptionGhostTexts.contains(trimmed) { return "" }
+        return value
+    }
+
+    private static func editorTextMetadata(startingAt element: AXUIElement) -> EditorTextMetadata {
+        var nodes: [EditorNodeMetadata] = []
         var current: AXUIElement? = element
         var depth = 0
 
         while let candidate = current, depth < 4 {
-            for attribute in ["AXPlaceholderValue", kAXDescriptionAttribute as String] {
-                if let value = stringAttribute(candidate, attribute) {
-                    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if isEditorGhostText(trimmed) { values.insert(trimmed) }
-                }
-            }
+            nodes.append(
+                EditorNodeMetadata(
+                    semanticPlaceholder: stringAttribute(candidate, "AXPlaceholderValue"),
+                    committedCharacterCount: integerAttribute(
+                        candidate,
+                        kAXNumberOfCharactersAttribute as String
+                    ),
+                    description: stringAttribute(candidate, kAXDescriptionAttribute as String)
+                )
+            )
             current = parent(of: candidate)
             depth += 1
         }
 
-        return values
+        guard let target = nodes.first else {
+            return EditorTextMetadata(
+                semanticPlaceholder: nil,
+                committedCharacterCount: nil,
+                descriptionGhostTexts: []
+            )
+        }
+        return resolveEditorTextMetadata(target: target, ancestors: Array(nodes.dropFirst()))
     }
 
-    private static func isEditorGhostText(_ value: String) -> Bool {
-        if value.isEmpty { return false }
-        if ignoredEditorGhostValues.contains(value) { return true }
-        let lowercased = value.lowercased()
-        return lowercased.hasPrefix("type /")
-            || lowercased.hasPrefix("ask ")
-            || lowercased.hasPrefix("message ")
-            || lowercased.hasPrefix("reply ")
+    static func resolveEditorTextMetadata(
+        target: EditorNodeMetadata,
+        ancestors: [EditorNodeMetadata]
+    ) -> EditorTextMetadata {
+        // Text, placeholder, description, and character-count provenance must
+        // stay on the same editable node. Ancestor metadata is intentionally
+        // ignored because it cannot prove that the target has no committed text.
+        _ = ancestors
+        var descriptionGhostTexts = Set<String>()
+        if target.committedCharacterCount == 0,
+           let description = target.description {
+            let trimmed = description.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { descriptionGhostTexts.insert(trimmed) }
+        }
+
+        let placeholder = target.semanticPlaceholder.flatMap { value -> String? in
+            value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : value
+        }
+        return EditorTextMetadata(
+            semanticPlaceholder: placeholder,
+            committedCharacterCount: target.committedCharacterCount,
+            descriptionGhostTexts: descriptionGhostTexts
+        )
     }
 
     private static func selectedTextRange(of element: AXUIElement) -> CFRange? {
@@ -318,18 +740,63 @@ public enum TextInjector {
         return false
     }
 
-    private static func stringAttribute(_ element: AXUIElement, _ attribute: String) -> String? {
+    private static func stringAttributeRead(
+        _ element: AXUIElement,
+        _ attribute: String
+    ) -> AXStringAttributeRead {
         var ref: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &ref) == .success else { return nil }
-        return ref as? String
+        let status = AXUIElementCopyAttributeValue(element, attribute as CFString, &ref)
+        switch status {
+        case .success:
+            guard let value = ref as? String else { return .unreadable }
+            return .value(value)
+        case .attributeUnsupported, .noValue:
+            return .absent
+        default:
+            return .unreadable
+        }
+    }
+
+    private static func stringAttribute(_ element: AXUIElement, _ attribute: String) -> String? {
+        stringAttributeRead(element, attribute).stringValue
+    }
+
+    private static func integerAttribute(_ element: AXUIElement, _ attribute: String) -> Int? {
+        var ref: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &ref) == .success,
+              let number = ref as? NSNumber else { return nil }
+        return number.intValue
+    }
+
+    private static func ancestorRoles(startingAt element: AXUIElement) -> [String] {
+        var roles: [String] = []
+        var current: AXUIElement? = element
+        var depth = 0
+        while let candidate = current, depth < 12 {
+            if let role = stringAttribute(candidate, kAXRoleAttribute as String) {
+                roles.append(role)
+            }
+            current = parent(of: candidate)
+            depth += 1
+        }
+        return roles
+    }
+
+    static func containsWebArea(ancestorRoles: [String]) -> Bool {
+        ancestorRoles.contains("AXWebArea")
     }
 
     /// True when the focus is inside web content (a browser app or an AXWebArea),
     /// where AX text insertion is unreliable. `insert(_:)` decides the actual
     /// strategy: clipboard paste normally, or direct typing for secure fields so
     /// a password never transits the pasteboard.
-    private static func isWebContext(frontmost: String, focusedRole: String, focusedSubrole: String) -> Bool {
-        if focusedRole == "AXWebArea" || focusedSubrole == "AXWebArea" { return true }
+    private static func isWebContext(
+        frontmost: String,
+        focusedRole: String,
+        focusedSubrole: String,
+        isInsideWebArea: Bool
+    ) -> Bool {
+        if isInsideWebArea || focusedRole == "AXWebArea" || focusedSubrole == "AXWebArea" { return true }
         return browserBundleIdentifiers.contains(frontmost)
     }
 
@@ -337,18 +804,43 @@ public enum TextInjector {
         frontmost: String,
         focusedRole: String,
         focusedSubrole: String,
-        isSecure: Bool
+        isSecure: Bool,
+        hasFocusedElement: Bool = true,
+        hasReadableAXMetadata: Bool = true,
+        isInsideWebArea: Bool = false
     ) -> InjectionRoute {
+        if !hasFocusedElement || !hasReadableAXMetadata { return .unknownFocusedTarget }
         if isSecure { return .secureDirectTyping }
         if isAIEditorTarget(frontmost) { return .aiEditorAXValue }
-        if isWebContext(frontmost: frontmost, focusedRole: focusedRole, focusedSubrole: focusedSubrole) {
+        if isWebContext(
+            frontmost: frontmost,
+            focusedRole: focusedRole,
+            focusedSubrole: focusedSubrole,
+            isInsideWebArea: isInsideWebArea
+        ) {
             return .webClipboardPaste
         }
         return .nativeAccessibility
     }
 
-    static func isSecureTextField(focusedSubrole: String?, editableSubrole: String?) -> Bool {
-        focusedSubrole == "AXSecureTextField" || editableSubrole == "AXSecureTextField"
+    static func classifyTargetSecurity(
+        focusedRole: AXStringAttributeRead,
+        focusedSubrole: AXStringAttributeRead,
+        editableRole: AXStringAttributeRead?,
+        editableSubrole: AXStringAttributeRead?
+    ) -> TargetSecurityClassification {
+        let roleReads = [focusedRole] + [editableRole].compactMap { $0 }
+        guard roleReads.allSatisfy({ read in
+            if case .value = read { return true }
+            return false
+        }) else {
+            return .unknown
+        }
+
+        let subroleReads = [focusedSubrole] + [editableSubrole].compactMap { $0 }
+        if subroleReads.contains(.unreadable) { return .unknown }
+        if subroleReads.contains(.value("AXSecureTextField")) { return .secure }
+        return .nonSecure
     }
 
     private static let browserBundleIdentifiers: Set<String> = [
@@ -373,13 +865,9 @@ public enum TextInjector {
         "com.google.antigravity-ide"
     ]
 
-    private static let ignoredEditorGhostValues: Set<String> = [
-        "Ask for follow-up changes",
-        "Type / for commands"
-    ]
-
     @discardableResult
     private static func typeUnicode(_ text: String) -> Bool {
+        if text.isEmpty { return true }
         let source = CGEventSource(stateID: .hidSystemState)
         source?.localEventsSuppressionInterval = 0
 
@@ -402,29 +890,55 @@ public enum TextInjector {
         return postedEvent
     }
 
-    private static func pasteViaClipboard(_ text: String, restoreClipboard: Bool) {
+    @discardableResult
+    private static func postBackspaces(_ count: Int) -> Bool {
+        guard count > 0 else { return true }
+        let source = CGEventSource(stateID: .hidSystemState)
+        source?.localEventsSuppressionInterval = 0
+        for _ in 0..<count {
+            guard let keyDown = CGEvent(
+                keyboardEventSource: source,
+                virtualKey: CGKeyCode(kVK_Delete),
+                keyDown: true
+            ), let keyUp = CGEvent(
+                keyboardEventSource: source,
+                virtualKey: CGKeyCode(kVK_Delete),
+                keyDown: false
+            ) else { return false }
+            keyDown.post(tap: .cghidEventTap)
+            keyUp.post(tap: .cghidEventTap)
+            usleep(4_000)
+        }
+        return true
+    }
+
+    @discardableResult
+    private static func pasteViaClipboard(_ text: String, restoreClipboard: Bool) -> Bool {
         let pasteboard = NSPasteboard.general
         let snapshot = restoreClipboard ? PasteboardSnapshot.capture(from: pasteboard) : nil
         writeClipboardOnly(text)
-        sendPasteShortcut()
+        guard sendPasteShortcut() else { return false }
 
-        guard restoreClipboard, let snapshot else { return }
+        guard restoreClipboard, let snapshot else { return true }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
             snapshot.restore(to: pasteboard, ifCurrentStringIs: text)
         }
+        return true
     }
 
-    private static func sendPasteShortcut() {
+    @discardableResult
+    private static func sendPasteShortcut() -> Bool {
         let source = CGEventSource(stateID: .hidSystemState)
         source?.localEventsSuppressionInterval = 0
 
         let keyDown = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(kVK_ANSI_V), keyDown: true)
         keyDown?.flags = .maskCommand
-        keyDown?.post(tap: .cghidEventTap)
-
         let keyUp = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(kVK_ANSI_V), keyDown: false)
         keyUp?.flags = .maskCommand
-        keyUp?.post(tap: .cghidEventTap)
+        guard let keyDown, let keyUp else { return false }
+        keyDown.post(tap: .cghidEventTap)
+        keyUp.post(tap: .cghidEventTap)
+        return true
     }
 
     private static func writeClipboardOnly(_ text: String) {
@@ -434,7 +948,56 @@ public enum TextInjector {
     }
 }
 
-private struct PasteboardSnapshot {
+@MainActor
+final class SystemLiveTextInjector: LiveTextInserting {
+    private var session: TextInjector.LiveSession?
+
+    func begin() -> Bool {
+        session = TextInjector.beginLiveSession()
+        return session != nil
+    }
+
+    func update(_ text: String) -> Bool {
+        guard let session else { return false }
+        return TextInjector.updateLiveSession(session, with: text)
+    }
+
+    func finish(_ text: String, restoreClipboard: Bool) -> InjectionResult {
+        guard let active = session else {
+            return TextInjector.insert(text, restoreClipboard: restoreClipboard)
+        }
+        defer { session = nil }
+        let updateSucceeded = TextInjector.updateLiveSession(active, with: text)
+        guard TextInjector.liveDeliveryConfirmation(
+            updateSucceeded: updateSucceeded,
+            readbackVerified: active.lastUpdateWasVerified
+        ) == .inserted else {
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.setString(text, forType: .string)
+            let reason = updateSucceeded
+                ? "Live text was sent, but the target did not confirm insertion"
+                : "Live target changed — final text copied to clipboard"
+            return .clipboardOnly(reason)
+        }
+        if restoreClipboard {
+            TextInjector.restoreLiveClipboard(active)
+        } else {
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.setString(text, forType: .string)
+        }
+        return .inserted
+    }
+
+    func cancel() {
+        guard let active = session else { return }
+        TextInjector.cancelLiveSession(active)
+        session = nil
+    }
+}
+
+struct PasteboardSnapshot {
     private let items: [Item]
 
     static func capture(from pasteboard: NSPasteboard) -> PasteboardSnapshot {

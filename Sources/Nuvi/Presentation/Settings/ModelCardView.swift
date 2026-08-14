@@ -23,7 +23,7 @@ struct ModelCardView: View {
     @ObservedObject private var loc = LocalizationStore.shared
 
     private var isWhisper: Bool { model.engine == .whisperKit }
-    private var accentColor: Color { isWhisper ? .blue : .purple }
+    private var accentColor: Color { NuviPalette.lavender }
     private var familyLabel: String { isWhisper ? "Whisper" : "Parakeet" }
     
     var body: some View {
@@ -70,7 +70,7 @@ struct ModelCardView: View {
             }
             
             Divider()
-                .background(Color.white.opacity(0.1))
+                .background(NuviPalette.softWhite.opacity(0.1))
             
             // Estadísticas: Precisión y Velocidad en barras
             VStack(spacing: 12) {
@@ -78,14 +78,14 @@ struct ModelCardView: View {
                     title: tr("Accuracy", "Precisión"),
                     value: model.accuracy,
                     valueText: String(format: "%.0f%%", model.accuracy * 100),
-                    gradient: Gradient(colors: [.yellow, .green])
+                    gradient: Gradient(colors: [NuviPalette.lavender, NuviPalette.softWhite])
                 )
 
                 metricBar(
                     title: tr("Speed", "Velocidad"),
                     value: model.speed,
                     valueText: String(format: "%.1fx RT", model.speed * 10),
-                    gradient: Gradient(colors: [.blue, .cyan])
+                    gradient: Gradient(colors: [NuviPalette.lavender.opacity(0.62), NuviPalette.lavender])
                 )
             }
 
@@ -121,14 +121,14 @@ struct ModelCardView: View {
         .padding(16)
         .background(
             RoundedRectangle(cornerRadius: 16)
-                .fill(Color.white.opacity(0.03))
-                .background(Color.black.opacity(0.2))
+                .fill(NuviPalette.softWhite.opacity(0.03))
+                .background(NuviPalette.charcoal.opacity(0.2))
         )
         .overlay(
             RoundedRectangle(cornerRadius: 16)
                 .stroke(
                     LinearGradient(
-                        colors: [Color.white.opacity(0.1), Color.clear],
+                        colors: [NuviPalette.softWhite.opacity(0.1), Color.clear],
                         startPoint: .topLeading,
                         endPoint: .bottomTrailing
                     ),
@@ -155,7 +155,7 @@ struct ModelCardView: View {
                 Button(action: onCancel) {
                     Image(systemName: "xmark.circle.fill")
                         .font(.title3)
-                        .foregroundColor(.red.opacity(0.8))
+                        .foregroundColor(NuviPalette.lavender.opacity(0.8))
                 }
                 .buttonStyle(.plain)
             }
@@ -163,14 +163,14 @@ struct ModelCardView: View {
             if isActive {
                 HStack(spacing: 4) {
                     Image(systemName: "checkmark.circle.fill")
-                        .foregroundColor(.green)
+                        .foregroundColor(NuviPalette.lavender)
                     Text(tr("Active", "Activo"))
                         .font(.system(size: 11, weight: .bold))
-                        .foregroundColor(.green)
+                        .foregroundColor(NuviPalette.lavender)
                 }
                 .padding(.horizontal, 10)
                 .padding(.vertical, 6)
-                .background(Color.green.opacity(0.15))
+                .background(NuviPalette.lavender.opacity(0.15))
                 .cornerRadius(8)
             } else {
                 Button(action: onSelect) {
@@ -179,7 +179,7 @@ struct ModelCardView: View {
                         .foregroundColor(.primary)
                         .padding(.horizontal, 12)
                         .padding(.vertical, 6)
-                        .background(Color.white.opacity(0.1))
+                        .background(NuviPalette.softWhite.opacity(0.1))
                         .cornerRadius(8)
                 }
                 .buttonStyle(.plain)
@@ -191,10 +191,10 @@ struct ModelCardView: View {
                     Text(tr("Download", "Descargar"))
                 }
                 .font(.system(size: 11, weight: .bold))
-                .foregroundColor(.black)
+                .foregroundColor(NuviPalette.charcoal)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 6)
-                .background(Color.white)
+                .background(NuviPalette.softWhite)
                 .cornerRadius(8)
             }
             .buttonStyle(.plain)
@@ -217,7 +217,7 @@ struct ModelCardView: View {
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
                     Capsule()
-                        .fill(Color.white.opacity(0.08))
+                        .fill(NuviPalette.softWhite.opacity(0.08))
                         .frame(height: 5)
                     
                     Capsule()
@@ -251,10 +251,10 @@ struct CircularProgressView: View {
     var body: some View {
         ZStack {
             Circle()
-                .stroke(Color.white.opacity(0.1), lineWidth: 2)
+                .stroke(NuviPalette.softWhite.opacity(0.1), lineWidth: 2)
             Circle()
                 .trim(from: 0, to: CGFloat(max(0, min(1, progress))))
-                .stroke(Color.blue, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                .stroke(NuviPalette.lavender, style: StrokeStyle(lineWidth: 2, lineCap: .round))
                 .rotationEffect(.degrees(-90))
                 .animation(.linear, value: progress)
         }

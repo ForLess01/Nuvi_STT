@@ -9,6 +9,21 @@ public enum DictationState: Equatable, Sendable {
     case idle
     case listening
     case transcribing
+    case inserted
+    case copied
     case notice(String)
     case error(String)
+}
+
+/// Controls when recognized text is delivered to the focused application.
+public enum DictationDeliveryMode: String, CaseIterable, Equatable, Sendable {
+    case standard
+    case live
+
+    public var label: String {
+        switch self {
+        case .standard: return "Standard"
+        case .live: return "Live (Beta)"
+        }
+    }
 }

@@ -21,4 +21,21 @@ public protocol TranscriptionEngine: AnyObject, Sendable {
     func transcribe(
         _ audio: AsyncStream<AVAudioPCMBuffer>
     ) -> AsyncThrowingStream<TranscriptionEvent, Error>
+
+    /// Consume microphone buffers while optionally favoring an incremental
+    /// recognition path. Engines that are already streaming can keep their
+    /// normal implementation; batch engines may opt into a live adapter.
+    func transcribe(
+        _ audio: AsyncStream<AVAudioPCMBuffer>,
+        reportingPartials: Bool
+    ) -> AsyncThrowingStream<TranscriptionEvent, Error>
+}
+
+public extension TranscriptionEngine {
+    func transcribe(
+        _ audio: AsyncStream<AVAudioPCMBuffer>,
+        reportingPartials: Bool
+    ) -> AsyncThrowingStream<TranscriptionEvent, Error> {
+        transcribe(audio)
+    }
 }

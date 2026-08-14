@@ -30,16 +30,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
     }
 
     var tint: Color {
-        switch self {
-        case .home: return .orange
-        case .configuration: return .gray
-        case .appearance: return .pink
-        case .vocabulary: return .blue
-        case .history: return .indigo
-        case .modes: return .cyan
-        case .sound: return .green
-        case .models: return .teal
-        }
+        NuviPalette.lavender
     }
 }
 
@@ -82,6 +73,9 @@ struct SettingsView: View {
         }
         .frame(width: 780, height: 580)
         .preferredColorScheme(.dark)
+        .fontDesign(.rounded)
+        .tint(NuviPalette.lavender)
+        .foregroundStyle(NuviPalette.softWhite)
     }
 
     @ViewBuilder
@@ -125,13 +119,13 @@ private struct HomePanel: View {
         return "v\(v)"
     }
 
-    /// The same icon the app ships with (the ferrofluid mark), used as a faint
+    /// The same official isologo-only icon the app ships with, used as a faint
     /// background watermark.
     private var appLogo: Image {
         if let icon = NSImage(named: NSImage.applicationIconName) {
             return Image(nsImage: icon)
         }
-        return Image(nsImage: FerrofluidBlobImage.menuBarImage(pointSize: 256, scale: 1))
+        return Image(nsImage: NuviBrand.menuBarImage(pointSize: 256))
     }
 
     var body: some View {
@@ -139,13 +133,18 @@ private struct HomePanel: View {
             // Landing hero
             VStack(alignment: .leading, spacing: 8) {
                 HStack(alignment: .firstTextBaseline, spacing: 10) {
-                    Text("Nuvi")
-                        .font(.system(size: 36, weight: .bold))
+                    if let wordmark = NuviBrand.wordmarkImage() {
+                        Image(nsImage: wordmark)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(width: 162, height: 50)
+                            .accessibilityLabel("Nuvi")
+                    }
                     Text(appVersion)
                         .font(.system(size: 11, weight: .semibold))
                         .padding(.horizontal, 7)
                         .padding(.vertical, 3)
-                        .background(Color.white.opacity(0.08))
+                        .background(NuviPalette.softWhite.opacity(0.08))
                         .cornerRadius(6)
                         .foregroundStyle(.secondary)
                 }
@@ -211,6 +210,8 @@ private struct ConfigurationPanel: View {
     @State private var launchAtLogin = (SMAppService.mainApp.status == .enabled)
     @State private var launchAtLoginError: String?
     @State private var engine = SettingsStore.shared.enginePreference
+    @State private var deliveryMode = SettingsStore.shared.dictationDeliveryMode
+    @State private var translationTarget = SettingsStore.shared.translationTarget
     @ObservedObject private var shortcuts = ShortcutsStore.shared
     @ObservedObject private var loc = LocalizationStore.shared
 
@@ -263,6 +264,38 @@ private struct ConfigurationPanel: View {
                     .labelsHidden()
                     .frame(width: 200)
                     .onChange(of: engine) { _, new in SettingsStore.shared.enginePreference = new }
+                }
+                RowDivider()
+                SettingRow(
+                    title: tr("Dictation mode", "Modo de dictado"),
+                    subtitle: liveModeSubtitle
+                ) {
+                    Picker("", selection: $deliveryMode) {
+                        Text(tr("Standard", "Estándar")).tag(DictationDeliveryMode.standard)
+                        Text(tr("Live (Beta)", "En vivo (Beta)")).tag(DictationDeliveryMode.live)
+                    }
+                    .labelsHidden()
+                    .frame(width: 200)
+                    .onChange(of: deliveryMode) { _, new in setDeliveryMode(new) }
+                }
+                RowDivider()
+                SettingRow(
+                    title: tr("Translation (Beta)", "Traducción (Beta)"),
+                    subtitle: tr(
+                        "Detects the spoken language and translates the settled result before delivery",
+                        "Detecta el idioma hablado y traduce el resultado definitivo antes de entregarlo"
+                    )
+                ) {
+                    Picker("", selection: $translationTarget) {
+                        ForEach(TranslationTarget.allCases, id: \.self) { target in
+                            Text(translationTargetName(target)).tag(target)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 200)
+                    .onChange(of: translationTarget) { _, new in
+                        SettingsStore.shared.translationTarget = new
+                    }
                 }
                 RowDivider()
                 SettingRow(title: tr("Microphone", "Micrófono"),
@@ -339,6 +372,29 @@ private struct ConfigurationPanel: View {
                 }
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: .nuviOutputPreferencesDidChange)) { _ in
+            deliveryMode = SettingsStore.shared.dictationDeliveryMode
+            translationTarget = SettingsStore.shared.translationTarget
+        }
+    }
+
+    private var liveModeSubtitle: String {
+        StatusMenuCopy(language: loc.language).liveDetail(
+            for: engine,
+            modelID: SettingsStore.shared.selectedModelID
+        )
+    }
+
+    private func translationTargetName(_ target: TranslationTarget) -> String {
+        StatusMenuCopy(language: loc.language).translationLabel(target)
+    }
+
+    private func setDeliveryMode(_ mode: DictationDeliveryMode) {
+        if mode == .live, !LiveModeConfirmation.requestIfNeeded() {
+            deliveryMode = SettingsStore.shared.dictationDeliveryMode
+            return
+        }
+        SettingsStore.shared.dictationDeliveryMode = mode
     }
 
     private var launchAtLoginSubtitle: String {
@@ -378,9 +434,42 @@ private struct AppearancePanel: View {
     @ObservedObject private var store = FerrofluidSettingsStore.shared
     @ObservedObject private var loc = LocalizationStore.shared
     @StateObject private var mic = FerrofluidMicProbe()
+    @State private var showPill = SettingsStore.shared.showPill
+    @State private var showMenuBarStatus = SettingsStore.shared.showMenuBarStatus
 
     var body: some View {
         PanelScaffold(title: tr("Appearance", "Apariencia")) {
+            SectionHeader(text: tr("Visibility", "Visibilidad"))
+            Card {
+                SettingRow(
+                    title: tr("Show transcription pill", "Mostrar pill de transcripción"),
+                    subtitle: tr(
+                        "Display the floating listening and completion indicator",
+                        "Muestra el indicador flotante de escucha y finalización"
+                    )
+                ) {
+                    Toggle("", isOn: $showPill)
+                        .labelsHidden()
+                        .onChange(of: showPill) { _, value in
+                            SettingsStore.shared.showPill = value
+                        }
+                }
+                RowDivider()
+                SettingRow(
+                    title: tr("Show status in menu bar", "Mostrar estado en la barra de menú"),
+                    subtitle: tr(
+                        "Expand the isologo with Listening, LIVE, and completion states",
+                        "Expande el isologo con estados de Escuchando, LIVE y finalización"
+                    )
+                ) {
+                    Toggle("", isOn: $showMenuBarStatus)
+                        .labelsHidden()
+                        .onChange(of: showMenuBarStatus) { _, value in
+                            SettingsStore.shared.showMenuBarStatus = value
+                        }
+                }
+            }
+
             SectionHeader(text: tr("Ferrofluid Visualizer", "Visualizador de ferrofluido"))
             Card {
                 HStack(alignment: .top, spacing: 28) {
@@ -388,10 +477,7 @@ private struct AppearancePanel: View {
                     VStack(alignment: .leading, spacing: 14) {
                         presetRow
                         RowDivider()
-                        ColorPicker(tr("Fluid color", "Color del fluido"), selection: colorBinding(\.fluidColor), supportsOpacity: false)
-                            .font(.system(size: 12))
-                        ColorPicker(tr("Background", "Fondo"), selection: colorBinding(\.backgroundColor), supportsOpacity: false)
-                            .font(.system(size: 12))
+                        brandPaletteRow
                         RowDivider()
                         slider(tr("Core size", "Tamaño del núcleo"), value: $store.settings.coreSize, range: 0.05...0.4)
                         slider(tr("Reach", "Alcance"), value: $store.settings.reach, range: 0.1...1.2)
@@ -423,34 +509,41 @@ private struct AppearancePanel: View {
         }
     }
 
-    /// Bridges a stored `RGBColor` to SwiftUI's `Color` for the ColorPicker,
-    /// resolving the picked color in sRGB so it matches the shader uniforms.
-    private func colorBinding(_ keyPath: WritableKeyPath<FerrofluidSettings, RGBColor>) -> Binding<Color> {
-        Binding(
-            get: {
-                let c = store.settings[keyPath: keyPath]
-                return Color(.sRGB, red: Double(c.r), green: Double(c.g), blue: Double(c.b))
-            },
-            set: { newValue in
-                let ns = NSColor(newValue).usingColorSpace(.sRGB) ?? .black
-                store.settings[keyPath: keyPath] = RGBColor(
-                    Float(ns.redComponent), Float(ns.greenComponent), Float(ns.blueComponent))
+    private var brandPaletteRow: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text(tr("Brand palette", "Paleta de marca"))
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
+            HStack(spacing: 12) {
+                paletteSwatch(NuviPalette.softWhite, label: "#F4F5F7")
+                paletteSwatch(NuviPalette.charcoal, label: "#0F1116")
+                paletteSwatch(NuviPalette.lavender, label: "#B89BFF")
             }
-        )
+        }
+    }
+
+    private func paletteSwatch(_ color: Color, label: String) -> some View {
+        HStack(spacing: 5) {
+            Circle()
+                .fill(color)
+                .frame(width: 13, height: 13)
+                .overlay(Circle().strokeBorder(NuviPalette.softWhite.opacity(0.18), lineWidth: 0.5))
+            Text(label).font(.system(size: 10, design: .monospaced))
+        }
     }
 
     private var preview: some View {
         VStack(spacing: 10) {
             ZStack {
-                Circle().fill(Color.white)
+                Circle().fill(NuviPalette.softWhite)
                 FerrofluidView(level: mic.active ? mic.level : 0,
                                settings: store.settings,
                                simulate: !mic.active)
                     .clipShape(Circle())
             }
             .frame(width: 150, height: 150)
-            .overlay(Circle().strokeBorder(.white.opacity(0.12), lineWidth: 1))
-            .shadow(color: .black.opacity(0.4), radius: 8, y: 2)
+            .overlay(Circle().strokeBorder(NuviPalette.softWhite.opacity(0.12), lineWidth: 1))
+            .shadow(color: NuviPalette.charcoal.opacity(0.4), radius: 8, y: 2)
 
             Button { mic.toggle() } label: {
                 Label(mic.active ? tr("Stop mic", "Detener mic") : tr("Test with mic", "Probar con mic"),
@@ -459,7 +552,7 @@ private struct AppearancePanel: View {
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
-            .tint(mic.active ? .red : .accentColor)
+            .tint(NuviPalette.lavender)
 
             if mic.denied {
                 Text(tr("Microphone access denied.\nEnable it in System Settings.",
@@ -542,7 +635,7 @@ private struct AccessibilityStatus: View {
     var body: some View {
         HStack(spacing: 8) {
             Image(systemName: trusted ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                .foregroundStyle(trusted ? .green : .orange)
+                .foregroundStyle(NuviPalette.lavender)
             Text(trusted ? tr("Granted", "Concedido") : tr("Not granted", "No concedido"))
                 .font(.system(size: 12))
                 .foregroundStyle(.secondary)

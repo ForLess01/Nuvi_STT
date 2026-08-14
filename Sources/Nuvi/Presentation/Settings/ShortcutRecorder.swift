@@ -76,7 +76,7 @@ struct ShortcutRecorder: View {
                     .frame(minWidth: 120)
             }
             .buttonStyle(.bordered)
-            .tint(recording.active ? .blue : nil)
+            .tint(recording.active ? NuviPalette.lavender : nil)
 
             if allowsClear, combo != nil, !recording.active {
                 Button(action: { onChange(nil) }) {

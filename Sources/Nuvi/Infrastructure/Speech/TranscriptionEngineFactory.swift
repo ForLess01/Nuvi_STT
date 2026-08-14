@@ -4,7 +4,12 @@ import Foundation
 /// engine preference. `auto` builds the hybrid composite (native first, Whisper
 /// fallback). Everything else returns a single adapter.
 public enum TranscriptionEngineFactory {
+    static func normalizedConfiguration(_ configuration: TranscriptionConfiguration) -> TranscriptionConfiguration {
+        configuration.normalized
+    }
+
     public static func make(configuration: TranscriptionConfiguration) -> TranscriptionEngine {
+        let configuration = normalizedConfiguration(configuration)
         switch configuration.engine {
         case .speechAnalyzer:
             return SpeechAnalyzerEngine()

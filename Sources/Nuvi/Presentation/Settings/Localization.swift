@@ -21,7 +21,10 @@ public final class LocalizationStore: ObservableObject {
     public static let shared = LocalizationStore()
 
     @Published public var language: AppLanguage {
-        didSet { SettingsStore.shared.interfaceLanguage = language.rawValue }
+        didSet {
+            SettingsStore.shared.interfaceLanguage = language.rawValue
+            NotificationCenter.default.post(name: .nuviPresentationPreferencesDidChange, object: self)
+        }
     }
 
     public init() {
