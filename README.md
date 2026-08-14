@@ -1,21 +1,53 @@
 # Nuvi
 
 <p align="center">
-  <img src="Resources/cover.png" alt="Nuvi Cover Art" width="100%">
+  <img src="Resources/cover_2.png" alt="Nuvi — native on-device dictation for macOS" width="100%">
 </p>
 
 Nuvi is a native macOS menu-bar dictation app featuring a floating pill, a Metal-based ferrofluid visualizer, global hotkeys, and on-device speech-to-text transcription that automatically inserts text into the focused application.
 
 Built purely in Swift, AppKit, SwiftUI, AVFoundation, and Metal. No Electron. No Python runtime dependencies.
 
-## What's new in v2
+## Android offline preview
 
-- **Models Library** — browse, download, select and delete models for **two engines**: Whisper (WhisperKit) and **Parakeet** (FluidAudio). Selecting a model switches the active engine automatically.
-- **English / Spanish interface** — switch the Settings language at runtime (no relaunch) from *Configuration → Interface*.
-- **Ferrofluid visualizer** — fluid/background **color pickers**, curated **presets**, and a **live mic preview** to tune it against your voice.
-- **Home landing** with an app-icon watermark and a real-time view of your configured shortcut; **ferrofluid “N” menu-bar icon**.
-- **Privacy & hardening** — Hardened Runtime signing, history opt-out (`history.json` written `0600`), and password fields never transit the clipboard.
-- **Performance** — the visualizer pauses while the pill is hidden.
+The repository now also contains an initial native Android IME in
+[`android/`](android/README.md), designed first for the Samsung Galaxy S24 Ultra.
+It captures 16 kHz mono audio and inserts through `InputConnection`. NVIDIA
+Parakeet TDT 0.6B v3 INT8 via official `sherpa-onnx` v1.13.4 is the primary
+engine; pinned `whisper.cpp` v1.8.6 remains an explicit alternative. The
+engines are serialized by a single-native permit and there is no silent cloud
+or model fallback. If a timed-out Parakeet native call does not exit, later
+attempts return `ENGINE_BUSY` instead of creating parallel native work; see the
+Android guide for the documented residual risk.
+
+The Android manifest has no internet permission. On a Samsung Galaxy S24 Ultra,
+download the official Parakeet `.tar.bz2` archive in Chrome, then select it from
+Nuvi's **Import model from Downloads** flow without extracting it. Nuvi performs
+bounded stream extraction, validates and load-tests the exact four-file model
+bundle, then atomically activates it in app-private storage. See the complete
+[Android setup, error-code, benchmark, privacy, and design guide](android/README.md).
+
+The Android visual layer is an Android-native optical-glass interpretation,
+not Apple's proprietary Liquid Glass implementation. Opaque content remains
+separate from a single floating controls layer, and the UI honors reduced
+motion/transparency, contrast, and power-saver behavior. The IME includes an
+AGSL/Canvas ferrofluid control and a deterministic vector adaptive icon.
+
+## What's new in v2.1
+
+- **LIVE dictation (Beta)** — progressively inserts speech into the focused editable field while preserving committed text across pauses and partial revisions.
+- **Automatic translation (Beta)** — detects the spoken language and delivers the original text, English (US), English (UK), or Portuguese (Brazil) through Apple's on-device Translation framework.
+- **Recent Transcriptions** — quickly recover, copy, or insert recent results from the menu bar.
+- **Safer text insertion** — avoids leaking placeholder or suggestion text, verifies successful delivery, and reports **Inserted** or **Copied** instead of echoing private transcript content in the pill.
+- **A quieter interface** — independently hide the floating pill or active menu-bar status text while keeping dictation and Escape-to-cancel available.
+- **New Nuvi identity** — official isologo, app icon, menu-bar mark, Soft White / Charcoal / Lavender palette, and refreshed community cover.
+- **Reliability** — single-instance launch protection and broader engine, LIVE, translation, history, and insertion regression coverage.
+
+<p align="center">
+  <img src="docs/assets/releases/v2.1.0/menubar-status.gif" alt="Nuvi v2.1 menu-bar status" width="100%">
+</p>
+
+See the complete [Nuvi v2.1.0 release notes](docs/releases/v2.1.0.md).
 
 ## Quick Install
 
@@ -37,11 +69,11 @@ brew install --cask nuvi
 
 ## Verified status
 
-Verified in this repository on **2026-06-18**:
+Verified in this repository on **2026-08-14**:
 
-- `swift build` ✅
-- `./scripts/build-app.sh release` ✅ (Hardened Runtime)
-- `swift test` ✅ 13 regression tests
+- `swift test` ✅ 117 tests, 0 failures (2 opt-in runtime probes skipped)
+- Release bundle ✅ built, signed, installed, and matched byte-for-byte with the
+  installed executable during local release verification
 
 Important: the repo currently documents some historical engine claims, but it
 does **not** include benchmark artifacts that prove relative WER/speed numbers.
@@ -64,20 +96,22 @@ Nuvi exposes four engine preferences:
 
 This matters because older docs in the repo incorrectly said that `auto` was
 the default. It is **not** the default right now; `speechAnalyzer` is.
+Engine and model changes apply to the next dictation without relaunching Nuvi.
+If a setting changes during an active recording, Nuvi finishes or cancels that
+session with its original engine and then applies the new configuration.
 
 ## Models and offline dictation
 
 Transcription models are **not** bundled directly inside the Git repository to keep the download size lightweight. Instead, Nuvi manages and downloads models dynamically:
 
-### 1. `speechAnalyzer` (Apple Speech Engine)
-Uses Apple's native `SFSpeechRecognizer` framework.
-* **macOS Compatibility**:
-  - **Requisitos**: Disponible a partir de macOS 10.15 (Catalina).
-  - **On-Device (Offline)**: Para que el reconocimiento sea 100% local, privado y sin conexión a internet, se requiere **Apple Silicon (M1/M2/M3/M4/etc.)** o macOS 12 (Monterey) en adelante con soporte de dictado local activado.
-* **Modelos**: Utiliza los modelos de redes neuronales propietarios de Apple (Siri/Dictation) integrados y optimizados directamente en macOS.
-* **Idiomas y Configuración**:
-  1. Abrí **System Settings (Ajustes del Sistema) → Keyboard (Teclado) → Dictation (Dictado)**.
-  2. Activá el Dictado y seleccioná los idiomas que quieras utilizar. Asegurate de que se descarguen localmente para usarlos sin internet.
+### 1. `speechAnalyzer` (Apple speech engine)
+
+The adapter currently uses Apple's `SFSpeechRecognizer` API and requires
+on-device recognition. Nuvi itself targets **macOS 26.0**, regardless of the
+older OS versions on which parts of the Speech framework first appeared.
+Availability still depends on the selected locale and the speech assets present
+on the Mac. Enable Dictation and install the desired language in **System
+Settings → Keyboard → Dictation** before treating an offline result as verified.
 
 ### 2. `whisperKit` / `auto` (Whisper Engine)
 Utiliza el framework de código abierto `WhisperKit` de Argmax, ejecutando modelos Whisper de OpenAI optimizados para CoreML (Apple Neural Engine).
@@ -126,8 +160,13 @@ To cut a release:
    ditto -c -k --sequesterRsrc --keepParent build/Nuvi.app build/Nuvi.zip
    shasum -a 256 build/Nuvi.zip   # note the sha256
    ```
-2. Create the GitHub release with `build/Nuvi.zip` attached (tag `vX.Y.Z`).
+2. Copy `docs/releases/vX.Y.Z.md` into the GitHub release description and
+   attach `build/Nuvi.zip` to tag `vX.Y.Z`.
 3. Update `version` and `sha256` in `Casks/nuvi.rb` of the `ForLess01/homebrew-tap` repo.
+
+Release notes live in `docs/releases/`; their screenshots and GIFs live in
+`docs/assets/releases/vX.Y.Z/`. Keep app/runtime assets in `Resources/` so
+release media never becomes part of the packaged app by accident.
 
 ### First launch (clearing Gatekeeper, free)
 
@@ -162,8 +201,10 @@ Sources/Nuvi/
 │   ├── Modes/
 │   ├── Output/
 │   ├── Settings/
-│   └── Speech/
+│   ├── Speech/
+│   └── Translation/
 └── Presentation/
+    ├── Brand/
     ├── Ferrofluid/
     ├── MenuBar/
     ├── Pill/
@@ -183,7 +224,7 @@ One correction versus older docs: `AudioCaptureService` is currently a
 
 ## Installation and Setup
 
-### 1. Build and Install
+### 1. Build and install
 
 Nuvi is compiled directly from the source code. Follow these simple steps to install it:
 
@@ -192,7 +233,7 @@ Nuvi is compiled directly from the source code. Follow these simple steps to ins
    git clone git@github.com:ForLess01/Nuvi_STT.git
    cd Nuvi_STT
    ```
-2. Build the production app bundle using the release script:
+2. Build the production app bundle without modifying `/Applications`:
    ```bash
    ./scripts/build-app.sh release
    ```
@@ -200,7 +241,14 @@ Nuvi is compiled directly from the source code. Follow these simple steps to ins
    ```bash
    open build/Nuvi.app
    ```
-   *Tip: You can drag and drop `Nuvi.app` from the `build` folder into your `/Applications` directory to install it permanently.*
+4. To build and replace `/Applications/Nuvi.app` explicitly:
+   ```bash
+   ./scripts/install-app.sh release
+   ```
+
+`build-app.sh` is safe for packaging because it writes SwiftPM artifacts under
+`.build/` and the packaged app under `build/`; it never mutates `/Applications`.
+`install-app.sh` is the opt-in local installation path.
 
 ---
 
@@ -230,15 +278,20 @@ Shortcuts are configured in **Settings → Configuration → Keyboard Shortcuts*
 
 ## Implemented features
 
-- Floating pill (`NSPanel`) with a smooth left-to-right fade animation, pinned top-left
+- Floating pill (`NSPanel`) with animated listening, LIVE, inserted, and copied states
 - Live ferrofluid visualizer rendered with Metal — color pickers, presets, and a live mic preview
-- Menu-bar control surface with a ferrofluid "N" icon
+- Official Nuvi app and menu-bar identity with optional active status text
 - SpeechAnalyzer adapter
 - WhisperKit adapter
 - Parakeet (FluidAudio) adapter
 - Hybrid engine adapter
 - **Models Library** — download / select / delete models for both engines, with real disk sizes and referential RAM
 - **English / Spanish interface** with runtime switching
+- **LIVE dictation (Beta)** across the current engine adapters
+- **Automatic output translation (Beta)** with source-language detection
+- **Recent Transcriptions** menu with copy and insertion actions
+- Independent pill and menu-bar status visibility controls
+- Single-instance launch protection
 - Vocabulary replacement rules
 - History persistence (opt-out, owner-only file permissions)
 - Modes with formatting / affixes / optional auto-activation by frontmost app
@@ -248,23 +301,28 @@ Shortcuts are configured in **Settings → Configuration → Keyboard Shortcuts*
 
 ## Known gaps
 
-- Test coverage is still modest (13 regression tests): vocabulary, mode
-  resolution, retry after engine errors, cancel-without-delivery, the models
-  catalog, and the ferrofluid shader/uniform layout
-- WhisperKit and Parakeet both transcribe in batch after recording stops; they
-  do not stream partials
+- Test coverage includes vocabulary, mode resolution, retry after engine
+  errors, cancel-without-delivery, runtime engine/model reconfiguration, pure
+  text-injection routing/ghost-text behavior, the models catalog, and the
+  ferrofluid shader/uniform layout. Live Accessibility behavior still requires
+  manual validation in real target apps.
+- LIVE is a Beta workflow and still requires manual Accessibility validation in
+  each target app; unsupported or secure fields intentionally fail closed
+- Translation availability depends on Apple's supported language pairs and
+  locally available language assets
 - SpeechAnalyzer probe results are machine/asset dependent
 - Model RAM figures are referential: Parakeet is measured, Whisper is estimated
 
 ## Engine verification workflow
 
-The repo includes a headless probe mode so you can verify engine behavior on a
-real machine without using the UI:
+The repo includes a headless probe mode so you can verify one audio file through
+the probe's configured engine path on a real machine without using the UI:
 
 ```bash
 say -o /tmp/t.aiff "hola, esto es una prueba de dictado"
 "$(swift build -c release --show-bin-path)/Nuvi" --probe /tmp/t.aiff es-ES
 ```
 
-That command is the correct verification path, but its output is machine- and
-asset-dependent, so this README does not hardcode a claimed result anymore.
+The probe does not replace UI validation, Accessibility insertion testing, or a
+full engine/model matrix. Its output is machine- and asset-dependent, so this
+README does not hardcode a claimed result.
