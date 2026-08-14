@@ -256,7 +256,7 @@ private struct ConfigurationPanel: View {
                 }
                 RowDivider()
                 SettingRow(title: tr("Engine", "Motor"),
-                           subtitle: tr("Engine change applies on next launch", "El cambio de motor se aplica al reiniciar")) {
+                           subtitle: tr("Engine change applies to the next dictation", "El cambio de motor se aplica al próximo dictado")) {
                     Picker("", selection: $engine) {
                         ForEach(EnginePreference.allCases, id: \.self) { Text($0.label).tag($0) }
                     }

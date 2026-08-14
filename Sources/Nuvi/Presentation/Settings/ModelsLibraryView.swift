@@ -104,8 +104,7 @@ struct ModelsLibraryView: View {
                                 downloadService.deleteModel(modelId: model.id)
                                 // Si eliminamos el activo, volvemos a tiny por seguridad
                                 if activeModelId == model.id {
-                                    SettingsStore.shared.selectedModelID = "openai_whisper-tiny"
-                                    SettingsStore.shared.enginePreference = .whisperKit
+                                    SettingsStore.shared.selectModel(id: "openai_whisper-tiny", engine: .whisperKit)
                                     activeModelId = "openai_whisper-tiny"
                                 }
                             }
@@ -125,8 +124,10 @@ struct ModelsLibraryView: View {
     /// Activating a model also switches the engine so the runtime loads the right
     /// backend for the selected model id.
     private func activate(_ model: AppModel) {
-        SettingsStore.shared.selectedModelID = model.id
-        SettingsStore.shared.enginePreference = (model.engine == .parakeet) ? .parakeet : .whisperKit
+        SettingsStore.shared.selectModel(
+            id: model.id,
+            engine: (model.engine == .parakeet) ? .parakeet : .whisperKit
+        )
         activeModelId = model.id
     }
 

@@ -6,6 +6,7 @@ import Carbon.HIToolbox
 public enum InjectionResult: Sendable {
     case inserted                // inserted into the focused text field/editor
     case clipboardOnly(String)   // left on the clipboard, with a reason
+    case manualFallback(String)  // nothing copied; user action is required
 }
 
 /// Places transcribed text into whatever app has focus.
@@ -13,8 +14,21 @@ public enum InjectionResult: Sendable {
 /// Order of attempts:
 ///   1. Direct Accessibility insertion when the focused element supports it.
 ///   2. Direct Unicode typing into a focused editable element.
-///   3. Clipboard fallback only when no editable target is available/trusted.
+///   3. Clipboard fallback only after a trusted AX inspection establishes that
+///      the target is not a secure field.
 public enum TextInjector {
+    enum PreflightPolicy: Equatable {
+        case classifyFocusedTarget
+        case directTypingWithoutClipboard
+    }
+
+    enum InjectionRoute: Equatable {
+        case secureDirectTyping
+        case aiEditorAXValue
+        case webClipboardPaste
+        case nativeAccessibility
+    }
+
     @discardableResult
     public static func ensureAccessibilityPermission() -> Bool {
         let key = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
@@ -29,40 +43,51 @@ public enum TextInjector {
         let frontmost = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "?"
         NSLog("Nuvi/inject: trusted=\(trusted), frontmost=\(frontmost), characters=\(text.count)")
 
-        guard trusted else {
-            writeClipboardOnly(text)
-            NSLog("Nuvi/inject: Accessibility NOT trusted → clipboard")
-            return .clipboardOnly("Copied to clipboard — Accessibility not granted")
+        switch preflightPolicy(isAccessibilityTrusted: trusted) {
+        case .directTypingWithoutClipboard:
+            // Without AX trust Nuvi cannot determine whether the focused field
+            // is secure. Never put unknown text on NSPasteboard preemptively.
+            NSLog("Nuvi/inject: Accessibility NOT trusted → direct typing without clipboard")
+            return untrustedAttemptResult(didPostEvent: typeUnicode(text))
+        case .classifyFocusedTarget:
+            break
         }
 
         let element = focusedElement()
         let role = element.flatMap { stringAttribute($0, kAXRoleAttribute as String) } ?? "?"
         let subrole = element.flatMap { stringAttribute($0, kAXSubroleAttribute as String) } ?? "?"
         let editable = element.flatMap(editableElement(startingAt:))
+        let editableSubrole = editable.flatMap { stringAttribute($0, kAXSubroleAttribute as String) }
+        let secure = isSecureTextField(focusedSubrole: subrole, editableSubrole: editableSubrole)
         NSLog("Nuvi/inject: focused role=\(role), subrole=\(subrole), editableTarget=\(editable != nil)")
 
-        if isAIEditorTarget(frontmost), let element {
+        switch route(frontmost: frontmost, focusedRole: role, focusedSubrole: subrole, isSecure: secure) {
+        case .secureDirectTyping:
+            // This MUST precede every route that touches NSPasteboard. AI editors
+            // and browsers can both expose secure descendants.
+            NSLog("Nuvi/inject: secure field → direct typing")
+            return typeUnicode(text)
+                ? .inserted
+                : .manualFallback("Could not type into the secure field — nothing was copied")
+
+        case .aiEditorAXValue:
+            guard let element else {
+                writeClipboardOnly(text)
+                return .clipboardOnly("Copied to clipboard — no text field focused")
+            }
             if axValueInsertVerified(element, text, insertion: .appendToEnd) {
                 return .inserted
             }
             pasteViaClipboard(text, restoreClipboard: restoreClipboard)
             return .inserted
-        }
 
-        // Web content (browsers / AXWebArea) FIRST: AX text insertion frequently
-        // reports success but silently does nothing in web inputs (e.g. the
-        // YouTube search box). Trying it first would short-circuit and leave the
-        // user with nothing — not even on the clipboard. So route web straight to
-        // the reliable path: clipboard paste, or direct typing for secure fields.
-        if isWebContext(frontmost: frontmost, focusedRole: role, focusedSubrole: subrole) {
-            if subrole == "AXSecureTextField" {
-                NSLog("Nuvi/inject: secure web field → direct typing")
-                typeUnicode(text)
-            } else {
-                NSLog("Nuvi/inject: web target → clipboard paste")
-                pasteViaClipboard(text, restoreClipboard: restoreClipboard)
-            }
+        case .webClipboardPaste:
+            NSLog("Nuvi/inject: web target → clipboard paste")
+            pasteViaClipboard(text, restoreClipboard: restoreClipboard)
             return .inserted
+
+        case .nativeAccessibility:
+            break
         }
 
         // Native apps: direct Accessibility insertion where supported.
@@ -77,8 +102,9 @@ public enum TextInjector {
                 return .inserted
             }
             NSLog("Nuvi/inject: direct Unicode typing")
-            typeUnicode(text)
-            return .inserted
+            return typeUnicode(text)
+                ? .inserted
+                : .manualFallback("Could not type into the focused field — nothing was copied")
         }
 
         writeClipboardOnly(text)
@@ -87,6 +113,21 @@ public enum TextInjector {
     }
 
     // MARK: - Accessibility helpers
+
+    static func preflightPolicy(isAccessibilityTrusted: Bool) -> PreflightPolicy {
+        isAccessibilityTrusted ? .classifyFocusedTarget : .directTypingWithoutClipboard
+    }
+
+    static func untrustedAttemptResult(didPostEvent: Bool) -> InjectionResult {
+        if didPostEvent {
+            return .manualFallback(
+                "Direct typing was attempted, but Accessibility is required to verify insertion — nothing was copied"
+            )
+        }
+        return .manualFallback(
+            "Could not attempt direct typing; grant Accessibility and try again — nothing was copied"
+        )
+    }
 
     private static func focusedElement() -> AXUIElement? {
         let system = AXUIElementCreateSystemWide()
@@ -165,7 +206,7 @@ public enum TextInjector {
         return verified
     }
 
-    private static func editableValueRemovingGhostText(_ value: String, ghostTexts: Set<String>) -> String {
+    static func editableValueRemovingGhostText(_ value: String, ghostTexts: Set<String>) -> String {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { return "" }
         if ghostTexts.contains(trimmed) { return "" }
@@ -223,7 +264,7 @@ public enum TextInjector {
         return range
     }
 
-    private static func replacingSelection(in value: String, range: CFRange?, with text: String) -> (value: String, caretLocation: Int) {
+    static func replacingSelection(in value: String, range: CFRange?, with text: String) -> (value: String, caretLocation: Int) {
         let insertedLength = (text as NSString).length
         guard let range, range.location >= 0, range.length >= 0 else {
             let nsLength = (value as NSString).length
@@ -292,6 +333,24 @@ public enum TextInjector {
         return browserBundleIdentifiers.contains(frontmost)
     }
 
+    static func route(
+        frontmost: String,
+        focusedRole: String,
+        focusedSubrole: String,
+        isSecure: Bool
+    ) -> InjectionRoute {
+        if isSecure { return .secureDirectTyping }
+        if isAIEditorTarget(frontmost) { return .aiEditorAXValue }
+        if isWebContext(frontmost: frontmost, focusedRole: focusedRole, focusedSubrole: focusedSubrole) {
+            return .webClipboardPaste
+        }
+        return .nativeAccessibility
+    }
+
+    static func isSecureTextField(focusedSubrole: String?, editableSubrole: String?) -> Bool {
+        focusedSubrole == "AXSecureTextField" || editableSubrole == "AXSecureTextField"
+    }
+
     private static let browserBundleIdentifiers: Set<String> = [
         "com.apple.Safari",
         "com.google.Chrome",
@@ -319,13 +378,15 @@ public enum TextInjector {
         "Type / for commands"
     ]
 
-    private static func typeUnicode(_ text: String) {
+    @discardableResult
+    private static func typeUnicode(_ text: String) -> Bool {
         let source = CGEventSource(stateID: .hidSystemState)
         source?.localEventsSuppressionInterval = 0
 
         let units = Array(text.utf16)
         let chunkSize = 32
         var offset = 0
+        var postedEvent = false
 
         while offset < units.count {
             let end = min(offset + chunkSize, units.count)
@@ -333,10 +394,12 @@ public enum TextInjector {
             if let event = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true) {
                 event.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: &chunk)
                 event.post(tap: .cghidEventTap)
+                postedEvent = true
             }
             usleep(12_000)
             offset = end
         }
+        return postedEvent
     }
 
     private static func pasteViaClipboard(_ text: String, restoreClipboard: Bool) {

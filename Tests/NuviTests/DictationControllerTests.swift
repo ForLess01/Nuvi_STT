@@ -84,6 +84,121 @@ final class DictationControllerTests: XCTestCase {
         XCTAssertEqual(injector.insertedTexts, [])
     }
 
+    func testReconfigurationPreparesNewEngineWithSameLocale() async throws {
+        let audio = FakeAudioCapture()
+        let first = FakeEngine(identifier: "first")
+        let second = FakeEngine(identifier: "second")
+        let controller = DictationController(
+            audio: audio,
+            engine: first,
+            history: HistoryStore(),
+            vocabulary: VocabularyStore(),
+            modes: ModesStore(),
+            textInjector: FakeTextInjector(),
+            engineConfigurationID: "speech-analyzer:model-a"
+        )
+
+        controller.start()
+        await waitUntil { controller.state == .listening }
+        controller.cancel()
+        await Task.yield()
+
+        controller.reconfigure(engine: second, configurationID: "whisperkit:model-b")
+        controller.start()
+        await waitUntil { controller.state == .listening }
+
+        XCTAssertEqual(first.preparedLocales.count, 1)
+        XCTAssertEqual(second.preparedLocales.count, 1)
+        controller.cancel()
+    }
+
+    func testReconfigurationDuringSessionAppliesAfterCancellation() async throws {
+        let audio = FakeAudioCapture()
+        let first = FakeEngine(identifier: "first")
+        let second = FakeEngine(identifier: "second")
+        let controller = DictationController(
+            audio: audio,
+            engine: first,
+            history: HistoryStore(),
+            vocabulary: VocabularyStore(),
+            modes: ModesStore(),
+            textInjector: FakeTextInjector(),
+            engineConfigurationID: "first:model-a"
+        )
+
+        controller.start()
+        await waitUntil { controller.state == .listening }
+        controller.reconfigure(engine: second, configurationID: "second:model-b")
+        controller.cancel()
+        await Task.yield()
+        controller.start()
+        await waitUntil { controller.state == .listening }
+
+        XCTAssertEqual(first.preparedLocales.count, 1)
+        XCTAssertEqual(second.preparedLocales.count, 1)
+        controller.cancel()
+    }
+
+    func testReturningToActiveConfigurationClearsPendingEngine() async throws {
+        let audio = FakeAudioCapture()
+        let first = FakeEngine(identifier: "first")
+        let pending = FakeEngine(identifier: "pending")
+        let controller = DictationController(
+            audio: audio,
+            engine: first,
+            history: HistoryStore(),
+            vocabulary: VocabularyStore(),
+            modes: ModesStore(),
+            textInjector: FakeTextInjector(),
+            engineConfigurationID: "first:model-a"
+        )
+
+        controller.start()
+        await waitUntil { controller.state == .listening }
+        controller.reconfigure(engine: pending, configurationID: "second:model-b")
+        controller.reconfigure(engine: first, configurationID: "first:model-a")
+        controller.cancel()
+        await Task.yield()
+        controller.start()
+        await waitUntil { controller.state == .listening }
+
+        XCTAssertEqual(first.preparedLocales.count, 1)
+        XCTAssertEqual(pending.preparedLocales.count, 0)
+        controller.cancel()
+    }
+
+    func testImmediateCancelRestartKeepsNewSessionAndDefersReconfiguration() async throws {
+        let audio = FakeAudioCapture()
+        let first = FakeEngine(identifier: "first")
+        let replacement = FakeEngine(identifier: "replacement")
+        let controller = DictationController(
+            audio: audio,
+            engine: first,
+            history: HistoryStore(),
+            vocabulary: VocabularyStore(),
+            modes: ModesStore(),
+            textInjector: FakeTextInjector(),
+            engineConfigurationID: "first:model-a"
+        )
+
+        controller.start()
+        await waitUntil { controller.state == .listening }
+        controller.cancel()
+        controller.start() // Intentionally no yield: session A cleanup may still be running.
+        controller.reconfigure(engine: replacement, configurationID: "replacement:model-b")
+        await waitUntil { controller.state == .listening }
+        try? await Task.sleep(nanoseconds: 30_000_000)
+
+        XCTAssertEqual(controller.state, .listening)
+        XCTAssertEqual(replacement.preparedLocales.count, 0)
+
+        controller.cancel()
+        controller.start()
+        await waitUntil { controller.state == .listening }
+        XCTAssertEqual(replacement.preparedLocales.count, 1)
+        controller.cancel()
+    }
+
     private func waitUntil(_ predicate: @escaping @MainActor () -> Bool) async {
         for _ in 0..<100 where !predicate() {
             try? await Task.sleep(nanoseconds: 10_000_000)
@@ -117,12 +232,18 @@ private final class FakeAudioCapture: AudioCapturing, @unchecked Sendable {
 }
 
 private final class FakeEngine: TranscriptionEngine, @unchecked Sendable {
-    let identifier = "fake"
+    let identifier: String
     var prepareError: Error?
     var events: [TranscriptionEvent] = []
+    var preparedLocales: [String] = []
     private var continuation: AsyncThrowingStream<TranscriptionEvent, Error>.Continuation?
 
+    init(identifier: String = "fake") {
+        self.identifier = identifier
+    }
+
     func prepare(locale: Locale) async throws {
+        preparedLocales.append(locale.identifier)
         if let prepareError { throw prepareError }
     }
 

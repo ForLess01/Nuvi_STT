@@ -1,5 +1,16 @@
 import Foundation
 
+extension Notification.Name {
+    static let nuviTranscriptionConfigurationDidChange = Notification.Name("nuvi.transcriptionConfigurationDidChange")
+}
+
+public struct TranscriptionConfiguration: Equatable, Sendable {
+    public let engine: EnginePreference
+    public let modelID: String
+
+    public var identity: String { "\(engine.rawValue):\(modelID)" }
+}
+
 /// Which transcription engine the app uses. `auto` is the true hybrid: try the
 /// native SpeechAnalyzer, fall back to WhisperKit when it can't serve a locale.
 public enum EnginePreference: String, CaseIterable, Sendable {
@@ -67,12 +78,37 @@ public final class SettingsStore: @unchecked Sendable {
         // Default to the native engine: reliable, no downloads. WhisperKit (and
         // the hybrid that can fall back to it) are opt-in from Settings.
         get { EnginePreference(rawValue: defaults.string(forKey: Keys.engine) ?? "") ?? .speechAnalyzer }
-        set { defaults.set(newValue.rawValue, forKey: Keys.engine) }
+        set {
+            let changed = newValue != enginePreference
+            defaults.set(newValue.rawValue, forKey: Keys.engine)
+            if changed { notifyTranscriptionConfigurationChanged() }
+        }
     }
 
     public var selectedModelID: String {
         get { defaults.string(forKey: Keys.selectedModelID) ?? "openai_whisper-tiny" }
-        set { defaults.set(newValue, forKey: Keys.selectedModelID) }
+        set {
+            let changed = newValue != selectedModelID
+            defaults.set(newValue, forKey: Keys.selectedModelID)
+            if changed { notifyTranscriptionConfigurationChanged() }
+        }
+    }
+
+    public var transcriptionConfiguration: TranscriptionConfiguration {
+        TranscriptionConfiguration(engine: enginePreference, modelID: selectedModelID)
+    }
+
+    /// Updates model and engine as one logical operation so observers never
+    /// construct an adapter for an intermediate configuration.
+    public func selectModel(id: String, engine: EnginePreference) {
+        let before = transcriptionConfiguration
+        defaults.set(id, forKey: Keys.selectedModelID)
+        defaults.set(engine.rawValue, forKey: Keys.engine)
+        if transcriptionConfiguration != before { notifyTranscriptionConfigurationChanged() }
+    }
+
+    private func notifyTranscriptionConfigurationChanged() {
+        NotificationCenter.default.post(name: .nuviTranscriptionConfigurationDidChange, object: self)
     }
 
     /// Parakeet model ids that finished downloading at least once. FluidAudio

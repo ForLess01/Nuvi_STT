@@ -23,13 +23,15 @@ final class AppEnvironment {
 
     init() {
         let audio = AudioCaptureService()
-        let engine = TranscriptionEngineFactory.makeDefault()
+        let configuration = SettingsStore.shared.transcriptionConfiguration
+        let engine = TranscriptionEngineFactory.make(configuration: configuration)
 
         controller = DictationController(audio: audio,
                                          engine: engine,
                                          history: .shared,
                                          vocabulary: .shared,
-                                         modes: .shared)
+                                         modes: .shared,
+                                         engineConfigurationID: configuration.identity)
         pill = PillWindowController(controller: controller)
         statusItem = StatusItemController()
     }
@@ -47,6 +49,19 @@ final class AppEnvironment {
         hotkeyManager = manager
 
         observeState()
+        observeTranscriptionConfiguration()
+    }
+
+    private func observeTranscriptionConfiguration() {
+        NotificationCenter.default.publisher(for: .nuviTranscriptionConfigurationDidChange)
+            .sink { [weak self] _ in
+                let configuration = SettingsStore.shared.transcriptionConfiguration
+                self?.controller.reconfigure(
+                    engine: TranscriptionEngineFactory.make(configuration: configuration),
+                    configurationID: configuration.identity
+                )
+            }
+            .store(in: &cancellables)
     }
 
     // Esc-to-cancel is only live while recording, so it never swallows Escape

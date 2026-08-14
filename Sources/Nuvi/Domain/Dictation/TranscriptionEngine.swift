@@ -11,8 +11,9 @@ public protocol TranscriptionEngine: AnyObject, Sendable {
     /// Stable identifier for diagnostics / settings (e.g. "speech-analyzer").
     var identifier: String { get }
 
-    /// Prepare for a locale: download/allocate models if the adapter needs to.
-    /// Called once before the first session for a given locale.
+    /// Prepare for a locale and engine configuration: download/allocate models
+    /// if the adapter needs to. Called once before the first session for that
+    /// configuration and locale pair.
     func prepare(locale: Locale) async throws
 
     /// Consume a stream of microphone buffers and emit transcription events.

@@ -39,6 +39,7 @@ public extension NuviError {
 
     // MARK: Output (O)
     static func clipboardFallback(_ reason: String) -> NuviError { NuviError("NUVI-O01", reason) }
+    static func manualOutputRequired(_ reason: String) -> NuviError { NuviError("NUVI-O02", reason) }
 
     // MARK: Unexpected (X)
     static func unexpected(_ reason: String) -> NuviError { NuviError("NUVI-X01", reason) }
