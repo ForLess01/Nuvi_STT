@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Primitive tokens -->
+    <color name="ink_950">#090B12</color>
+    <color name="ink_900">#111522</color>
+    <color name="ink_700">#343B50</color>
+    <color name="cloud_50">#F7F8FC</color>
+    <color name="white">#FFFFFFFF</color>
+    <color name="mercury_400">#8C7CFF</color>
+    <color name="mercury_500">#6C5CE7</color>
+    <color name="aqua_400">#56E4D7</color>
+    <color name="success_500">#27AE76</color>
+    <color name="danger_500">#E45C68</color>
+
+    <!-- Semantic tokens -->
+    <color name="surface">@color/cloud_50</color>
+    <color name="surface_container">@color/white</color>
+    <color name="content_primary">@color/ink_950</color>
+    <color name="content_secondary">@color/ink_700</color>
+    <color name="accent">@color/mercury_500</color>
+    <color name="accent_soft">#E8E4FF</color>
+    <color name="divider">#16090B12</color>
+
+    <!-- Component tokens -->
+    <color name="glass_fill">#D9FFFFFF</color>
+    <color name="glass_stroke">#66FFFFFF</color>
+    <color name="ime_surface">#F2F4F9</color>
+</resources>
