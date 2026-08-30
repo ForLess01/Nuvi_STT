@@ -1,6 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android" xmlns:tools="http://schemas.android.com/tools" tools:ignore="ObsoleteSdkInt">
-    <background android:drawable="@color/ink_950" />
-    <foreground android:drawable="@drawable/ic_nuvi_foreground" />
-    <monochrome android:drawable="@drawable/ic_nuvi_monochrome" />
-</adaptive-icon>

@@ -8,31 +8,6 @@ Nuvi is a native macOS menu-bar dictation app featuring a floating pill, a Metal
 
 Built purely in Swift, AppKit, SwiftUI, AVFoundation, and Metal. No Electron. No Python runtime dependencies.
 
-## Android offline preview
-
-The repository now also contains an initial native Android IME in
-[`android/`](android/README.md), designed first for the Samsung Galaxy S24 Ultra.
-It captures 16 kHz mono audio and inserts through `InputConnection`. NVIDIA
-Parakeet TDT 0.6B v3 INT8 via official `sherpa-onnx` v1.13.4 is the primary
-engine; pinned `whisper.cpp` v1.8.6 remains an explicit alternative. The
-engines are serialized by a single-native permit and there is no silent cloud
-or model fallback. If a timed-out Parakeet native call does not exit, later
-attempts return `ENGINE_BUSY` instead of creating parallel native work; see the
-Android guide for the documented residual risk.
-
-The Android manifest has no internet permission. On a Samsung Galaxy S24 Ultra,
-download the official Parakeet `.tar.bz2` archive in Chrome, then select it from
-Nuvi's **Import model from Downloads** flow without extracting it. Nuvi performs
-bounded stream extraction, validates and load-tests the exact four-file model
-bundle, then atomically activates it in app-private storage. See the complete
-[Android setup, error-code, benchmark, privacy, and design guide](android/README.md).
-
-The Android visual layer is an Android-native optical-glass interpretation,
-not Apple's proprietary Liquid Glass implementation. Opaque content remains
-separate from a single floating controls layer, and the UI honors reduced
-motion/transparency, contrast, and power-saver behavior. The IME includes an
-AGSL/Canvas ferrofluid control and a deterministic vector adaptive icon.
-
 ## What's new in v2.1
 
 - **LIVE dictation (Beta)** — progressively inserts speech into the focused editable field while preserving committed text across pauses and partial revisions.
