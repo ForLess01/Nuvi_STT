@@ -1,3 +1,4 @@
+import AppKit
 import XCTest
 @testable import Nuvi
 
@@ -23,6 +24,47 @@ final class TextInjectorTests: XCTestCase {
             case .clipboardOnly:
                 XCTFail("Untrusted field safety must never select the clipboard")
             }
+        }
+    }
+
+    func testFailedClipboardPasteUsesManualFallbackForAIAndWebRoutes() {
+        for targetName in ["editor", "web field"] {
+            switch TextInjector.pasteAttemptResult(didPaste: false, targetName: targetName) {
+            case .manualFallback(let reason):
+                XCTAssertTrue(reason.contains("clipboard restored"))
+                XCTAssertTrue(reason.contains("manual paste required"))
+            case .inserted:
+                XCTFail("A failed clipboard paste must not claim insertion")
+            case .clipboardOnly:
+                XCTFail("A failed clipboard paste must require manual fallback")
+            }
+        }
+
+        if case .inserted = TextInjector.pasteAttemptResult(didPaste: true, targetName: "editor") {
+            // A successful paste keeps the existing inserted result.
+        } else {
+            XCTFail("A successful clipboard paste should report insertion")
+        }
+    }
+
+    func testFailedClipboardPasteRestoresTheOriginalContents() {
+        let pasteboard = NSPasteboard(name: .init("NuviTests.TextInjector.\(UUID().uuidString)"))
+        let original = "already copied"
+        let dictated = "new transcription"
+
+        for restoreClipboard in [true, false] {
+            pasteboard.clearContents()
+            XCTAssertTrue(pasteboard.setString(original, forType: .string))
+
+            let didPaste = TextInjector.pasteViaClipboard(
+                dictated,
+                restoreClipboard: restoreClipboard,
+                pasteboard: pasteboard,
+                sendPaste: { false }
+            )
+
+            XCTAssertFalse(didPaste)
+            XCTAssertEqual(pasteboard.string(forType: .string), original)
         }
     }
 

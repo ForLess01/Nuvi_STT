@@ -280,16 +280,20 @@ public enum TextInjector {
                     manualFallbackReason(for: outcome, targetName: "editor")
                 )
             case .continueWith(.clipboardPaste):
-                pasteViaClipboard(text, restoreClipboard: restoreClipboard)
-                return .inserted
+                return pasteAttemptResult(
+                    didPaste: pasteViaClipboard(text, restoreClipboard: restoreClipboard),
+                    targetName: "editor"
+                )
             case .continueWith:
                 return .manualFallback("Editor insertion stopped before an unsafe fallback — nothing was copied or typed")
             }
 
         case .webClipboardPaste:
             NSLog("Nuvi/inject: web target → clipboard paste")
-            pasteViaClipboard(text, restoreClipboard: restoreClipboard)
-            return .inserted
+            return pasteAttemptResult(
+                didPaste: pasteViaClipboard(text, restoreClipboard: restoreClipboard),
+                targetName: "web field"
+            )
 
         case .nativeAccessibility:
             break
@@ -354,6 +358,15 @@ public enum TextInjector {
         return .manualFallback(
             "Could not attempt direct typing; grant Accessibility and try again — nothing was copied"
         )
+    }
+
+    static func pasteAttemptResult(didPaste: Bool, targetName: String) -> InjectionResult {
+        guard didPaste else {
+            return .manualFallback(
+                "Could not paste into the \(targetName) — nothing was copied; clipboard restored; manual paste required"
+            )
+        }
+        return .inserted
     }
 
     private static func focusedElement() -> AXUIElement? {
@@ -913,13 +926,23 @@ public enum TextInjector {
     }
 
     @discardableResult
-    private static func pasteViaClipboard(_ text: String, restoreClipboard: Bool) -> Bool {
-        let pasteboard = NSPasteboard.general
-        let snapshot = restoreClipboard ? PasteboardSnapshot.capture(from: pasteboard) : nil
-        writeClipboardOnly(text)
-        guard sendPasteShortcut() else { return false }
+    static func pasteViaClipboard(
+        _ text: String,
+        restoreClipboard: Bool,
+        pasteboard: NSPasteboard = .general,
+        sendPaste: () -> Bool = sendPasteShortcut
+    ) -> Bool {
+        let snapshot = PasteboardSnapshot.capture(from: pasteboard)
+        guard writeClipboardOnly(text, to: pasteboard) else {
+            snapshot.restore(to: pasteboard, ifCurrentStringIs: text)
+            return false
+        }
+        guard sendPaste() else {
+            snapshot.restore(to: pasteboard, ifCurrentStringIs: text)
+            return false
+        }
 
-        guard restoreClipboard, let snapshot else { return true }
+        guard restoreClipboard else { return true }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
             snapshot.restore(to: pasteboard, ifCurrentStringIs: text)
         }
@@ -941,10 +964,13 @@ public enum TextInjector {
         return true
     }
 
-    private static func writeClipboardOnly(_ text: String) {
-        let pasteboard = NSPasteboard.general
+    @discardableResult
+    private static func writeClipboardOnly(
+        _ text: String,
+        to pasteboard: NSPasteboard = .general
+    ) -> Bool {
         pasteboard.clearContents()
-        pasteboard.setString(text, forType: .string)
+        return pasteboard.setString(text, forType: .string)
     }
 }
 
