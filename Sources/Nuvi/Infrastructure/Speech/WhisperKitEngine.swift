@@ -14,8 +14,61 @@ import WhisperKit
 ///   2. Rebuild. `canImport(WhisperKit)` flips on and this becomes live.
 ///
 /// Standard mode runs one settled pass after capture. Live mode periodically
-/// decodes the accumulated 16 kHz audio and emits provisional revisions, so all
-/// currently catalogued Whisper model sizes participate in progressive delivery.
+/// decodes a bounded rolling 16 kHz window and emits provisional revisions, so
+/// all currently catalogued Whisper model sizes participate in progressive delivery.
+internal struct RollingAudioWindow {
+    let capacity: Int
+    private var storage: [Float]
+    private var head = 0
+    private(set) var count = 0
+
+    init(capacity: Int) {
+        precondition(capacity > 0)
+        self.capacity = capacity
+        storage = Array(repeating: 0, count: capacity)
+    }
+
+    mutating func append(contentsOf source: [Float]) {
+        source.withUnsafeBufferPointer { append(contentsOf: $0) }
+    }
+
+    mutating func append(contentsOf source: UnsafeBufferPointer<Float>) {
+        guard !source.isEmpty else { return }
+
+        if source.count >= capacity {
+            let start = source.count - capacity
+            for index in 0..<capacity {
+                storage[index] = source[start + index]
+            }
+            head = 0
+            count = capacity
+            return
+        }
+
+        let overflow = max(0, count + source.count - capacity)
+        if overflow > 0 {
+            head = (head + overflow) % capacity
+            count -= overflow
+        }
+
+        for value in source {
+            let tail = (head + count) % capacity
+            storage[tail] = value
+            count += 1
+        }
+    }
+
+    func snapshot() -> [Float] {
+        guard count > 0 else { return [] }
+        var result: [Float] = []
+        result.reserveCapacity(count)
+        for offset in 0..<count {
+            result.append(storage[(head + offset) % capacity])
+        }
+        return result
+    }
+}
+
 public final class WhisperKitEngine: TranscriptionEngine, @unchecked Sendable {
     public let identifier = "whisperkit"
 
@@ -95,6 +148,7 @@ public final class WhisperKitEngine: TranscriptionEngine, @unchecked Sendable {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
+                    try Task.checkCancellation()
                     guard let pipe else {
                         throw TranscriptionError.engineUnavailable("WhisperKit not prepared")
                     }
@@ -108,9 +162,12 @@ public final class WhisperKitEngine: TranscriptionEngine, @unchecked Sendable {
                     }
                     let converter = BufferConverter(targetFormat: target)
 
+                    // Keep the complete bounded session for the authoritative
+                    // final pass; LIVE decodes only the rolling window below.
                     var samples: [Float] = []
                     let maxSamples = 16_000 * 10 * 60 // 10 minutes at 16 kHz mono.
                     for await buffer in audio {
+                        try Task.checkCancellation()
                         if let converted = converter.convert(buffer),
                            let channel = converted.floatChannelData {
                             let count = Int(converted.frameLength)
@@ -121,6 +178,7 @@ public final class WhisperKitEngine: TranscriptionEngine, @unchecked Sendable {
                         }
                     }
 
+                    try Task.checkCancellation()
                     guard !samples.isEmpty else {
                         NSLog("Nuvi/whisperkit: no audio reached the engine")
                         continuation.finish(throwing: NuviError.noAudioReceived)
@@ -135,7 +193,7 @@ public final class WhisperKitEngine: TranscriptionEngine, @unchecked Sendable {
                     continuation.yield(.final(text))
                     continuation.finish()
                 } catch {
-                    continuation.finish(throwing: TranscriptionError.underlying(String(describing: error)))
+                    continuation.finish(throwing: Self.normalizedTranscriptionError(error))
                 }
             }
             continuation.onTermination = { _ in task.cancel() }
@@ -151,6 +209,7 @@ public final class WhisperKitEngine: TranscriptionEngine, @unchecked Sendable {
         return AsyncThrowingStream { continuation in
             let task = Task {
                 do {
+                    try Task.checkCancellation()
                     guard let pipe else {
                         throw TranscriptionError.engineUnavailable("WhisperKit not prepared")
                     }
@@ -169,7 +228,10 @@ public final class WhisperKitEngine: TranscriptionEngine, @unchecked Sendable {
                     let minimumHypothesisSamples = 16_000 * 2
                     let maxSamples = 16_000 * 10 * 60
                     var nextHypothesisAt = minimumHypothesisSamples
+                    // The full session is retained for the settled final pass;
+                    // provisional decodes use only the bounded rolling window.
                     var samples: [Float] = []
+                    var liveWindow = RollingAudioWindow(capacity: Self.liveWindowSamples)
                     var lastPartial = ""
 
                     for await buffer in audio {
@@ -182,16 +244,21 @@ public final class WhisperKitEngine: TranscriptionEngine, @unchecked Sendable {
                                 "WhisperKit input exceeded 10 minute limit"
                             )
                         }
+                        let source = UnsafeBufferPointer(start: channel[0], count: count)
                         samples.append(
-                            contentsOf: UnsafeBufferPointer(start: channel[0], count: count)
+                            contentsOf: source
                         )
+                        liveWindow.append(contentsOf: source)
 
                         guard samples.count >= nextHypothesisAt else { continue }
                         let results = try await pipe.transcribe(
-                            audioArray: samples,
+                            audioArray: liveWindow.snapshot(),
                             decodeOptions: options
                         )
                         let hypothesis = Self.joinedText(results)
+                        // The controller's LiveTranscriptAssembler keeps the
+                        // prior provisional text and de-duplicates overlap when
+                        // this rolling window advances.
                         if !hypothesis.isEmpty, hypothesis != lastPartial {
                             lastPartial = hypothesis
                             continuation.yield(.partial(hypothesis))
@@ -199,6 +266,7 @@ public final class WhisperKitEngine: TranscriptionEngine, @unchecked Sendable {
                         nextHypothesisAt = samples.count + cadence
                     }
 
+                    try Task.checkCancellation()
                     guard !samples.isEmpty else { throw NuviError.noAudioReceived }
                     let results = try await pipe.transcribe(
                         audioArray: samples,
@@ -206,12 +274,8 @@ public final class WhisperKitEngine: TranscriptionEngine, @unchecked Sendable {
                     )
                     continuation.yield(.final(Self.joinedText(results)))
                     continuation.finish()
-                } catch is CancellationError {
-                    continuation.finish(throwing: CancellationError())
                 } catch {
-                    continuation.finish(
-                        throwing: TranscriptionError.underlying(String(describing: error))
-                    )
+                    continuation.finish(throwing: Self.normalizedTranscriptionError(error))
                 }
             }
             continuation.onTermination = { _ in task.cancel() }
@@ -228,6 +292,24 @@ public final class WhisperKitEngine: TranscriptionEngine, @unchecked Sendable {
             seconds = 1.5
         }
         return Int(16_000 * seconds)
+    }
+
+    /// Whisper's native feature extractor uses a 30-second window. Keeping the
+    /// live decode input at that bound avoids re-decoding the entire session;
+    /// Standard mode still uses the complete `samples` buffer for its final pass.
+    internal static let liveWindowSamples = 16_000 * 30
+
+    internal static func normalizedTranscriptionError(_ error: Error) -> Error {
+        if error is CancellationError {
+            return CancellationError()
+        }
+        if let coded = error as? NuviError {
+            return coded
+        }
+        if let coded = error as? TranscriptionError {
+            return coded
+        }
+        return TranscriptionError.underlying(String(describing: error))
     }
 
     private static func joinedText(_ results: [TranscriptionResult]) -> String {

@@ -64,6 +64,7 @@ public final class ParakeetEngine: TranscriptionEngine, @unchecked Sendable {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
+                    try Task.checkCancellation()
                     guard let manager else {
                         throw TranscriptionError.engineUnavailable("Parakeet not prepared")
                     }
@@ -80,6 +81,7 @@ public final class ParakeetEngine: TranscriptionEngine, @unchecked Sendable {
                     var samples: [Float] = []
                     let maxSamples = 16_000 * 10 * 60 // 10 minutes at 16 kHz mono.
                     for await buffer in audio {
+                        try Task.checkCancellation()
                         if let converted = converter.convert(buffer),
                            let channel = converted.floatChannelData {
                             let count = Int(converted.frameLength)
@@ -90,6 +92,7 @@ public final class ParakeetEngine: TranscriptionEngine, @unchecked Sendable {
                         }
                     }
 
+                    try Task.checkCancellation()
                     guard !samples.isEmpty else {
                         NSLog("Nuvi/parakeet: no audio reached the engine")
                         continuation.finish(throwing: NuviError.noAudioReceived)
@@ -105,7 +108,7 @@ public final class ParakeetEngine: TranscriptionEngine, @unchecked Sendable {
                     continuation.yield(.final(text))
                     continuation.finish()
                 } catch {
-                    continuation.finish(throwing: TranscriptionError.underlying(String(describing: error)))
+                    continuation.finish(throwing: Self.normalizedTranscriptionError(error))
                 }
             }
             continuation.onTermination = { _ in task.cancel() }
@@ -121,6 +124,7 @@ public final class ParakeetEngine: TranscriptionEngine, @unchecked Sendable {
         return AsyncThrowingStream { continuation in
             let task = Task {
                 do {
+                    try Task.checkCancellation()
                     guard let models, let manager else {
                         throw TranscriptionError.engineUnavailable("Parakeet not prepared")
                     }
@@ -213,16 +217,25 @@ public final class ParakeetEngine: TranscriptionEngine, @unchecked Sendable {
                     let final = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
                     continuation.yield(.final(final))
                     continuation.finish()
-                } catch is CancellationError {
-                    continuation.finish(throwing: CancellationError())
                 } catch {
-                    continuation.finish(
-                        throwing: TranscriptionError.underlying(String(describing: error))
-                    )
+                    continuation.finish(throwing: Self.normalizedTranscriptionError(error))
                 }
             }
             continuation.onTermination = { _ in task.cancel() }
         }
+    }
+
+    internal static func normalizedTranscriptionError(_ error: Error) -> Error {
+        if error is CancellationError {
+            return CancellationError()
+        }
+        if let coded = error as? NuviError {
+            return coded
+        }
+        if let coded = error as? TranscriptionError {
+            return coded
+        }
+        return TranscriptionError.underlying(String(describing: error))
     }
 #else
     public func prepare(locale: Locale) async throws {
