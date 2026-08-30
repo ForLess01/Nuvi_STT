@@ -6,6 +6,12 @@ import SwiftUI
 /// focus from the app you're typing into.
 @MainActor
 final class PillWindowController {
+    /// The geometry seam keeps placement tests independent from AppKit's
+    /// process-global screen list and from a physical multi-monitor setup.
+    internal struct ScreenGeometry: Equatable {
+        let visibleFrame: NSRect
+    }
+
     private enum Layout {
         static let screenInset: CGFloat = 22
         static let nebulaPadding: CGFloat = 34
@@ -30,9 +36,15 @@ final class PillWindowController {
     private let container = NSView()
     private let nebulaView = NebulaGlowView()
     private let hosting: NSHostingView<PillView>
+    private let screenProvider: () -> ScreenGeometry?
     private var animationToken = 0
 
-    init(controller: DictationController, translation: TranslationCoordinator) {
+    init(
+        controller: DictationController,
+        translation: TranslationCoordinator,
+        screenProvider: (() -> ScreenGeometry?)? = nil
+    ) {
+        self.screenProvider = screenProvider ?? { PillWindowController.currentScreenGeometry() }
         hosting = NSHostingView(rootView: PillView(controller: controller, translation: translation))
 
         panel = NSPanel(
@@ -194,13 +206,48 @@ final class PillWindowController {
     }
 
     private func positionTopLeft() {
-        guard let screen = NSScreen.main else { return }
+        guard let screen = screenProvider() ?? Self.fallbackScreenGeometry() else { return }
         let visible = screen.visibleFrame
         let padding = Layout.nebulaPadding
         let contentHeight = max(hosting.frame.height, panel.frame.height - padding * 2)
         let origin = NSPoint(x: visible.minX + Layout.screenInset - padding,
                              y: visible.maxY - contentHeight - Layout.screenInset - padding)
         panel.setFrameOrigin(origin)
+    }
+
+    /// Chooses the display associated with the frontmost window first, then
+    /// the display containing the pointer (the reliable active-display signal
+    /// for a menu-bar app), and finally safe primary/available-screen fallbacks.
+    internal static func selectPlacementScreen(
+        frontmostScreen: ScreenGeometry?,
+        pointerScreen: ScreenGeometry?,
+        mainScreen: ScreenGeometry?,
+        availableScreens: [ScreenGeometry]
+    ) -> ScreenGeometry? {
+        frontmostScreen ?? pointerScreen ?? mainScreen ?? availableScreens.first
+    }
+
+    private static func currentScreenGeometry() -> ScreenGeometry? {
+        let screens = NSScreen.screens
+        let available = screens.map { ScreenGeometry(visibleFrame: $0.visibleFrame) }
+        let pointer = NSEvent.mouseLocation
+        let pointerScreen = screens.first(where: { $0.frame.contains(pointer) })
+            .map { ScreenGeometry(visibleFrame: $0.visibleFrame) }
+        let frontmostScreen = (NSApp.keyWindow?.screen ?? NSApp.mainWindow?.screen)
+            .map { ScreenGeometry(visibleFrame: $0.visibleFrame) }
+        let mainScreen = NSScreen.main.map { ScreenGeometry(visibleFrame: $0.visibleFrame) }
+
+        return selectPlacementScreen(
+            frontmostScreen: frontmostScreen,
+            pointerScreen: pointerScreen,
+            mainScreen: mainScreen,
+            availableScreens: available
+        )
+    }
+
+    private static func fallbackScreenGeometry() -> ScreenGeometry? {
+        guard let screen = NSScreen.main ?? NSScreen.screens.first else { return nil }
+        return ScreenGeometry(visibleFrame: screen.visibleFrame)
     }
 
 }
