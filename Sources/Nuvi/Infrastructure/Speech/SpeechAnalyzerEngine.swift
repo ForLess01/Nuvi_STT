@@ -47,7 +47,8 @@ public final class SpeechAnalyzerEngine: TranscriptionEngine, @unchecked Sendabl
             || (lang != nil && installed.contains { $0.language.languageCode?.identifier == lang })
         if !isInstalled {
             let transcriber = makeTranscriber(volatile: false)
-            if let request = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
+            let installationRequest = try await AssetInventory.assetInstallationRequest(supporting: [transcriber])
+            if let request = installationRequest {
                 NSLog("Nuvi/speech: installing speech asset for \(target)")
                 try await request.downloadAndInstall()
                 NSLog("Nuvi/speech: installed speech asset for \(target)")

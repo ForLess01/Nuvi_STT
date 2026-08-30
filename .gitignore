@@ -16,6 +16,7 @@ Thumbs.db
 .atl/
 .gemini/
 *.log
+graphify-out/
 
 # Environment files
 .env
