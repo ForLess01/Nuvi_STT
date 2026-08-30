@@ -18,6 +18,153 @@ public protocol AudioCapturing: AnyObject, Sendable {
     func stop()
 }
 
+/// The control-plane lifecycle for one HAL instance. The render callback only
+/// reads the immutable `unit` reference; cleanup is kept on the control side.
+internal protocol AudioUnitLifecycle: AnyObject {
+    var unit: AudioUnit? { get }
+    func stop()
+    func uninitialize()
+    func dispose()
+}
+
+private final class HALAudioUnitLifecycle: AudioUnitLifecycle, @unchecked Sendable {
+    let unit: AudioUnit?
+
+    init(unit: AudioUnit) {
+        self.unit = unit
+    }
+
+    func stop() {
+        guard let unit else { return }
+        _ = AudioOutputUnitStop(unit)
+    }
+
+    func uninitialize() {
+        guard let unit else { return }
+        _ = AudioUnitUninitialize(unit)
+    }
+
+    func dispose() {
+        guard let unit else { return }
+        _ = AudioComponentInstanceDispose(unit)
+    }
+}
+
+/// Per-run state retained by the service while the HAL callback is installed.
+/// The callback never reaches back into `AudioCaptureService`, so stopping one
+/// run cannot expose another run's unit, format, or stream continuation.
+internal final class AudioCaptureSession: @unchecked Sendable {
+    let lifecycle: AudioUnitLifecycle
+    let format: AVAudioFormat?
+    let continuation: AsyncStream<AVAudioPCMBuffer>.Continuation
+    let levelHandler: (@Sendable (Float) -> Void)?
+    let levelEmissionIntervalNanos: UInt64
+
+    // These values are written only by the render callback. They are not part
+    // of service lifecycle state and are never reset from the control thread.
+    private var captureGain: AdaptiveCaptureGain
+    private var lastLevelEmissionNanos: UInt64 = 0
+    private var didCleanup = false
+
+    init(lifecycle: AudioUnitLifecycle,
+         format: AVAudioFormat?,
+         continuation: AsyncStream<AVAudioPCMBuffer>.Continuation,
+         levelHandler: (@Sendable (Float) -> Void)?,
+         usesBluetoothInput: Bool,
+         levelEmissionIntervalNanos: UInt64 = 50_000_000) {
+        self.lifecycle = lifecycle
+        self.format = format
+        self.continuation = continuation
+        self.levelHandler = levelHandler
+        self.levelEmissionIntervalNanos = levelEmissionIntervalNanos
+        self.captureGain = usesBluetoothInput ? .bluetoothSpeechBoost : .disabled
+    }
+
+    /// Stops the HAL before completing the stream. Calls are control-side and
+    /// intentionally idempotent so failed starts cannot double-dispose a unit.
+    func cleanup() {
+        guard !didCleanup else { return }
+        didCleanup = true
+        lifecycle.stop()
+        lifecycle.uninitialize()
+        lifecycle.dispose()
+        continuation.finish()
+    }
+
+    /// Pulls one slice of input audio into a fresh PCM buffer and publishes it.
+    /// Called on the audio render thread. The allocation/yield behavior remains
+    /// unchanged in this lifecycle-hardening slice and is tracked separately.
+    func render(actionFlags: UnsafeMutablePointer<AudioUnitRenderActionFlags>,
+                timeStamp: UnsafePointer<AudioTimeStamp>,
+                busNumber: UInt32,
+                frames: UInt32) -> OSStatus {
+        guard let unit = lifecycle.unit,
+              let format,
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else {
+            return noErr
+        }
+        buffer.frameLength = frames
+        let status = AudioUnitRender(unit, actionFlags, timeStamp, busNumber, frames, buffer.mutableAudioBufferList)
+        guard status == noErr else { return status }
+        applyCaptureGain(to: buffer)
+        continuation.yield(buffer)
+        emitLevel(from: buffer)
+        return noErr
+    }
+
+    private func applyCaptureGain(to buffer: AVAudioPCMBuffer) {
+        guard captureGain.isEnabled, let channels = buffer.floatChannelData else { return }
+        let frames = Int(buffer.frameLength)
+        let channelCount = Int(buffer.format.channelCount)
+        guard frames > 0, channelCount > 0 else { return }
+
+        var sumSquares: Float = 0
+        for channelIndex in 0..<channelCount {
+            let channel = channels[channelIndex]
+            for frame in 0..<frames {
+                let sample = channel[frame]
+                sumSquares += sample * sample
+            }
+        }
+
+        let sampleCount = Float(frames * channelCount)
+        let rms = (sumSquares / sampleCount).squareRoot()
+        let gain = captureGain.nextGain(forRMS: rms)
+        guard gain > 1.001 else { return }
+
+        for channelIndex in 0..<channelCount {
+            let channel = channels[channelIndex]
+            for frame in 0..<frames {
+                channel[frame] = softLimit(channel[frame] * gain)
+            }
+        }
+    }
+
+    private func softLimit(_ sample: Float) -> Float {
+        // Smoothly constrain boosted speech without the harsh edge of hard clipping.
+        tanhf(sample)
+    }
+
+    private func emitLevel(from buffer: AVAudioPCMBuffer) {
+        guard let channel = buffer.floatChannelData?[0] else { return }
+        let frames = Int(buffer.frameLength)
+        guard frames > 0 else { return }
+
+        var sum: Float = 0
+        for i in 0..<frames {
+            let sample = channel[i]
+            sum += sample * sample
+        }
+        let rms = (sum / Float(frames)).squareRoot()
+        // Perceptual-ish mapping: gain up quiet speech, clamp to 0...1.
+        let level = min(1, max(0, rms * 12))
+        let now = DispatchTime.now().uptimeNanoseconds
+        guard now - lastLevelEmissionNanos >= levelEmissionIntervalNanos else { return }
+        lastLevelEmissionNanos = now
+        levelHandler?(level)
+    }
+}
+
 /// Captures microphone audio with a dedicated CoreAudio HAL I/O unit (AUHAL)
 /// pinned to a specific device, and exposes two things:
 ///   • an AsyncStream of PCM buffers for the transcription engine, and
@@ -34,16 +181,21 @@ public protocol AudioCapturing: AnyObject, Sendable {
 /// The render callback runs on the audio thread, so `onLevel` is called there —
 /// the consumer is responsible for hopping to the main actor.
 public final class AudioCaptureService: AudioCapturing, @unchecked Sendable {
-    private var unit: AudioUnit?
-    private var clientFormat: AVAudioFormat?
-    private var continuation: AsyncStream<AVAudioPCMBuffer>.Continuation?
-    private var captureGain = AdaptiveCaptureGain.disabled
-    private var lastLevelEmissionNanos: UInt64 = 0
-    private let levelEmissionIntervalNanos: UInt64 = 50_000_000 // 20 Hz
+    private var activeSession: AudioCaptureSession?
 
     public var onLevel: (@Sendable (Float) -> Void)?
 
     public init() {}
+
+    // Internal seam for lifecycle tests; production construction uses the
+    // public no-argument initializer and creates sessions in start().
+    internal init(activeSession: AudioCaptureSession?) {
+        self.activeSession = activeSession
+    }
+
+    deinit {
+        cleanupCapture()
+    }
 
     public func requestPermission() async -> Bool {
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
@@ -61,14 +213,15 @@ public final class AudioCaptureService: AudioCapturing, @unchecked Sendable {
     public func start() throws -> AsyncStream<AVAudioPCMBuffer> {
         stop()
 
+        var lifecycle: AudioUnitLifecycle?
         do {
             let unit = try makeInputUnit()
-            self.unit = unit
+            let liveLifecycle = HALAudioUnitLifecycle(unit: unit)
+            lifecycle = liveLifecycle
 
             let device = chosenInputDevice()
             try setCurrentDevice(device, on: unit)
             let usesBluetoothInput = AudioInputDevice.isBluetoothInputDevice(device)
-            captureGain = usesBluetoothInput ? .bluetoothSpeechBoost : .disabled
             if usesBluetoothInput {
                 NSLog("Nuvi/audio: Bluetooth input selected; applying speech gain while macOS uses hands-free/HFP quality")
             }
@@ -86,13 +239,22 @@ public final class AudioCaptureService: AudioCapturing, @unchecked Sendable {
             guard let avFormat = AVAudioFormat(streamDescription: &asbd) else {
                 throw AudioCaptureError.microphoneInUse
             }
-            self.clientFormat = avFormat
             NSLog("Nuvi/audio: HAL input device=\(device), sampleRate=\(avFormat.sampleRate), channels=\(avFormat.channelCount)")
 
             let (stream, continuation) = AsyncStream<AVAudioPCMBuffer>.makeStream()
-            self.continuation = continuation
+            let session = AudioCaptureSession(
+                lifecycle: liveLifecycle,
+                format: avFormat,
+                continuation: continuation,
+                levelHandler: onLevel,
+                usesBluetoothInput: usesBluetoothInput
+            )
+            activeSession = session
+            // From this point on, the session owns all callback state and the
+            // catch path must clean it through `activeSession`.
+            lifecycle = nil
 
-            try setInputCallback(on: unit)
+            try setInputCallback(on: unit, session: session)
 
             var status = AudioUnitInitialize(unit)
             guard status == noErr else { throw AudioCaptureError.microphoneInUse }
@@ -103,9 +265,11 @@ public final class AudioCaptureService: AudioCapturing, @unchecked Sendable {
             return stream
         } catch let error as AudioCaptureError {
             cleanupCapture()
+            cleanup(lifecycle)
             throw error
         } catch {
             cleanupCapture()
+            cleanup(lifecycle)
             NSLog("Nuvi/audio: failed to start microphone capture: \(String(describing: error))")
             throw AudioCaptureError.microphoneInUse
         }
@@ -117,16 +281,18 @@ public final class AudioCaptureService: AudioCapturing, @unchecked Sendable {
     }
 
     private func cleanupCapture() {
-        if let unit {
-            AudioOutputUnitStop(unit)
-            AudioUnitUninitialize(unit)
-            AudioComponentInstanceDispose(unit)
-        }
-        unit = nil
-        clientFormat = nil
-        captureGain = .disabled
-        continuation?.finish()
-        continuation = nil
+        // Detach first. The local strong reference keeps the callback-owned
+        // session alive through stop/uninitialize/dispose.
+        let session = activeSession
+        activeSession = nil
+        session?.cleanup()
+    }
+
+    private func cleanup(_ lifecycle: AudioUnitLifecycle?) {
+        guard let lifecycle else { return }
+        lifecycle.stop()
+        lifecycle.uninitialize()
+        lifecycle.dispose()
     }
 
     // MARK: - Device selection
@@ -223,10 +389,10 @@ public final class AudioCaptureService: AudioCapturing, @unchecked Sendable {
                 UInt32(MemoryLayout<AudioStreamBasicDescription>.size))
     }
 
-    private func setInputCallback(on unit: AudioUnit) throws {
+    private func setInputCallback(on unit: AudioUnit, session: AudioCaptureSession) throws {
         var callback = AURenderCallbackStruct(
             inputProc: captureRenderCallback,
-            inputProcRefCon: Unmanaged.passUnretained(self).toOpaque()
+            inputProcRefCon: Unmanaged.passUnretained(session).toOpaque()
         )
         try set(unit, kAudioOutputUnitProperty_SetInputCallback, .global, 0, &callback,
                 UInt32(MemoryLayout<AURenderCallbackStruct>.size))
@@ -245,79 +411,6 @@ public final class AudioCaptureService: AudioCapturing, @unchecked Sendable {
         guard status == noErr else {
             throw AudioCaptureError.microphoneUnavailable("AudioUnitSetProperty \(property) failed: \(status)")
         }
-    }
-
-    // MARK: - Render
-
-    /// Pulls one slice of input audio into a fresh PCM buffer and publishes it.
-    /// Called on the audio render thread.
-    fileprivate func render(actionFlags: UnsafeMutablePointer<AudioUnitRenderActionFlags>,
-                            timeStamp: UnsafePointer<AudioTimeStamp>,
-                            busNumber: UInt32,
-                            frames: UInt32) -> OSStatus {
-        guard let unit, let format = clientFormat,
-              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else {
-            return noErr
-        }
-        buffer.frameLength = frames
-        let status = AudioUnitRender(unit, actionFlags, timeStamp, busNumber, frames, buffer.mutableAudioBufferList)
-        guard status == noErr else { return status }
-        applyCaptureGain(to: buffer)
-        continuation?.yield(buffer)
-        emitLevel(from: buffer)
-        return noErr
-    }
-
-    private func applyCaptureGain(to buffer: AVAudioPCMBuffer) {
-        guard captureGain.isEnabled, let channels = buffer.floatChannelData else { return }
-        let frames = Int(buffer.frameLength)
-        let channelCount = Int(buffer.format.channelCount)
-        guard frames > 0, channelCount > 0 else { return }
-
-        var sumSquares: Float = 0
-        for channelIndex in 0..<channelCount {
-            let channel = channels[channelIndex]
-            for frame in 0..<frames {
-                let sample = channel[frame]
-                sumSquares += sample * sample
-            }
-        }
-
-        let sampleCount = Float(frames * channelCount)
-        let rms = (sumSquares / sampleCount).squareRoot()
-        let gain = captureGain.nextGain(forRMS: rms)
-        guard gain > 1.001 else { return }
-
-        for channelIndex in 0..<channelCount {
-            let channel = channels[channelIndex]
-            for frame in 0..<frames {
-                channel[frame] = softLimit(channel[frame] * gain)
-            }
-        }
-    }
-
-    private func softLimit(_ sample: Float) -> Float {
-        // Smoothly constrain boosted speech without the harsh edge of hard clipping.
-        tanhf(sample)
-    }
-
-    private func emitLevel(from buffer: AVAudioPCMBuffer) {
-        guard let channel = buffer.floatChannelData?[0] else { return }
-        let frames = Int(buffer.frameLength)
-        guard frames > 0 else { return }
-
-        var sum: Float = 0
-        for i in 0..<frames {
-            let sample = channel[i]
-            sum += sample * sample
-        }
-        let rms = (sum / Float(frames)).squareRoot()
-        // Perceptual-ish mapping: gain up quiet speech, clamp to 0...1.
-        let level = min(1, max(0, rms * 12))
-        let now = DispatchTime.now().uptimeNanoseconds
-        guard now - lastLevelEmissionNanos >= levelEmissionIntervalNanos else { return }
-        lastLevelEmissionNanos = now
-        onLevel?(level)
     }
 }
 
@@ -350,13 +443,13 @@ private struct AdaptiveCaptureGain {
     }
 }
 
-/// C render callback. Forwards to the owning service via the ref-con pointer.
+/// C render callback. Forwards to the callback-owned session via the ref-con pointer.
 private func captureRenderCallback(refCon: UnsafeMutableRawPointer,
                                    actionFlags: UnsafeMutablePointer<AudioUnitRenderActionFlags>,
                                    timeStamp: UnsafePointer<AudioTimeStamp>,
                                    busNumber: UInt32,
                                    frames: UInt32,
                                    data: UnsafeMutablePointer<AudioBufferList>?) -> OSStatus {
-    let service = Unmanaged<AudioCaptureService>.fromOpaque(refCon).takeUnretainedValue()
-    return service.render(actionFlags: actionFlags, timeStamp: timeStamp, busNumber: busNumber, frames: frames)
+    let session = Unmanaged<AudioCaptureSession>.fromOpaque(refCon).takeUnretainedValue()
+    return session.render(actionFlags: actionFlags, timeStamp: timeStamp, busNumber: busNumber, frames: frames)
 }
