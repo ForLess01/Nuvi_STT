@@ -3,6 +3,7 @@ import AVFoundation
 import AudioToolbox
 import CoreAudio
 import Darwin
+import Synchronization
 
 /// Port for microphone capture. Keeping the controller on this abstraction lets
 /// tests drive dictation without touching real hardware.
@@ -53,24 +54,44 @@ private final class HALAudioUnitLifecycle: AudioUnitLifecycle, @unchecked Sendab
 /// Per-run state retained by the service while the HAL callback is installed.
 /// The callback never reaches back into `AudioCaptureService`, so stopping one
 /// run cannot expose another run's unit, format, or stream continuation.
+///
+/// The callback is deliberately limited to an atomic admission check, a
+/// preallocated `AudioUnitRender`, and a lock-free ring publication. Buffer
+/// allocation, gain, RMS, level delivery, and AsyncStream yielding all happen
+/// on the detached publisher.
 internal final class AudioCaptureSession: @unchecked Sendable {
+    static let ringCapacity = 8
+    static let streamBufferCapacity = 8
+
     let lifecycle: AudioUnitLifecycle
     let format: AVAudioFormat?
-    let continuation: AsyncStream<AVAudioPCMBuffer>.Continuation
+    var continuation: AsyncStream<AVAudioPCMBuffer>.Continuation
     let levelHandler: (@Sendable (Float) -> Void)?
     let levelEmissionIntervalNanos: UInt64
+    let ring: AudioChunkRing
 
-    // These values are written only by the render callback. They are not part
-    // of service lifecycle state and are never reset from the control thread.
+    private let callbackState = Atomic<UInt64>(0)
+    private let cleanupState = Atomic<Bool>(false)
+    private let streamTerminated = Atomic<Bool>(false)
+    private let publisherStartedState = Atomic<Bool>(false)
+    private let streamDropped = Atomic<UInt64>(0)
+    private let allocationFailures = Atomic<UInt64>(0)
+    private let publisherCompletion = DispatchSemaphore(value: 0)
+
     private var captureGain: AdaptiveCaptureGain
     private var lastLevelEmissionNanos: UInt64 = 0
-    private var didCleanup = false
+    private var publisherTask: Task<Void, Never>?
+    private var publisherStarted = false
+
+    private static let admissionClosedBit: UInt64 = 1 << 63
+    private static let callbackCountMask: UInt64 = admissionClosedBit - 1
 
     init(lifecycle: AudioUnitLifecycle,
          format: AVAudioFormat?,
          continuation: AsyncStream<AVAudioPCMBuffer>.Continuation,
          levelHandler: (@Sendable (Float) -> Void)?,
          usesBluetoothInput: Bool,
+         ring: AudioChunkRing? = nil,
          levelEmissionIntervalNanos: UInt64 = 50_000_000) {
         self.lifecycle = lifecycle
         self.format = format
@@ -78,38 +99,248 @@ internal final class AudioCaptureSession: @unchecked Sendable {
         self.levelHandler = levelHandler
         self.levelEmissionIntervalNanos = levelEmissionIntervalNanos
         self.captureGain = usesBluetoothInput ? .bluetoothSpeechBoost : .disabled
+        self.ring = ring ?? AudioChunkRing(maxFrames: 1, channelCount: 1, capacity: 1)
+    }
+
+    internal var droppedStreamCount: UInt64 {
+        streamDropped.load(ordering: .acquiring)
+    }
+
+    internal var bufferAllocationFailureCount: UInt64 {
+        allocationFailures.load(ordering: .acquiring)
+    }
+
+    /// Installs stream cancellation handling before the stream is returned to
+    /// the consumer. The handler marks termination first, allowing a publisher
+    /// that is currently polling an empty ring to exit before cleanup waits.
+    func installTerminationHandler() {
+        continuation.onTermination = { [weak self] _ in
+            guard let self else { return }
+            self.streamTerminated.store(true, ordering: .releasing)
+            // A running publisher performs cleanup after it has signalled its
+            // completion semaphore. This avoids a re-entrant deadlock if
+            // AsyncStream invokes this handler while `yield` returns `.terminated`.
+            if !self.publisherStartedState.load(ordering: .acquiring) {
+                self.cleanup()
+            }
+        }
+    }
+
+    /// Starts the non-realtime publisher. The task owns no callback resources;
+    /// the session remains retained by `AudioCaptureService` until cleanup has
+    /// closed admission and waited for this task to drain.
+    func startPublisher() {
+        guard !publisherStarted else { return }
+        publisherStarted = true
+        publisherStartedState.store(true, ordering: .releasing)
+        let task = Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self else { return }
+            await self.publisherLoop()
+        }
+        publisherTask = task
     }
 
     /// Stops the HAL before completing the stream. Calls are control-side and
-    /// intentionally idempotent so failed starts cannot double-dispose a unit.
+    /// intentionally idempotent so failed starts and stream cancellation
+    /// cannot double-dispose a unit.
     func cleanup() {
-        guard !didCleanup else { return }
-        didCleanup = true
+        guard !cleanupState.exchange(true, ordering: .acquiringAndReleasing) else { return }
+
+        closeCallbackAdmission()
         lifecycle.stop()
+        waitForCallbacks()
         lifecycle.uninitialize()
         lifecycle.dispose()
+
+        // No callback can publish after the admission wait. The publisher may
+        // still own queued slots, so close first and let it drain before the
+        // final control-side safety drain.
+        ring.close()
+        if publisherStarted {
+            publisherCompletion.wait()
+            publisherTask = nil
+        }
+        ring.drain()
+
+        // Level zero is delivered off the CoreAudio callback before stream
+        // completion, including when cancellation initiated cleanup.
+        levelHandler?(0)
         continuation.finish()
     }
 
-    /// Pulls one slice of input audio into a fresh PCM buffer and publishes it.
-    /// Called on the audio render thread. The allocation/yield behavior remains
-    /// unchanged in this lifecycle-hardening slice and is tracked separately.
+    /// The callback's admission gate. A single CAS combines the closed bit and
+    /// in-flight count, preventing a close/wait race from admitting a callback
+    /// after the control plane observed zero in-flight callbacks.
+    func enterCallback() -> Bool {
+        while true {
+            let state = callbackState.load(ordering: .acquiring)
+            guard state & Self.admissionClosedBit == 0 else { return false }
+            let count = state & Self.callbackCountMask
+            guard count < Self.callbackCountMask else { return false }
+            let result = callbackState.compareExchange(
+                expected: state,
+                desired: state &+ 1,
+                ordering: .acquiringAndReleasing
+            )
+            if result.exchanged { return true }
+        }
+    }
+
+    func leaveCallback() {
+        callbackState.wrappingSubtract(1, ordering: .releasing)
+    }
+
+    /// Pulls one slice of input audio into a preallocated ring slot. No
+    /// AVAudioPCMBuffer, AsyncStream, task, queue, lock, or sample processing
+    /// occurs on this path.
     func render(actionFlags: UnsafeMutablePointer<AudioUnitRenderActionFlags>,
                 timeStamp: UnsafePointer<AudioTimeStamp>,
                 busNumber: UInt32,
                 frames: UInt32) -> OSStatus {
-        guard let unit = lifecycle.unit,
-              let format,
-              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else {
+        guard let unit = lifecycle.unit else { return noErr }
+        let reservationResult = ring.beginWrite(
+            frames: frames,
+            channelCount: UInt32(ring.channelCount)
+        )
+        switch reservationResult {
+        case .full:
+            // A full queue drops the newest slice, but the HAL input pull must
+            // still be consumed. Render into the preallocated sink so the
+            // callback does not leave input pending or overwrite old audio.
+            guard let discard = ring.discardBufferList(
+                frames: frames,
+                channelCount: UInt32(ring.channelCount)
+            ) else { return noErr }
+            return AudioUnitRender(unit, actionFlags, timeStamp, busNumber, frames, discard)
+        case .oversized, .closed:
+            // Oversized slices cannot safely be rendered into fixed storage;
+            // they are counted by the ring and dropped without resizing.
+            return noErr
+        case .reserved(let reservation):
+            let status = AudioUnitRender(
+                unit,
+                actionFlags,
+                timeStamp,
+                busNumber,
+                frames,
+                ring.audioBufferList(for: reservation)
+            )
+            guard status == noErr else {
+                ring.abandonWrite(reservation)
+                return status
+            }
+            ring.commitWrite(reservation)
             return noErr
         }
-        buffer.frameLength = frames
-        let status = AudioUnitRender(unit, actionFlags, timeStamp, busNumber, frames, buffer.mutableAudioBufferList)
-        guard status == noErr else { return status }
+    }
+
+    /// Deterministic support seam for focused tests. It runs the same
+    /// publisher-side copy/gain/level/yield path without waiting on a task.
+    internal func publishAvailableChunksForTesting() {
+        drainPublishedChunks()
+    }
+
+    private func closeCallbackAdmission() {
+        while true {
+            let state = callbackState.load(ordering: .acquiring)
+            guard state & Self.admissionClosedBit == 0 else { return }
+            let result = callbackState.compareExchange(
+                expected: state,
+                desired: state | Self.admissionClosedBit,
+                ordering: .acquiringAndReleasing
+            )
+            if result.exchanged { return }
+        }
+    }
+
+    private func waitForCallbacks() {
+        while callbackState.load(ordering: .acquiring) & Self.callbackCountMask != 0 {
+            sched_yield()
+        }
+    }
+
+    private func publisherLoop() async {
+        defer {
+            publisherCompletion.signal()
+            if streamTerminated.load(ordering: .acquiring),
+               !cleanupState.load(ordering: .acquiring) {
+                // The completion signal is already available, so cleanup can
+                // synchronously finish lifecycle disposal without waiting on
+                // this task (which is the current execution context).
+                cleanup()
+            }
+        }
+
+        while true {
+            var processedAny = false
+            while let chunk = ring.pop() {
+                processedAny = true
+                publish(chunk)
+            }
+
+            if streamTerminated.load(ordering: .acquiring) || ring.isClosed {
+                // `publish` releases every chunk even after stream cancellation;
+                // the loop only exits once all currently visible slots are
+                // consumed, preserving close/drain ordering.
+                while let chunk = ring.pop() {
+                    ring.release(chunk)
+                }
+                return
+            }
+
+            if !processedAny {
+                // The callback has no wake-up primitive on its realtime path;
+                // short publisher-side sleeps avoid a hot spin while retaining
+                // bounded shutdown once `ring.close()` is observed.
+                try? await Task.sleep(nanoseconds: 1_000_000)
+            }
+        }
+    }
+
+    private func drainPublishedChunks() {
+        while let chunk = ring.pop() {
+            publish(chunk)
+        }
+    }
+
+    private func publish(_ chunk: AudioChunkRing.Chunk) {
+        defer { ring.release(chunk) }
+        guard !streamTerminated.load(ordering: .acquiring) else { return }
+        guard let format,
+              let buffer = AVAudioPCMBuffer(
+                  pcmFormat: format,
+                  frameCapacity: AVAudioFrameCount(chunk.frameCount)
+              ),
+              let channels = buffer.floatChannelData else {
+            allocationFailures.wrappingAdd(1, ordering: .relaxed)
+            return
+        }
+
+        buffer.frameLength = AVAudioFrameCount(chunk.frameCount)
+        let destinationChannels = min(chunk.channelCount, Int(buffer.format.channelCount))
+        let sourceChannels = chunk.channelData
+        for channelIndex in 0..<destinationChannels {
+            channels[channelIndex].update(
+                from: sourceChannels[channelIndex],
+                count: chunk.frameCount
+            )
+        }
+
+        // Bluetooth gain and RMS are intentionally publisher-side work. This
+        // also guarantees each yielded buffer is a unique retained instance.
         applyCaptureGain(to: buffer)
-        continuation.yield(buffer)
         emitLevel(from: buffer)
-        return noErr
+
+        switch continuation.yield(buffer) {
+        case .enqueued:
+            break
+        case .dropped:
+            streamDropped.wrappingAdd(1, ordering: .relaxed)
+        case .terminated:
+            streamTerminated.store(true, ordering: .releasing)
+        @unknown default:
+            break
+        }
     }
 
     private func applyCaptureGain(to buffer: AVAudioPCMBuffer) {
@@ -178,8 +409,9 @@ internal final class AudioCaptureSession: @unchecked Sendable {
 /// playback is never degraded. Disposing the unit on stop fully releases the
 /// device.
 ///
-/// The render callback runs on the audio thread, so `onLevel` is called there —
-/// the consumer is responsible for hopping to the main actor.
+/// The render callback only copies into the fixed ring. A detached publisher
+/// owns PCM allocation, Bluetooth gain, RMS throttling, `onLevel`, and stream
+/// delivery, so consumers never retain a buffer that the callback may reuse.
 public final class AudioCaptureService: AudioCapturing, @unchecked Sendable {
     private var activeSession: AudioCaptureSession?
 
@@ -239,17 +471,31 @@ public final class AudioCaptureService: AudioCapturing, @unchecked Sendable {
             guard let avFormat = AVAudioFormat(streamDescription: &asbd) else {
                 throw AudioCaptureError.microphoneInUse
             }
+            let maximumFrames = try maximumFramesPerSlice(of: unit)
             NSLog("Nuvi/audio: HAL input device=\(device), sampleRate=\(avFormat.sampleRate), channels=\(avFormat.channelCount)")
 
-            let (stream, continuation) = AsyncStream<AVAudioPCMBuffer>.makeStream()
+            let (stream, continuation) = AsyncStream<AVAudioPCMBuffer>.makeStream(
+                // The ring and stream both use drop-newest semantics. Keeping
+                // the oldest buffered values preserves temporal order when a
+                // consumer falls behind.
+                bufferingPolicy: .bufferingOldest(AudioCaptureSession.streamBufferCapacity)
+            )
+            let ring = AudioChunkRing(
+                maxFrames: Int(maximumFrames),
+                channelCount: Int(hardware.mChannelsPerFrame),
+                capacity: AudioCaptureSession.ringCapacity
+            )
             let session = AudioCaptureSession(
                 lifecycle: liveLifecycle,
                 format: avFormat,
                 continuation: continuation,
                 levelHandler: onLevel,
-                usesBluetoothInput: usesBluetoothInput
+                usesBluetoothInput: usesBluetoothInput,
+                ring: ring
             )
             activeSession = session
+            session.installTerminationHandler()
+            session.startPublisher()
             // From this point on, the session owns all callback state and the
             // catch path must clean it through `activeSession`.
             lifecycle = nil
@@ -276,16 +522,20 @@ public final class AudioCaptureService: AudioCapturing, @unchecked Sendable {
     }
 
     public func stop() {
-        cleanupCapture()
-        onLevel?(0)
+        let hadSession = cleanupCapture()
+        if !hadSession {
+            onLevel?(0)
+        }
     }
 
-    private func cleanupCapture() {
+    @discardableResult
+    private func cleanupCapture() -> Bool {
         // Detach first. The local strong reference keeps the callback-owned
         // session alive through stop/uninitialize/dispose.
         let session = activeSession
         activeSession = nil
         session?.cleanup()
+        return session != nil
     }
 
     private func cleanup(_ lifecycle: AudioUnitLifecycle?) {
@@ -366,6 +616,23 @@ public final class AudioCaptureService: AudioCapturing, @unchecked Sendable {
             throw AudioCaptureError.microphoneUnavailable("Could not read input format")
         }
         return format
+    }
+
+    private func maximumFramesPerSlice(of unit: AudioUnit) throws -> UInt32 {
+        var maxFrames: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        let status = AudioUnitGetProperty(
+            unit,
+            kAudioUnitProperty_MaximumFramesPerSlice,
+            kAudioUnitScope_Global,
+            0,
+            &maxFrames,
+            &size
+        )
+        guard status == noErr, maxFrames > 0 else {
+            throw AudioCaptureError.microphoneUnavailable("Could not read maximum frames per slice")
+        }
+        return maxFrames
     }
 
     private func makeClientFormat(sampleRate: Float64, channels: UInt32) -> AudioStreamBasicDescription {
@@ -451,5 +718,7 @@ private func captureRenderCallback(refCon: UnsafeMutableRawPointer,
                                    frames: UInt32,
                                    data: UnsafeMutablePointer<AudioBufferList>?) -> OSStatus {
     let session = Unmanaged<AudioCaptureSession>.fromOpaque(refCon).takeUnretainedValue()
+    guard session.enterCallback() else { return noErr }
+    defer { session.leaveCallback() }
     return session.render(actionFlags: actionFlags, timeStamp: timeStamp, busNumber: busNumber, frames: frames)
 }
