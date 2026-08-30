@@ -1,6 +1,14 @@
 import Foundation
 import Combine
 
+private final class HistoryFileManager: @unchecked Sendable {
+    let value: FileManager
+
+    init(_ value: FileManager) {
+        self.value = value
+    }
+}
+
 /// One transcription, persisted for the History screen.
 public struct HistoryEntry: Identifiable, Codable, Sendable, Hashable {
     public let id: UUID
@@ -28,6 +36,7 @@ public final class HistoryStore: ObservableObject {
     private let maxEntries = 500
     let persistenceURL: URL?
     private let isHistoryEnabled: () -> Bool
+    private let fileManager: HistoryFileManager
     private let persistenceQueue = DispatchQueue(label: "nuvi.history.persistence", qos: .utility)
 
     /// A nil URL is deliberately memory-only. Production uses `shared`, while
@@ -35,13 +44,18 @@ public final class HistoryStore: ObservableObject {
     /// the user's Application Support directory.
     public init(
         persistenceURL: URL? = nil,
-        isHistoryEnabled: @escaping () -> Bool = { SettingsStore.shared.saveHistory }
+        isHistoryEnabled: @escaping () -> Bool = { SettingsStore.shared.saveHistory },
+        fileManager: FileManager = .default
     ) {
         self.persistenceURL = persistenceURL
         self.isHistoryEnabled = isHistoryEnabled
-        guard isHistoryEnabled() else { return }
+        self.fileManager = HistoryFileManager(fileManager)
+        guard isHistoryEnabled() else {
+            purgePersistedHistory()
+            return
+        }
         if let directory = persistenceURL?.deletingLastPathComponent() {
-            try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try? fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
         }
         load()
     }
@@ -55,7 +69,10 @@ public final class HistoryStore: ObservableObject {
     public func add(_ text: String) {
         // Respect the privacy setting: when history is off, dictated text is
         // never stored (not in memory, not on disk).
-        guard isHistoryEnabled() else { return }
+        guard isHistoryEnabled() else {
+            purgePersistedHistory()
+            return
+        }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         entries.insert(HistoryEntry(text: trimmed), at: 0)
@@ -71,32 +88,46 @@ public final class HistoryStore: ObservableObject {
     public func clear() {
         entries.removeAll()
         guard let persistenceURL else { return }
-        persistenceQueue.async {
-            try? FileManager.default.removeItem(at: persistenceURL)
+        let fileManager = fileManager
+        persistenceQueue.sync {
+            try? fileManager.value.removeItem(at: persistenceURL)
         }
     }
 
     private func load() {
         guard let persistenceURL,
-              let data = try? Data(contentsOf: persistenceURL),
+              let data = fileManager.value.contents(atPath: persistenceURL.path),
               let decoded = try? JSONDecoder().decode([HistoryEntry].self, from: data) else { return }
-        entries = decoded
+        entries = Array(decoded.prefix(maxEntries))
     }
 
     private func save() {
-        guard isHistoryEnabled(), let persistenceURL else { return }
+        guard let persistenceURL else { return }
+        guard isHistoryEnabled() else {
+            purgePersistedHistory()
+            return
+        }
         let snapshot = entries
+        let fileManager = fileManager
         persistenceQueue.async {
             if let data = try? JSONEncoder().encode(snapshot) {
-                try? FileManager.default.createDirectory(
+                try? fileManager.value.createDirectory(
                     at: persistenceURL.deletingLastPathComponent(),
                     withIntermediateDirectories: true
                 )
                 try? data.write(to: persistenceURL, options: .atomic)
                 // Owner-only permissions: the file holds dictated speech.
-                try? FileManager.default.setAttributes([.posixPermissions: 0o600],
-                                                        ofItemAtPath: persistenceURL.path)
+                try? fileManager.value.setAttributes([.posixPermissions: 0o600],
+                                                      ofItemAtPath: persistenceURL.path)
             }
+        }
+    }
+
+    private func purgePersistedHistory() {
+        guard let persistenceURL else { return }
+        let fileManager = fileManager
+        persistenceQueue.sync {
+            try? fileManager.value.removeItem(at: persistenceURL)
         }
     }
 

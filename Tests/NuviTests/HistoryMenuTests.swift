@@ -268,17 +268,65 @@ final class HistoryMenuTests: XCTestCase {
         XCTAssertEqual(second.persistenceURL, url)
     }
 
-    func testDisabledHistoryDoesNotLoadOrAddPersistedContent() throws {
+    func testDisabledHistoryPurgesExistingFileAndDoesNotLoadOrAddPersistedContent() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("NuviTests-History-\(UUID().uuidString)", isDirectory: true)
         let url = directory.appendingPathComponent("history.json")
+        let fileManager = FileManager()
         defer { try? FileManager.default.removeItem(at: directory) }
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
         try JSONEncoder().encode([HistoryEntry(text: "must remain hidden")]).write(to: url)
+        XCTAssertTrue(fileManager.fileExists(atPath: url.path))
 
-        let store = HistoryStore(persistenceURL: url, isHistoryEnabled: { false })
+        let store = HistoryStore(
+            persistenceURL: url,
+            isHistoryEnabled: { false },
+            fileManager: fileManager
+        )
         store.add("must not be retained")
 
         XCTAssertTrue(store.entries.isEmpty)
+        XCTAssertFalse(fileManager.fileExists(atPath: url.path))
+    }
+
+    func testClearWaitsForQueuedSaveBeforePhysicallyDeletingHistory() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("NuviTests-History-\(UUID().uuidString)", isDirectory: true)
+        let url = directory.appendingPathComponent("history.json")
+        let fileManager = FileManager()
+        defer { try? fileManager.removeItem(at: directory) }
+
+        let store = HistoryStore(
+            persistenceURL: url,
+            isHistoryEnabled: { true },
+            fileManager: fileManager
+        )
+        store.add("queued before clear")
+        store.clear()
+
+        XCTAssertTrue(store.entries.isEmpty)
+        XCTAssertFalse(fileManager.fileExists(atPath: url.path))
+
+        store.flushPersistence()
+        XCTAssertFalse(fileManager.fileExists(atPath: url.path))
+    }
+
+    func testHistoryStoreCapsEntriesLoadedFromDisk() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("NuviTests-History-\(UUID().uuidString)", isDirectory: true)
+        let url = directory.appendingPathComponent("history.json")
+        let fileManager = FileManager()
+        defer { try? fileManager.removeItem(at: directory) }
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        try JSONEncoder().encode((0..<501).map { HistoryEntry(text: "entry-\($0)") }).write(to: url)
+
+        let store = HistoryStore(
+            persistenceURL: url,
+            isHistoryEnabled: { true },
+            fileManager: fileManager
+        )
+
+        XCTAssertEqual(store.entries.count, 500)
+        XCTAssertEqual(store.entries.first?.text, "entry-0")
     }
 }
