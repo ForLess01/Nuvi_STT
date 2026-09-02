@@ -85,6 +85,10 @@ public final class ModelDownloadService: NSObject, ObservableObject {
     /// Parakeet models currently downloading. FluidAudio exposes no progress, so
     /// these are shown as indeterminate.
     @Published public var indeterminateDownloads: Set<String> = []
+    /// Downloads paused by the user. The underlying SDK task is cancelled while
+    /// its on-disk cache is retained so a later resume can continue the same
+    /// operation.
+    @Published public private(set) var pausedDownloads: Set<String> = []
     @Published public var downloadedModels: Set<String> = []
     /// Last user-facing error from a download/unzip failure, or nil.
     @Published public var lastError: String?
@@ -131,14 +135,20 @@ public final class ModelDownloadService: NSObject, ObservableObject {
     internal typealias ParakeetDownloadOperation = (_ version: String) async throws -> Void
 
     private var downloadTasks: [String: DownloadAttempt] = [:]
+    /// A resume is serialized behind the cancelled provider task. Keeping this
+    /// set separate from `pausedDownloads` prevents repeated taps from queuing
+    /// multiple operations against the same on-disk cache.
+    private var pendingResumes: Set<String> = []
     private let whisperDownloadOperation: WhisperDownloadOperation?
     private let parakeetDownloadOperation: ParakeetDownloadOperation?
+    private let modelDownloadBaseOverride: URL?
 
     public static let shared = ModelDownloadService()
 
     private override init() {
         whisperDownloadOperation = nil
         parakeetDownloadOperation = nil
+        modelDownloadBaseOverride = nil
         super.init()
         loadCatalog()
         refreshDownloadedModels()
@@ -149,10 +159,12 @@ public final class ModelDownloadService: NSObject, ObservableObject {
     internal init(
         testingCatalog: [AppModel],
         whisperDownloadOperation: WhisperDownloadOperation? = nil,
-        parakeetDownloadOperation: ParakeetDownloadOperation? = nil
+        parakeetDownloadOperation: ParakeetDownloadOperation? = nil,
+        modelDownloadBase: URL? = nil
     ) {
         self.whisperDownloadOperation = whisperDownloadOperation
         self.parakeetDownloadOperation = parakeetDownloadOperation
+        self.modelDownloadBaseOverride = modelDownloadBase
         super.init()
         catalog = testingCatalog
     }
@@ -204,8 +216,8 @@ public final class ModelDownloadService: NSObject, ObservableObject {
     public func refreshDownloadedModels() {
         // WhisperKit stores models nested, e.g.
         // .../WhisperKit/models/argmaxinc/whisperkit-coreml/openai_whisper-tiny/config.json
-        // so we recurse and treat the parent folder of any config.json as a
-        // downloaded variant (its folder name is the model id).
+        // so we recurse and inspect each candidate variant folder (its folder
+        // name is the model id) instead of treating config.json as completion.
         var downloaded = downloadedWhisperVariants()
 
         // Parakeet models: FluidAudio owns its cache, so we trust our persisted flag.
@@ -218,15 +230,79 @@ public final class ModelDownloadService: NSObject, ObservableObject {
 
     private func downloadedWhisperVariants() -> Set<String> {
         var variants = Set<String>()
+        let knownVariants = Set(catalog.compactMap { model in
+            model.engine == .whisperKit ? model.id : nil
+        })
         guard let baseDir = try? modelDownloadBase(),
               let enumerator = FileManager.default.enumerator(
                 at: baseDir, includingPropertiesForKeys: nil) else {
             return variants
         }
         for case let fileURL as URL in enumerator where fileURL.lastPathComponent == "config.json" {
-            variants.insert(fileURL.deletingLastPathComponent().lastPathComponent)
+            let modelDirectory = fileURL.deletingLastPathComponent()
+            let variant = modelDirectory.lastPathComponent
+            guard knownVariants.contains(variant), isCompleteWhisperModel(at: modelDirectory) else {
+                continue
+            }
+            variants.insert(variant)
         }
         return variants
+    }
+
+    /// WhisperKit considers a model usable only when its metadata and all of
+    /// its CoreML bundles are present. A config file can be written before the
+    /// model bundles finish downloading, so it is not a completion marker by
+    /// itself. Bundle names are intentionally not hardcoded here: the current
+    /// WhisperKit layout contains three `.mlmodelc` bundles, while future
+    /// releases may use `.mlpackage` bundles instead.
+    private func isCompleteWhisperModel(at directory: URL) -> Bool {
+        let configURL = directory.appendingPathComponent("config.json")
+        guard hasNonEmptyRegularFile(at: configURL),
+              let configData = try? Data(contentsOf: configURL),
+              (try? JSONSerialization.jsonObject(with: configData)) != nil else {
+            return false
+        }
+
+        let coreMLBundles = (try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ))?.filter { url in
+            let extensionName = url.pathExtension.lowercased()
+            return extensionName == "mlmodelc" || extensionName == "mlpackage"
+        } ?? []
+
+        // WhisperKit's standard pipeline requires feature extraction, audio
+        // encoding, and text decoding bundles. Requiring three non-empty
+        // bundles rejects config-only and partially downloaded cache folders
+        // without depending on brittle model filenames.
+        guard coreMLBundles.count >= 3 else { return false }
+        return coreMLBundles.allSatisfy { containsNonEmptyRegularFile(in: $0) }
+    }
+
+    private func hasNonEmptyRegularFile(at url: URL) -> Bool {
+        guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+              values.isRegularFile == true else {
+            return false
+        }
+        return (values.fileSize ?? 0) > 0
+    }
+
+    private func containsNonEmptyRegularFile(in directory: URL) -> Bool {
+        guard let enumerator = FileManager.default.enumerator(
+            at: directory,
+            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return false
+        }
+
+        for case let fileURL as URL in enumerator {
+            if hasNonEmptyRegularFile(at: fileURL) {
+                return true
+            }
+        }
+        return false
     }
 
     public func startDownload(modelId: String) {
@@ -247,8 +323,11 @@ public final class ModelDownloadService: NSObject, ObservableObject {
         downloadTasks[modelId] = attempt
 
         DispatchQueue.main.async {
-            guard self.isCurrentAttempt(modelId: modelId, token: token) else { return }
-            self.downloadProgress[modelId] = 0.01 // Mark start
+            guard self.isCurrentAttempt(modelId: modelId, token: token),
+                  !self.pausedDownloads.contains(modelId) else { return }
+            if self.downloadProgress[modelId] == nil {
+                self.downloadProgress[modelId] = 0.01 // Mark start
+            }
         }
 
         // Strong capture is fine: this is the shared singleton, which lives for
@@ -294,7 +373,8 @@ public final class ModelDownloadService: NSObject, ObservableObject {
         downloadTasks[modelId] = attempt
 
         DispatchQueue.main.async {
-            guard self.isCurrentAttempt(modelId: modelId, token: token) else { return }
+            guard self.isCurrentAttempt(modelId: modelId, token: token),
+                  !self.pausedDownloads.contains(modelId) else { return }
             self.indeterminateDownloads.insert(modelId)
         }
 
@@ -384,21 +464,29 @@ public final class ModelDownloadService: NSObject, ObservableObject {
     /// Exposes only the current-attempt bit to deterministic unit tests; the
     /// UI continues to derive its state from the published collections.
     internal func isDownloadActive(modelId: String) -> Bool {
-        downloadTasks[modelId] != nil
+        downloadTasks[modelId] != nil && !pausedDownloads.contains(modelId)
+    }
+
+    /// Returns whether the model has a paused download that can be resumed.
+    public func isDownloadPaused(modelId: String) -> Bool {
+        pausedDownloads.contains(modelId) && downloadTasks[modelId] != nil
     }
 
     private func updateProgress(modelId: String, token: UUID, fraction: Double) {
-        guard isCurrentAttempt(modelId: modelId, token: token) else { return }
+        guard isCurrentAttempt(modelId: modelId, token: token),
+              !pausedDownloads.contains(modelId) else { return }
         downloadProgress[modelId] = fraction
     }
 
     private func completeDownload(modelId: String, token: UUID) {
+        guard !pausedDownloads.contains(modelId) else { return }
         guard finishDownload(modelId: modelId, token: token) else { return }
         refreshDownloadedModels()
     }
 
     private func completeParakeetDownload(modelId: String, token: UUID) {
-        guard isCurrentAttempt(modelId: modelId, token: token) else { return }
+        guard isCurrentAttempt(modelId: modelId, token: token),
+              !pausedDownloads.contains(modelId) else { return }
         var set = SettingsStore.shared.downloadedParakeetModels
         set.insert(modelId)
         SettingsStore.shared.downloadedParakeetModels = set
@@ -407,13 +495,17 @@ public final class ModelDownloadService: NSObject, ObservableObject {
     }
 
     private func failDownload(modelId: String, token: UUID, message: String) {
-        guard isCurrentAttempt(modelId: modelId, token: token) else { return }
+        guard isCurrentAttempt(modelId: modelId, token: token),
+              !pausedDownloads.contains(modelId) else { return }
         lastError = message
         finishDownload(modelId: modelId, token: token)
     }
 
     private func cancelledDownload(modelId: String, token: UUID) {
         // Cancellation is an expected user action, not a user-facing error.
+        // A paused attempt remains owned by the service so a resume can create
+        // a fresh generation without losing the provider's partial cache.
+        guard !pausedDownloads.contains(modelId) else { return }
         _ = finishDownload(modelId: modelId, token: token)
     }
 
@@ -422,8 +514,64 @@ public final class ModelDownloadService: NSObject, ObservableObject {
         guard isCurrentAttempt(modelId: modelId, token: token) else { return false }
         downloadProgress.removeValue(forKey: modelId)
         indeterminateDownloads.remove(modelId)
+        pendingResumes.remove(modelId)
+        pausedDownloads.remove(modelId)
         downloadTasks.removeValue(forKey: modelId)
         return true
+    }
+
+    /// Pauses a download without deleting or resetting the provider's cache.
+    /// The cancelled task is deliberately left behind until its callbacks have
+    /// drained; resume replaces its UUID generation before starting again.
+    public func pauseDownload(modelId: String) {
+        guard let attempt = downloadTasks[modelId],
+              !pausedDownloads.contains(modelId),
+              attempt.task != nil else { return }
+
+        pausedDownloads.insert(modelId)
+        indeterminateDownloads.remove(modelId)
+        attempt.task?.cancel()
+    }
+
+    /// Resumes a paused download using the same catalog operation. A new UUID
+    /// generation makes every callback from the cancelled task stale, while
+    /// WhisperKit/FluidAudio reuse whatever partial files remain in their cache.
+    public func resumeDownload(modelId: String) {
+        guard pausedDownloads.contains(modelId),
+              !pendingResumes.contains(modelId),
+              let model = catalog.first(where: { $0.id == modelId }),
+              let attempt = downloadTasks[modelId] else { return }
+
+        pendingResumes.insert(modelId)
+        let token = attempt.token
+        let cancelledTask = attempt.task
+        cancelledTask?.cancel()
+
+        // WhisperKit's cancellation handler schedules downloader.cancel() in a
+        // child task. Waiting for the owning attempt to finish ensures that
+        // child has quiesced before a new generation touches the same cache.
+        Task { @MainActor [weak self] in
+            if let cancelledTask {
+                await cancelledTask.value
+            }
+            self?.startResumedDownload(model: model, modelId: modelId, token: token)
+        }
+    }
+
+    private func startResumedDownload(model: AppModel, modelId: String, token: UUID) {
+        guard pendingResumes.remove(modelId) != nil,
+              pausedDownloads.contains(modelId),
+              isCurrentAttempt(modelId: modelId, token: token) else { return }
+
+        downloadTasks.removeValue(forKey: modelId)
+        pausedDownloads.remove(modelId)
+
+        switch model.engine {
+        case .whisperKit:
+            startWhisperDownload(model)
+        case .parakeet:
+            startParakeetDownload(model)
+        }
     }
 
     public func cancelDownload(modelId: String) {
@@ -465,6 +613,9 @@ public final class ModelDownloadService: NSObject, ObservableObject {
     /// WhisperKit download/load directory. Delegates to the shared `ModelStorage`
     /// so the engine and this service never look in different places.
     public func modelDownloadBase() throws -> URL {
-        try ModelStorage.whisperKitBase()
+        if let modelDownloadBaseOverride {
+            return modelDownloadBaseOverride
+        }
+        return try ModelStorage.whisperKitBase()
     }
 }

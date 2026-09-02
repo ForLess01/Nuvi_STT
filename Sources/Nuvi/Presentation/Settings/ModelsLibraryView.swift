@@ -90,9 +90,16 @@ struct ModelsLibraryView: View {
                             model: model,
                             isDownloaded: downloadService.downloadedModels.contains(model.id),
                             isActive: activeModelId == model.id,
+                            isPaused: downloadService.isDownloadPaused(modelId: model.id),
                             activity: downloadActivity(for: model),
                             onDownload: {
                                 downloadService.startDownload(modelId: model.id)
+                            },
+                            onPause: {
+                                downloadService.pauseDownload(modelId: model.id)
+                            },
+                            onResume: {
+                                downloadService.resumeDownload(modelId: model.id)
                             },
                             onCancel: {
                                 downloadService.cancelDownload(modelId: model.id)
@@ -132,6 +139,15 @@ struct ModelsLibraryView: View {
     }
 
     private func downloadActivity(for model: AppModel) -> DownloadActivity? {
+        if downloadService.isDownloadPaused(modelId: model.id) {
+            if let fraction = downloadService.downloadProgress[model.id] {
+                return .determinate(fraction)
+            }
+            // FluidAudio does not expose byte progress. Keep the activity
+            // indeterminate while paused, but the card renders a static pause
+            // glyph instead of a misleading spinner.
+            return .indeterminate
+        }
         if downloadService.indeterminateDownloads.contains(model.id) {
             return .indeterminate
         }

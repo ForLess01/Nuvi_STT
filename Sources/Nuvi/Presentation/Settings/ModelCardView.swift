@@ -12,9 +12,12 @@ struct ModelCardView: View {
     let model: AppModel
     let isDownloaded: Bool
     let isActive: Bool
+    let isPaused: Bool
     let activity: DownloadActivity? // nil si no se está descargando
 
     let onDownload: () -> Void
+    let onPause: () -> Void
+    let onResume: () -> Void
     let onCancel: () -> Void
     let onSelect: () -> Void
     let onDelete: () -> Void
@@ -148,8 +151,36 @@ struct ModelCardView: View {
                     CircularProgressView(progress: fraction)
                         .frame(width: 18, height: 18)
                 case .indeterminate:
-                    ProgressView()
-                        .controlSize(.small)
+                    if isPaused {
+                        Image(systemName: "pause.circle.fill")
+                            .font(.title3)
+                            .foregroundColor(NuviPalette.lavender.opacity(0.8))
+                    } else {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+                }
+
+                if isPaused {
+                    Button(action: onResume) {
+                        Image(systemName: "play.fill")
+                            .font(.title3)
+                            .foregroundColor(NuviPalette.lavender.opacity(0.8))
+                    }
+                    .buttonStyle(.plain)
+                    .help(tr("Resume download", "Reanudar descarga"))
+                    .accessibilityLabel(tr("Resume download", "Reanudar descarga"))
+                    .accessibilityHint(tr("Continue this download from its cached files.", "Continuar esta descarga desde sus archivos en caché."))
+                } else {
+                    Button(action: onPause) {
+                        Image(systemName: "pause.fill")
+                            .font(.title3)
+                            .foregroundColor(NuviPalette.lavender.opacity(0.8))
+                    }
+                    .buttonStyle(.plain)
+                    .help(tr("Pause download", "Pausar descarga"))
+                    .accessibilityLabel(tr("Pause download", "Pausar descarga"))
+                    .accessibilityHint(tr("Keep downloaded files and pause this operation.", "Conservar los archivos descargados y pausar esta operación."))
                 }
 
                 Button(action: onCancel) {
@@ -158,6 +189,9 @@ struct ModelCardView: View {
                         .foregroundColor(NuviPalette.lavender.opacity(0.8))
                 }
                 .buttonStyle(.plain)
+                .help(tr("Cancel download", "Cancelar descarga"))
+                .accessibilityLabel(tr("Cancel download", "Cancelar descarga"))
+                .accessibilityHint(tr("Stop this operation; cached partial files are kept.", "Detener esta operación; se conservan los archivos parciales en caché."))
             }
         } else if isDownloaded {
             if isActive {
