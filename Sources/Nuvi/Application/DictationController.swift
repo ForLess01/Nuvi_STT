@@ -289,6 +289,8 @@ public final class DictationController: ObservableObject {
     private let textTranslator: TextTranslating
     private let translationTarget: () -> TranslationTarget
     private let deliveryMode: () -> DictationDeliveryMode
+    private let silenceDetectionEnabled: () -> Bool
+    private let silenceDurationThreshold: () -> TimeInterval
     private let completionScheduler: CompletionFeedbackScheduling
     private var session: Task<Void, Never>?
     private var sessionID: UUID?
@@ -297,6 +299,8 @@ public final class DictationController: ObservableObject {
     private var completionCancellation: AnyCancellable?
     private var completionToken: UUID?
     private var liveInsertionStarted = false
+    private var hasSpokenInCurrentSession = false
+    private var silenceStopTask: Task<Void, Never>?
 
     public convenience init(audio: AudioCapturing,
                             engine: TranscriptionEngine,
@@ -312,6 +316,12 @@ public final class DictationController: ObservableObject {
                             deliveryMode: @escaping () -> DictationDeliveryMode = {
                                 SettingsStore.shared.dictationDeliveryMode
                             },
+                            silenceDetectionEnabled: @escaping () -> Bool = {
+                                SettingsStore.shared.silenceDetectionEnabled
+                            },
+                            silenceDurationThreshold: @escaping () -> TimeInterval = {
+                                SettingsStore.shared.silenceDurationThreshold
+                            },
                             engineConfigurationID: String? = nil) {
         self.init(
             audio: audio,
@@ -324,6 +334,8 @@ public final class DictationController: ObservableObject {
             textTranslator: textTranslator,
             translationTarget: translationTarget,
             deliveryMode: deliveryMode,
+            silenceDetectionEnabled: silenceDetectionEnabled,
+            silenceDurationThreshold: silenceDurationThreshold,
             engineConfigurationID: engineConfigurationID,
             completionScheduler: LiveCompletionFeedbackScheduler()
         )
@@ -343,6 +355,12 @@ public final class DictationController: ObservableObject {
          deliveryMode: @escaping () -> DictationDeliveryMode = {
              SettingsStore.shared.dictationDeliveryMode
          },
+         silenceDetectionEnabled: @escaping () -> Bool = {
+             SettingsStore.shared.silenceDetectionEnabled
+         },
+         silenceDurationThreshold: @escaping () -> TimeInterval = {
+             SettingsStore.shared.silenceDurationThreshold
+         },
          engineConfigurationID: String?,
          completionScheduler: CompletionFeedbackScheduling) {
         self.audio = audio
@@ -356,9 +374,15 @@ public final class DictationController: ObservableObject {
         self.textTranslator = textTranslator
         self.translationTarget = translationTarget
         self.deliveryMode = deliveryMode
+        self.silenceDetectionEnabled = silenceDetectionEnabled
+        self.silenceDurationThreshold = silenceDurationThreshold
         self.completionScheduler = completionScheduler
         self.audio.onLevel = { [weak self] level in
-            Task { @MainActor in self?.level = level }
+            Task { @MainActor in
+                guard let self else { return }
+                self.level = level
+                self.processSilenceDetection(level: level)
+            }
         }
     }
 
@@ -405,6 +429,8 @@ public final class DictationController: ObservableObject {
         // state is still .idle, so a second trigger could spawn a 2nd session.
         guard session == nil else { return }
         cancelCompletionFeedback()
+        cancelSilenceTimer()
+        hasSpokenInCurrentSession = false
         NSLog("Nuvi/session: start requested")
         stopRequested = false
         transcript = ""
@@ -447,6 +473,7 @@ public final class DictationController: ObservableObject {
     private func performStop() {
         guard state == .listening else { return }
         NSLog("Nuvi/session: stop requested")
+        cancelSilenceTimer()
         state = .transcribing
         NuviSound.stop()
         audio.stop() // ends the buffer stream → engine emits the final segment
@@ -455,6 +482,7 @@ public final class DictationController: ObservableObject {
     /// Discard the session entirely (Esc).
     public func cancel() {
         NSLog("Nuvi/session: cancel requested")
+        cancelSilenceTimer()
         let cancelled = session
         session = nil
         sessionID = nil
@@ -463,6 +491,41 @@ public final class DictationController: ObservableObject {
         cancelLiveInsertion()
         NuviSound.cancel()
         clearSessionState()
+    }
+
+    private func processSilenceDetection(level: Float) {
+        guard state == .listening, silenceDetectionEnabled() else { return }
+
+        let speechThreshold: Float = 0.10
+        let silenceThreshold: Float = 0.07
+
+        if level >= speechThreshold {
+            hasSpokenInCurrentSession = true
+            cancelSilenceTimer()
+            return
+        }
+
+        if hasSpokenInCurrentSession {
+            if level > silenceThreshold {
+                // Intermediate sound (whisper, soft syllable) - cancel pending countdown
+                cancelSilenceTimer()
+            } else if silenceStopTask == nil {
+                // Sustained silence (< 0.07) - start countdown to auto-stop
+                let duration = max(0.5, silenceDurationThreshold())
+                let nanos = UInt64(duration * 1_000_000_000)
+                silenceStopTask = Task { @MainActor [weak self] in
+                    try? await Task.sleep(nanoseconds: nanos)
+                    guard !Task.isCancelled, let self, self.state == .listening else { return }
+                    NSLog("Nuvi/session: auto-stopping due to detected silence")
+                    self.stop()
+                }
+            }
+        }
+    }
+
+    private func cancelSilenceTimer() {
+        silenceStopTask?.cancel()
+        silenceStopTask = nil
     }
 
     // MARK: - Session
@@ -499,6 +562,8 @@ public final class DictationController: ObservableObject {
 
             var liveTranscript = LiveTranscriptAssembler()
             for try await event in engine.transcribe(buffers, reportingPartials: isLive) {
+                hasSpokenInCurrentSession = true
+                cancelSilenceTimer()
                 if isLive {
                     guard let assembled = liveTranscript.consume(event) else { continue }
                     transcript = assembled
@@ -587,6 +652,8 @@ public final class DictationController: ObservableObject {
     }
 
     private func clearSessionState() {
+        cancelSilenceTimer()
+        hasSpokenInCurrentSession = false
         cancelLiveInsertion()
         cancelCompletionFeedback()
         state = .idle

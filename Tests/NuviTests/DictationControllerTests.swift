@@ -659,6 +659,45 @@ final class DictationControllerTests: XCTestCase {
         XCTAssertEqual(controller.state, .error(NuviError.micInUse.display))
     }
 
+    func testSilenceDetectionAutoStopsSessionAfterSpeechFollowedBySilence() async {
+        let audio = FakeAudioCapture()
+        let engine = FakeEngine()
+        engine.events = []
+        let controller = DictationController(
+            audio: audio,
+            engine: engine,
+            history: HistoryStore(),
+            vocabulary: VocabularyStore(),
+            modes: ModesStore(),
+            textInjector: FakeTextInjector(),
+            silenceDetectionEnabled: { true },
+            silenceDurationThreshold: { 0.1 }
+        )
+
+        controller.start()
+        await yieldUntil { controller.state == .listening }
+
+        // Speech starts
+        audio.onLevel?(0.25)
+        await Task.yield()
+
+        // Silence follows
+        audio.onLevel?(0.01)
+
+        // Wait for auto-stop to trigger performStop()
+        await waitUntil { audio.stopCount == 1 && controller.state == .transcribing }
+
+        XCTAssertEqual(audio.stopCount, 1)
+        XCTAssertEqual(controller.state, .transcribing)
+
+        // Deliver final text from engine to finish
+        engine.emit(.final("dictated text"))
+        engine.finish()
+
+        await waitUntil { controller.state == .inserted }
+        XCTAssertEqual(controller.state, .inserted)
+    }
+
     private func yieldUntil(_ predicate: @escaping @MainActor () -> Bool) async {
         for _ in 0..<1_000 where !predicate() {
             await Task.yield()
@@ -697,7 +736,10 @@ private final class FakeAudioCapture: AudioCapturing, @unchecked Sendable {
         return pair.stream
     }
 
+    private(set) var stopCount = 0
+
     func stop() {
+        stopCount += 1
         continuation?.finish()
         continuation = nil
     }
@@ -742,6 +784,10 @@ private final class FakeEngine: TranscriptionEngine, @unchecked Sendable {
 
     func emit(_ event: TranscriptionEvent) {
         continuation?.yield(event)
+    }
+
+    func finish() {
+        continuation?.finish()
     }
 }
 

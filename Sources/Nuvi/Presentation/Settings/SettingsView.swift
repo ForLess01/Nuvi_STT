@@ -212,6 +212,8 @@ private struct ConfigurationPanel: View {
     @State private var engine = SettingsStore.shared.enginePreference
     @State private var deliveryMode = SettingsStore.shared.dictationDeliveryMode
     @State private var translationTarget = SettingsStore.shared.translationTarget
+    @State private var silenceDetection = SettingsStore.shared.silenceDetectionEnabled
+    @State private var silenceDuration = SettingsStore.shared.silenceDurationThreshold
     @ObservedObject private var shortcuts = ShortcutsStore.shared
     @ObservedObject private var loc = LocalizationStore.shared
 
@@ -295,6 +297,39 @@ private struct ConfigurationPanel: View {
                     .frame(width: 200)
                     .onChange(of: translationTarget) { _, new in
                         SettingsStore.shared.translationTarget = new
+                    }
+                }
+                RowDivider()
+                SettingRow(
+                    title: tr("Auto-stop on silence", "Auto-detener por silencio"),
+                    subtitle: tr(
+                        "Automatically finish dictation after a brief pause in speech",
+                        "Finaliza automáticamente el dictado tras una breve pausa al hablar"
+                    )
+                ) {
+                    Toggle("", isOn: $silenceDetection)
+                        .labelsHidden()
+                        .onChange(of: silenceDetection) { _, value in
+                            SettingsStore.shared.silenceDetectionEnabled = value
+                        }
+                }
+                if silenceDetection {
+                    RowDivider()
+                    SettingRow(
+                        title: tr("Silence duration", "Duración de silencio"),
+                        subtitle: tr("How long to wait after you stop speaking", "Tiempo de espera tras dejar de hablar")
+                    ) {
+                        Picker("", selection: $silenceDuration) {
+                            Text("1.0s").tag(1.0)
+                            Text("1.5s").tag(1.5)
+                            Text("2.0s").tag(2.0)
+                            Text("3.0s").tag(3.0)
+                        }
+                        .labelsHidden()
+                        .frame(width: 200)
+                        .onChange(of: silenceDuration) { _, value in
+                            SettingsStore.shared.silenceDurationThreshold = value
+                        }
                     }
                 }
                 RowDivider()

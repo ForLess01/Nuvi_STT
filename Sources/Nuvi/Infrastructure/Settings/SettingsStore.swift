@@ -146,6 +146,19 @@ public final class SettingsStore: @unchecked Sendable {
         set { defaults.set(newValue, forKey: Keys.hasAcknowledgedLiveMode) }
     }
 
+    public var silenceDetectionEnabled: Bool {
+        get { defaults.bool(forKey: Keys.silenceDetectionEnabled) }
+        set { defaults.set(newValue, forKey: Keys.silenceDetectionEnabled) }
+    }
+
+    public var silenceDurationThreshold: TimeInterval {
+        get {
+            let val = defaults.double(forKey: Keys.silenceDurationThreshold)
+            return val > 0 ? val : 1.5
+        }
+        set { defaults.set(newValue, forKey: Keys.silenceDurationThreshold) }
+    }
+
     /// Which input device to capture from, by CoreAudio device UID.
     ///   ""        → Automatic: built-in mic if present, else system default. Keeps
     ///               a Bluetooth headset in A2DP so its music is never degraded.
@@ -240,6 +253,8 @@ public final class SettingsStore: @unchecked Sendable {
         // could not stream. Every user must see the corrected engine-specific
         // resource notice once.
         static let hasAcknowledgedLiveMode = "nuvi.hasAcknowledgedLiveModeV2"
+        static let silenceDetectionEnabled = "nuvi.silenceDetectionEnabled"
+        static let silenceDurationThreshold = "nuvi.silenceDurationThreshold"
         static let inputDeviceUID = "nuvi.inputDeviceUID"
         static let selectedModelID = "nuvi.selectedModelID"
         static let downloadedParakeet = "nuvi.downloadedParakeetModels"
