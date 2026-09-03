@@ -60,6 +60,18 @@
     "icon": "cpu.fill"
   },
   {
+    "id": "openai_whisper-large-v3_turbo",
+    "name": "Whisper Large v3 Turbo",
+    "desc": "Near-Large v3 accuracy at 4x-6x higher speed with reduced memory footprint.",
+    "descEs": "Precisión cercana a Large v3 a 4x-6x mayor velocidad con menor consumo de memoria.",
+    "engine": "whisperKit",
+    "accuracy": 0.97,
+    "speed": 0.75,
+    "sizeBytes": 1624000000,
+    "ramBytes": 2147483648,
+    "icon": "bolt.badge.clock.fill"
+  },
+  {
     "id": "parakeet-tdt-0.6b-v3",
     "name": "Parakeet TDT v3",
     "desc": "Multilingual model (25 European languages + Japanese). Extremely fast on Apple Silicon via FluidAudio.",
