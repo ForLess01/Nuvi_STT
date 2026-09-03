@@ -102,7 +102,7 @@ public final class WhisperKitEngine: TranscriptionEngine, @unchecked Sendable {
             pipe = try await makePipeline()
         } catch {
             if Self.isRecoverableMetadataError(error) {
-                try? Self.resetAppOwnedWhisperCache()
+                try? Self.resetModelCache(for: modelName)
                 do {
                     pipe = try await makePipeline()
                     return
@@ -125,12 +125,21 @@ public final class WhisperKitEngine: TranscriptionEngine, @unchecked Sendable {
         )
     }
 
-    private static func resetAppOwnedWhisperCache() throws {
+    private static func resetModelCache(for modelName: String) throws {
         let downloadBase = try ModelStorage.whisperKitBase()
-        if FileManager.default.fileExists(atPath: downloadBase.path) {
-            try FileManager.default.removeItem(at: downloadBase)
+        guard FileManager.default.fileExists(atPath: downloadBase.path) else { return }
+        if let enumerator = FileManager.default.enumerator(at: downloadBase, includingPropertiesForKeys: nil) {
+            var toRemove: [URL] = []
+            for case let fileURL as URL in enumerator where fileURL.lastPathComponent == "config.json" {
+                let dir = fileURL.deletingLastPathComponent()
+                if dir.lastPathComponent == modelName {
+                    toRemove.append(dir)
+                }
+            }
+            for dir in toRemove {
+                try? FileManager.default.removeItem(at: dir)
+            }
         }
-        try FileManager.default.createDirectory(at: downloadBase, withIntermediateDirectories: true)
     }
 
     private static func isRecoverableMetadataError(_ error: Error) -> Bool {

@@ -62,8 +62,17 @@ public final class HistoryStore: ObservableObject {
 
     private static func productionPersistenceURL() -> URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        let dir = base.appendingPathComponent("Nuvi", isDirectory: true)
-        return dir.appendingPathComponent("history.json")
+        let appFolderName = Bundle.main.bundleIdentifier ?? "com.nuvi.app"
+        let primaryDir = base.appendingPathComponent(appFolderName, isDirectory: true)
+        let primaryFile = primaryDir.appendingPathComponent("history.json")
+
+        let legacyDir = base.appendingPathComponent("Nuvi", isDirectory: true)
+        let legacyFile = legacyDir.appendingPathComponent("history.json")
+        if !FileManager.default.fileExists(atPath: primaryFile.path) && FileManager.default.fileExists(atPath: legacyFile.path) {
+            try? FileManager.default.createDirectory(at: primaryDir, withIntermediateDirectories: true)
+            try? FileManager.default.copyItem(at: legacyFile, to: primaryFile)
+        }
+        return primaryFile
     }
 
     public func add(_ text: String) {

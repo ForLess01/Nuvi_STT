@@ -28,20 +28,32 @@ final class TranslationCoordinator: ObservableObject, TextTranslating {
         )
 
         let id = UUID()
-        return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                begin(
-                    PendingRequest(
-                        id: id,
-                        text: text,
-                        sourceLanguage: nil,
-                        continuation: continuation
-                    ),
-                    targetLanguage: targetLanguage
-                )
+        let timeoutNanos: UInt64 = 5_000_000_000
+        return try await withThrowingTaskGroup(of: String.self) { group in
+            group.addTask { @MainActor in
+                try await withTaskCancellationHandler {
+                    try await withCheckedThrowingContinuation { continuation in
+                        self.begin(
+                            PendingRequest(
+                                id: id,
+                                text: text,
+                                sourceLanguage: nil,
+                                continuation: continuation
+                            ),
+                            targetLanguage: targetLanguage
+                        )
+                    }
+                } onCancel: {
+                    Task { @MainActor [weak self] in self?.cancel(id: id) }
+                }
             }
-        } onCancel: {
-            Task { @MainActor [weak self] in self?.cancel(id: id) }
+            group.addTask {
+                try await Task.sleep(nanoseconds: timeoutNanos)
+                throw NuviError.translationFailed("Translation request timed out")
+            }
+            let result = try await group.next()!
+            group.cancelAll()
+            return result
         }
     }
 

@@ -582,32 +582,58 @@ public final class ModelDownloadService: NSObject, ObservableObject {
     
     public func deleteModel(modelId: String) {
         guard let model = catalog.first(where: { $0.id == modelId }) else { return }
+        downloadedModels.remove(modelId)
+
         switch model.engine {
         case .whisperKit:
-            // The model folder is nested under the HF repo path, so locate it by
-            // finding the config.json whose parent folder name is the model id.
-            guard let baseDir = try? modelDownloadBase(),
-                  let enumerator = FileManager.default.enumerator(
-                    at: baseDir, includingPropertiesForKeys: nil) else { break }
-            var toRemove: [URL] = []
-            for case let fileURL as URL in enumerator where fileURL.lastPathComponent == "config.json" {
-                let dir = fileURL.deletingLastPathComponent()
-                if dir.lastPathComponent == modelId {
-                    toRemove.append(dir)
+            guard let baseDir = try? modelDownloadBase() else { break }
+            DispatchQueue.global(qos: .utility).async {
+                Self.removeWhisperModelFiles(baseDir: baseDir, modelId: modelId)
+                DispatchQueue.main.async { [weak self] in
+                    self?.refreshDownloadedModels()
                 }
             }
-            for dir in toRemove {
-                try? FileManager.default.removeItem(at: dir)
-            }
         case .parakeet:
-            // FluidAudio owns the on-disk cache (path undocumented), so we only
-            // clear our "downloaded" flag. The model re-loads instantly from
-            // FluidAudio's cache if it's still present.
             var set = SettingsStore.shared.downloadedParakeetModels
             set.remove(modelId)
             SettingsStore.shared.downloadedParakeetModels = set
+
+            DispatchQueue.global(qos: .utility).async {
+                Self.removeParakeetModelFiles(modelId: modelId)
+                DispatchQueue.main.async { [weak self] in
+                    self?.refreshDownloadedModels()
+                }
+            }
         }
-        refreshDownloadedModels()
+    }
+
+    private nonisolated static func removeWhisperModelFiles(baseDir: URL, modelId: String) {
+        guard let enumerator = FileManager.default.enumerator(at: baseDir, includingPropertiesForKeys: nil) else { return }
+        var toRemove: [URL] = []
+        for case let fileURL as URL in enumerator where fileURL.lastPathComponent == "config.json" {
+            let dir = fileURL.deletingLastPathComponent()
+            if dir.lastPathComponent == modelId {
+                toRemove.append(dir)
+            }
+        }
+        for dir in toRemove {
+            try? FileManager.default.removeItem(at: dir)
+        }
+    }
+
+    private nonisolated static func removeParakeetModelFiles(modelId: String) {
+        guard let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return }
+        let fluidAudioModels = appSupport
+            .appendingPathComponent("FluidAudio", isDirectory: true)
+            .appendingPathComponent("Models", isDirectory: true)
+        guard let contents = try? FileManager.default.contentsOfDirectory(at: fluidAudioModels, includingPropertiesForKeys: nil) else { return }
+        for dir in contents {
+            let name = dir.lastPathComponent.lowercased()
+            let target = modelId.lowercased()
+            if name == target || name.contains(target) || target.contains(name) {
+                try? FileManager.default.removeItem(at: dir)
+            }
+        }
     }
 
     /// WhisperKit download/load directory. Delegates to the shared `ModelStorage`

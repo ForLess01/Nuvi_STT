@@ -22,9 +22,13 @@ public final class VocabularyStore: ObservableObject {
     public static let shared = VocabularyStore()
 
     @Published public var rules: [VocabularyRule] {
-        didSet { save() }
+        didSet {
+            recompile()
+            save()
+        }
     }
 
+    private var compiledRules: [(from: String, regex: NSRegularExpression, template: String)] = []
     private let key = "nuvi.vocabulary"
     private var pendingSave: DispatchWorkItem?
 
@@ -35,6 +39,7 @@ public final class VocabularyStore: ObservableObject {
         } else {
             rules = []
         }
+        recompile()
     }
 
     public func add() {
@@ -45,16 +50,25 @@ public final class VocabularyStore: ObservableObject {
         rules.removeAll { $0.id == rule.id }
     }
 
-    /// Case-insensitive whole-word replacement for each non-empty rule.
-    public func apply(to text: String) -> String {
-        var result = text
-        for rule in rules where !rule.from.isEmpty {
+    private func recompile() {
+        compiledRules = rules.compactMap { rule in
+            guard !rule.from.isEmpty else { return nil }
             let escaped = NSRegularExpression.escapedPattern(for: rule.from)
             let pattern = "(?<![\\p{L}\\p{N}_])\(escaped)(?![\\p{L}\\p{N}_])"
-            guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { continue }
-            let range = NSRange(result.startIndex..., in: result)
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return nil }
             let template = NSRegularExpression.escapedTemplate(for: rule.to)
-            result = regex.stringByReplacingMatches(in: result, options: [], range: range, withTemplate: template)
+            return (rule.from, regex, template)
+        }
+    }
+
+    /// Case-insensitive whole-word replacement for each non-empty rule.
+    public func apply(to text: String) -> String {
+        guard !compiledRules.isEmpty, !text.isEmpty else { return text }
+        var result = text
+        for item in compiledRules {
+            guard result.localizedCaseInsensitiveContains(item.from) else { continue }
+            let range = NSRange(result.startIndex..., in: result)
+            result = item.regex.stringByReplacingMatches(in: result, options: [], range: range, withTemplate: item.template)
         }
         return result
     }

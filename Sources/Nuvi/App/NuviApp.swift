@@ -46,7 +46,7 @@ enum NuviApp {
     }
 
     static func main() {
-        let identity = Bundle.main.bundleIdentifier ?? "com.nuvi.Nuvi"
+        let identity = Bundle.main.bundleIdentifier ?? "com.nuvi.app"
         let lockURL = SingleInstanceGuard.defaultLockURL(identity: identity)
         routeLaunch(
             arguments: CommandLine.arguments,
