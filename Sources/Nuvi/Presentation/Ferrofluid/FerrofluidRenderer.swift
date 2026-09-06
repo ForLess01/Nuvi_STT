@@ -12,10 +12,14 @@ final class FerrofluidRenderer: NSObject, MTKViewDelegate {
     private let startTime = CACurrentMediaTime()
 
     var level: Float = 0
+    var spectrum: AudioSpectrum = .zero
     var settings: FerrofluidSettings = .default
     var simulate: Bool = false
 
     private var smoothed: Float = 0
+    private var smoothedBass: Float = 0
+    private var smoothedMid: Float = 0
+    private var smoothedTreble: Float = 0
 
     private struct Uniforms {
         var time: Float
@@ -33,6 +37,9 @@ final class FerrofluidRenderer: NSObject, MTKViewDelegate {
         var bgR: Float
         var bgG: Float
         var bgB: Float
+        var bass: Float
+        var mid: Float
+        var treble: Float
     }
 
     init?(mtkView: MTKView) {
@@ -92,8 +99,46 @@ final class FerrofluidRenderer: NSObject, MTKViewDelegate {
         guard let encoder = command.makeRenderCommandEncoder(descriptor: descriptor) else { return }
 
         let time = Float(CACurrentMediaTime() - startTime)
-        let target = simulate ? (0.45 + 0.45 * (0.5 + 0.5 * sin(time * 3.1))) : level
-        smoothed += (target - smoothed) * 0.22
+        let sens = max(0.1, settings.sensitivity)
+        let targetLevel: Float
+        let targetBass: Float
+        let targetMid: Float
+        let targetTreble: Float
+
+        if simulate {
+            let wave = 0.5 + 0.5 * sin(time * 3.1)
+            targetLevel = min(1.0, (0.45 + 0.45 * wave) * sens)
+            targetBass = min(1.0, (0.40 + 0.40 * (0.5 + 0.5 * sin(time * 2.2))) * sens)
+            targetMid = min(1.0, (0.35 + 0.35 * (0.5 + 0.5 * sin(time * 4.1 + 1.0))) * sens)
+            targetTreble = min(1.0, (0.30 + 0.30 * (0.5 + 0.5 * sin(time * 7.5 + 2.0))) * sens)
+        } else {
+            targetLevel = min(1.0, level * sens)
+            if spectrum != .zero {
+                targetBass = min(1.0, spectrum.bass * sens)
+                targetMid = min(1.0, spectrum.mid * sens)
+                targetTreble = min(1.0, spectrum.treble * sens)
+            } else {
+                targetBass = min(1.0, level * 0.9 * sens)
+                targetMid = min(1.0, level * 0.7 * sens)
+                targetTreble = min(1.0, level * 0.5 * sens)
+            }
+        }
+
+        // Bass: heavier mass, slower decay
+        let bassCoeff: Float = targetBass > smoothedBass ? 0.25 : 0.08
+        smoothedBass += (targetBass - smoothedBass) * bassCoeff
+
+        // Mid: moderate fluid damping
+        let midCoeff: Float = targetMid > smoothedMid ? 0.35 : 0.18
+        smoothedMid += (targetMid - smoothedMid) * midCoeff
+
+        // Treble: fast, sharp reaction for surface micro-spikes
+        let trebleCoeff: Float = targetTreble > smoothedTreble ? 0.65 : 0.35
+        smoothedTreble += (targetTreble - smoothedTreble) * trebleCoeff
+
+        // Level: overall fluid volume easing
+        let levelCoeff: Float = targetLevel > smoothed ? 0.28 : 0.18
+        smoothed += (targetLevel - smoothed) * levelCoeff
 
         var uniforms = Uniforms(
             time: time,
@@ -110,7 +155,10 @@ final class FerrofluidRenderer: NSObject, MTKViewDelegate {
             fluidB: settings.fluidColor.b,
             bgR: settings.backgroundColor.r,
             bgG: settings.backgroundColor.g,
-            bgB: settings.backgroundColor.b
+            bgB: settings.backgroundColor.b,
+            bass: smoothedBass,
+            mid: smoothedMid,
+            treble: smoothedTreble
         )
 
         encoder.setRenderPipelineState(pipeline)

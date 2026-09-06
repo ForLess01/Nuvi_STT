@@ -14,9 +14,17 @@ public enum AudioCaptureError: Error, Sendable, Equatable {
 
 public protocol AudioCapturing: AnyObject, Sendable {
     var onLevel: (@Sendable (Float) -> Void)? { get set }
+    var onSpectrum: (@Sendable (AudioSpectrum) -> Void)? { get set }
     func requestPermission() async -> Bool
     func start() throws -> AsyncStream<AVAudioPCMBuffer>
     func stop()
+}
+
+public extension AudioCapturing {
+    var onSpectrum: (@Sendable (AudioSpectrum) -> Void)? {
+        get { nil }
+        set {}
+    }
 }
 
 /// The control-plane lifecycle for one HAL instance. The render callback only
@@ -67,8 +75,10 @@ internal final class AudioCaptureSession: @unchecked Sendable {
     let format: AVAudioFormat?
     var continuation: AsyncStream<AVAudioPCMBuffer>.Continuation
     let levelHandler: (@Sendable (Float) -> Void)?
+    let spectrumHandler: (@Sendable (AudioSpectrum) -> Void)?
     let levelEmissionIntervalNanos: UInt64
     let ring: AudioChunkRing
+    private let spectrumAnalyzer = AudioSpectrumAnalyzer()
 
     private let callbackState = Atomic<UInt64>(0)
     private let cleanupState = Atomic<Bool>(false)
@@ -90,6 +100,7 @@ internal final class AudioCaptureSession: @unchecked Sendable {
          format: AVAudioFormat?,
          continuation: AsyncStream<AVAudioPCMBuffer>.Continuation,
          levelHandler: (@Sendable (Float) -> Void)?,
+         spectrumHandler: (@Sendable (AudioSpectrum) -> Void)? = nil,
          usesBluetoothInput: Bool,
          ring: AudioChunkRing? = nil,
          levelEmissionIntervalNanos: UInt64 = 50_000_000) {
@@ -97,6 +108,7 @@ internal final class AudioCaptureSession: @unchecked Sendable {
         self.format = format
         self.continuation = continuation
         self.levelHandler = levelHandler
+        self.spectrumHandler = spectrumHandler
         self.levelEmissionIntervalNanos = levelEmissionIntervalNanos
         self.captureGain = usesBluetoothInput ? .bluetoothSpeechBoost : .disabled
         self.ring = ring ?? AudioChunkRing(maxFrames: 1, channelCount: 1, capacity: 1)
@@ -165,6 +177,7 @@ internal final class AudioCaptureSession: @unchecked Sendable {
         // Level zero is delivered off the CoreAudio callback before stream
         // completion, including when cancellation initiated cleanup.
         levelHandler?(0)
+        spectrumHandler?(.zero)
         continuation.finish()
     }
 
@@ -377,22 +390,13 @@ internal final class AudioCaptureSession: @unchecked Sendable {
     }
 
     private func emitLevel(from buffer: AVAudioPCMBuffer) {
-        guard let channel = buffer.floatChannelData?[0] else { return }
-        let frames = Int(buffer.frameLength)
-        guard frames > 0 else { return }
-
-        var sum: Float = 0
-        for i in 0..<frames {
-            let sample = channel[i]
-            sum += sample * sample
-        }
-        let rms = (sum / Float(frames)).squareRoot()
-        // Perceptual-ish mapping: gain up quiet speech, clamp to 0...1.
-        let level = min(1, max(0, rms * 12))
         let now = DispatchTime.now().uptimeNanoseconds
         guard now - lastLevelEmissionNanos >= levelEmissionIntervalNanos else { return }
         lastLevelEmissionNanos = now
-        levelHandler?(level)
+
+        let spectrum = spectrumAnalyzer.analyze(buffer: buffer)
+        levelHandler?(spectrum.level)
+        spectrumHandler?(spectrum)
     }
 }
 
@@ -416,6 +420,7 @@ public final class AudioCaptureService: AudioCapturing, @unchecked Sendable {
     private var activeSession: AudioCaptureSession?
 
     public var onLevel: (@Sendable (Float) -> Void)?
+    public var onSpectrum: (@Sendable (AudioSpectrum) -> Void)?
 
     public init() {}
 
@@ -490,6 +495,7 @@ public final class AudioCaptureService: AudioCapturing, @unchecked Sendable {
                 format: avFormat,
                 continuation: continuation,
                 levelHandler: onLevel,
+                spectrumHandler: onSpectrum,
                 usesBluetoothInput: usesBluetoothInput,
                 ring: ring
             )
@@ -525,6 +531,7 @@ public final class AudioCaptureService: AudioCapturing, @unchecked Sendable {
         let hadSession = cleanupCapture()
         if !hadSession {
             onLevel?(0)
+            onSpectrum?(.zero)
         }
     }
 

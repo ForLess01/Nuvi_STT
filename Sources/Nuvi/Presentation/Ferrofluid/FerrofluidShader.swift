@@ -1,10 +1,15 @@
 /// The ferrofluid fragment shader, embedded as source and compiled at runtime.
 ///
-/// Organic chamber model: one cohesive core plus seven satellite droplets. Audio
-/// energy pushes satellites outward, magnetic cohesion pulls them back, and each
-/// droplet deforms with unique lobes and velocity-like teardrop stretching. This
-/// is intentionally inspired by physical ferrofluid/metaball behavior rather
-/// than a decorative radial star.
+/// Curvy organic ferrofluid model:
+/// - Smooth potential field with stretched metaballs and organic undulating lobes
+///   giving natural, continuous liquid curvature without geometric or angular artifacts.
+/// - Multi-band real acoustic driving:
+///   - Bass: volumetric core breathing, heavy mass inertia, and deep chamber turbulence.
+///   - Mid: vocal range resonance driving satellite droplet emergence and liquid neck formation.
+///   - Treble: fine harmonic excitation and agile droplet stretching.
+/// - Surface tension and sticky oil bridges: forming smooth catenoid necks before droplet detachment.
+/// - PBR Magnetic Oil Shading: Schlick Fresnel (F0 ~ 0.12), dual specular highlights,
+///   contact shadows, and subtle rim lighting.
 let FerrofluidShaderSource = """
 #include <metal_stdlib>
 using namespace metal;
@@ -28,6 +33,9 @@ struct Uniforms {
     float bgR;
     float bgG;
     float bgB;
+    float bass;
+    float mid;
+    float treble;
 };
 
 struct VOut {
@@ -45,7 +53,7 @@ vertex VOut nuvi_vertex(uint vid [[vertex_id]]) {
 }
 
 static inline float hash21(float2 p) {
-    p = fract(p * float2(123.34, 345.45));
+    p = fract(p * float2(234.34, 435.345));
     p += dot(p, p + 34.345);
     return fract(p.x * p.y);
 }
@@ -72,6 +80,7 @@ static inline float fbm(float2 p) {
     return v;
 }
 
+// Organic undulating lobes on liquid droplet boundaries
 static inline float organicLobes(float2 sample, float2 center, float radius,
                                  float energy, float lobes, float index, float time,
                                  float spikiness) {
@@ -86,6 +95,7 @@ static inline float organicLobes(float2 sample, float2 center, float radius,
     return (rounded - 0.28) * energy * radius * 0.56;
 }
 
+// Stretched metaball producing smooth, organic, continuous liquid curvature
 static inline float stretchedMetaball(float2 sample, float2 center, float radius,
                                       float2 velocityAxis, float stretch) {
     float2 d = sample - center;
@@ -102,29 +112,38 @@ static inline float stretchedMetaball(float2 sample, float2 center, float radius
     return pow((radius * radius) / dd, 1.18);
 }
 
+// Scalar potential field of the viscous magnetic liquid chamber
 static inline float chamberField(float2 uv, constant Uniforms& u) {
     float t = u.time * max(0.08, u.speed);
     float lvl = clamp(u.level, 0.0, 1.0);
+    float bass = clamp(u.bass, 0.0, 1.0);
+    float mid = clamp(u.mid, 0.0, 1.0);
+    float treble = clamp(u.treble, 0.0, 1.0);
+
     float breath = 0.5 + 0.5 * sin(t * 1.65);
     float energy = smoothstep(0.02, 0.72, lvl);
 
     // Low-frequency domain warp: the entire chamber breathes like viscous oil.
+    // Bass drives macro fluid turbulence organically.
     float2 warp = float2(fbm(uv * 2.05 + float2(0.0, t * 0.28)),
                          fbm(uv * 2.05 + float2(4.7, -t * 0.24))) - 0.5;
-    float2 p = uv + warp * (0.035 + 0.095 * energy);
+    float2 p = uv + warp * (0.035 + (0.075 * energy + 0.045 * bass));
 
     float field = 0.0;
 
     // Core: heavy, cohesive, almost always near center.
-    float coreRadius = u.coreSize * (1.08 + 0.22 * energy) + 0.011 * breath;
+    // Bass directly inflates the core volume with real acoustic energy.
+    float coreRadius = u.coreSize * (1.08 + 0.22 * energy + 0.20 * bass) + 0.011 * breath;
     float coreLobe = organicLobes(p, float2(0.0, -0.045), coreRadius,
-                                  0.18 + energy * 0.28, 3.0, 0.0, t, u.spikiness);
+                                  0.18 + energy * 0.28 + bass * 0.16, 3.0, 0.0, t, u.spikiness);
     field += stretchedMetaball(p, float2(0.0, -0.045), coreRadius + coreLobe,
                                float2(0.03 * sin(t), 0.02 * cos(t * 0.8)),
-                               1.0 + energy * 0.10);
+                               1.0 + energy * 0.10 + bass * 0.08);
 
-    // Seven satellites. They separate with audio, orbit subtly, then visually
-    // fuse back through the metaball threshold.
+    // Seven satellites driven by REAL frequency spectrum bands:
+    // i = 1, 2: Low-frequency (Bass) satellites
+    // i = 3, 4, 5: Mid-frequency (Voice resonance) satellites
+    // i = 6, 7: High-frequency (Treble/Sibilance) satellites
     for (int i = 1; i < 8; i++) {
         float fi = float(i);
         float seed = hash21(float2(fi, 9.17));
@@ -132,12 +151,26 @@ static inline float chamberField(float2 uv, constant Uniforms& u) {
         float orbit = t * (0.24 + 0.08 * seed) + sin(t * 0.41 + fi) * 0.22;
         float angle = baseAngle + orbit;
 
-        float band = 0.52 + 0.48 * sin(t * (1.1 + seed * 1.6) + fi * 1.37);
-        band = smoothstep(0.12, 1.0, band * energy + lvl * (0.45 + seed * 0.25));
+        // Map satellite to real frequency band
+        float freqBand;
+        if (i <= 2) {
+            // Bass band
+            freqBand = bass;
+        } else if (i <= 5) {
+            // Mid band (core human voice fundamental)
+            freqBand = mid;
+        } else {
+            // Treble band (consonants, sibilance)
+            freqBand = treble;
+        }
+
+        // Combine subtle organic breathing with real spectral response
+        float organicWiggle = 0.52 + 0.48 * sin(t * (1.1 + seed * 1.6) + fi * 1.37);
+        float band = smoothstep(0.08, 0.95, freqBand * (0.70 + 0.30 * organicWiggle) + energy * (0.35 + seed * 0.2));
 
         float restDistance = u.coreSize * (0.36 + 0.12 * seed);
-        float pushedDistance = u.coreSize * (0.68 + seed * 0.35) + u.reach * band * 0.31;
-        float cohesion = 1.0 - exp(-2.8 * energy);
+        float pushedDistance = u.coreSize * (0.68 + seed * 0.35) + u.reach * band * 0.38;
+        float cohesion = 1.0 - exp(-2.8 * (energy * 0.7 + freqBand * 0.6));
         float distance = mix(restDistance, pushedDistance, cohesion);
 
         float2 radial = float2(cos(angle), sin(angle));
@@ -145,21 +178,19 @@ static inline float chamberField(float2 uv, constant Uniforms& u) {
         float2 center = float2(0.0, -0.045) + radial * distance + tangent * (0.018 * sin(t * 1.4 + fi));
 
         float baseRadius = u.coreSize * mix(0.27, 0.58, hash21(float2(fi, 2.4)));
-        baseRadius *= 1.0 + band * 0.24;
+        baseRadius *= (1.0 + band * 0.28);
 
         float lobes = mix(2.0, 6.0, hash21(float2(fi, 5.8)));
         float lobeOffset = organicLobes(p, center, baseRadius, band, lobes, fi, t, u.spikiness);
 
-        // Velocity-like direction: outward plus orbit tangent, enough to form
-        // teardrops without needing persistent CPU physics state.
+        // Velocity-like direction: outward plus orbit tangent forms smooth teardrops
         float2 velocityAxis = normalize(radial * (0.55 + band) + tangent * (0.28 + seed * 0.34));
         float stretch = clamp(1.0 + band * (0.32 + u.reach * 0.32), 1.0, 1.95);
 
         field += stretchedMetaball(p, center, baseRadius + lobeOffset, velocityAxis, stretch);
     }
 
-    // Thin bridge reinforcement near active speech creates the sticky oil necks
-    // from the reference without producing random disconnected noise.
+    // Sticky oil necks & surface tension bridges during active voice
     float bridgeNoise = fbm(p * (4.8 + u.spikeCount * 0.22) + float2(t * 0.35, -t * 0.31));
     float ridge = 1.0 - abs(2.0 * bridgeNoise - 1.0);
     field += pow(clamp(ridge, 0.0, 1.0), 2.2) * clamp(field, 0.0, 1.0) * energy * 0.34;
@@ -200,13 +231,18 @@ fragment float4 nuvi_fragment(VOut in [[stage_in]],
     float3 lightB = normalize(float3(0.72, 0.34, 0.85));
     float diffuse = max(dot(normal, lightA), 0.0) * 0.38 + max(dot(normal, lightB), 0.0) * 0.16;
     float3 view = float3(0.0, 0.0, 1.0);
+
+    // Realistic PBR Fresnel for magnetic liquid
+    float F0 = 0.12;
+    float cosTheta = max(dot(normal, view), 0.0);
+    float fresnel = F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0);
+
     float specA = pow(max(dot(reflect(-lightA, normal), view), 0.0), 42.0);
     float specB = pow(max(dot(reflect(-lightB, normal), view), 0.0), 24.0) * 0.24;
 
     float rim = smoothstep(1.10, 1.45, field) * (1.0 - smoothstep(1.48, 2.3, field));
 
-    // Base fluid is the chosen color, lifted slightly by diffuse light. Darker
-    // fluids get a touch more lift so they don't read as a flat silhouette.
+    // Base fluid is the chosen color, lifted slightly by diffuse light.
     float fluidLum = dot(fluidColor, float3(0.299, 0.587, 0.114));
     float darkLift = mix(0.16, 0.06, smoothstep(0.0, 0.5, fluidLum));
     float3 fluid = fluidColor + diffuse * darkLift;
@@ -214,15 +250,14 @@ fragment float4 nuvi_fragment(VOut in [[stage_in]],
     // Specular stays near-white but is tinted toward the fluid so colored fluids
     // keep wet, believable highlights instead of washing out to gray.
     float3 specTint = mix(float3(0.95, 0.97, 1.0), normalize(fluidColor + 0.001), 0.35);
-    fluid += (specA + specB) * specTint;
+    fluid += (specA + specB) * specTint * (1.0 + fresnel * 0.5);
 
     // Rim light picks up the fluid hue so the edge glows in-color.
     fluid += rim * (fluidColor * 0.35 + 0.03) * (0.6 + lvl);
 
     float3 color = mix(chamber, fluid, ink);
 
-    // Subtle glass/chamber boundary shading, scaled by background brightness so
-    // it darkens light chambers without crushing dark ones to black.
+    // Subtle glass/chamber boundary shading
     float bgLum = dot(bgColor, float3(0.299, 0.587, 0.114));
     float rimShade = smoothstep(0.78, 1.0, distFromCenter);
     color -= rimShade * mix(0.04, 0.11, smoothstep(0.2, 0.9, bgLum));

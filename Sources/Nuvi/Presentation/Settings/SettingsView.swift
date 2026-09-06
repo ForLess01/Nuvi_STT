@@ -471,6 +471,7 @@ private struct AppearancePanel: View {
     @StateObject private var mic = FerrofluidMicProbe()
     @State private var showPill = SettingsStore.shared.showPill
     @State private var showMenuBarStatus = SettingsStore.shared.showMenuBarStatus
+    @State private var pillPosition = SettingsStore.shared.pillPosition
 
     var body: some View {
         PanelScaffold(title: tr("Appearance", "Apariencia")) {
@@ -505,6 +506,11 @@ private struct AppearancePanel: View {
                 }
             }
 
+            SectionHeader(text: tr("Pill Placement", "Ubicación de la píldora"))
+            Card {
+                PillPlacementPreviewView(selectedPosition: $pillPosition)
+            }
+
             SectionHeader(text: tr("Ferrofluid Visualizer", "Visualizador de ferrofluido"))
             Card {
                 HStack(alignment: .top, spacing: 28) {
@@ -514,6 +520,7 @@ private struct AppearancePanel: View {
                         RowDivider()
                         brandPaletteRow
                         RowDivider()
+                        slider(tr("Sensitivity", "Sensibilidad"), value: $store.settings.sensitivity, range: 0.2...3.0)
                         slider(tr("Core size", "Tamaño del núcleo"), value: $store.settings.coreSize, range: 0.05...0.4)
                         slider(tr("Reach", "Alcance"), value: $store.settings.reach, range: 0.1...1.2)
                         slider(tr("Spikiness", "Puntas"), value: $store.settings.spikiness, range: 1...8)
@@ -526,6 +533,9 @@ private struct AppearancePanel: View {
                 }
                 .padding(16)
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .nuviPillPositionDidChange)) { _ in
+            pillPosition = SettingsStore.shared.pillPosition
         }
     }
 
@@ -572,6 +582,7 @@ private struct AppearancePanel: View {
             ZStack {
                 Circle().fill(NuviPalette.softWhite)
                 FerrofluidView(level: mic.active ? mic.level : 0,
+                               spectrum: mic.active ? mic.spectrum : .zero,
                                settings: store.settings,
                                simulate: !mic.active)
                     .clipShape(Circle())
@@ -616,6 +627,188 @@ private struct AppearancePanel: View {
                 Slider(value: value, in: range)
             }
         }
+    }
+}
+
+// MARK: - Pill Placement Mini-Screen Preview
+
+private struct PillPlacementPreviewView: View {
+    @Binding var selectedPosition: PillPosition
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .center) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(tr("Anchor point", "Punto de anclaje"))
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(NuviPalette.softWhite)
+                    Text(tr(
+                        "Click any anchor to pin the pill, or drag the pill freely on screen.",
+                        "Haz clic en un punto para anclar la píldora, o arrástrala libremente."
+                    ))
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+
+                // Active position indicator badge
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(selectedPosition.isCustom ? NuviPalette.softWhite : NuviPalette.lavender)
+                        .frame(width: 7, height: 7)
+                    Text(selectedPosition.displayName)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(NuviPalette.softWhite)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(NuviPalette.softWhite.opacity(0.08))
+                .clipShape(Capsule())
+            }
+
+            // Mini-Screen display
+            ZStack {
+                // Outer bezel
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [
+                                Color(red: 24 / 255, green: 26 / 255, blue: 32 / 255),
+                                Color(red: 16 / 255, green: 18 / 255, blue: 23 / 255)
+                            ],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .strokeBorder(NuviPalette.softWhite.opacity(0.12), lineWidth: 1)
+                    )
+
+                // Top notch hint
+                VStack {
+                    RoundedRectangle(cornerRadius: 3, style: .continuous)
+                        .fill(Color.black.opacity(0.85))
+                        .frame(width: 38, height: 7)
+                        .padding(.top, 1)
+                    Spacer()
+                }
+
+                // Interactive safe area with 17 anchor dots + custom indicator
+                GeometryReader { geo in
+                    let padX: CGFloat = 24
+                    let padY: CGFloat = 20
+                    let safeW = max(1, geo.size.width - 2 * padX)
+                    let safeH = max(1, geo.size.height - 2 * padY)
+
+                    // Subtle dashed safe boundary guide
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .strokeBorder(
+                            NuviPalette.softWhite.opacity(0.06),
+                            style: StrokeStyle(lineWidth: 1, dash: [4, 4])
+                        )
+                        .frame(width: safeW, height: safeH)
+                        .position(x: geo.size.width / 2, y: geo.size.height / 2)
+
+                    // 17 preset anchor dots
+                    ForEach(PillPosition.allPresets, id: \.self) { preset in
+                        let coords = preset.normalizedCoordinates
+                        let px = padX + safeW * CGFloat(coords.xRatio)
+                        let py = padY + safeH * CGFloat(coords.yRatio)
+                        let isSelected = (selectedPosition == preset)
+
+                        AnchorDotView(
+                            preset: preset,
+                            isSelected: isSelected,
+                            action: {
+                                selectedPosition = preset
+                                SettingsStore.shared.pillPosition = preset
+                            }
+                        )
+                        .position(x: px, y: py)
+                    }
+
+                    // Custom indicator if dragged
+                    if case .custom(let rx, let ry) = selectedPosition {
+                        let cx = padX + safeW * CGFloat(rx)
+                        let cy = padY + safeH * CGFloat(ry)
+
+                        CustomIndicatorDotView()
+                            .position(x: cx, y: cy)
+                    }
+                }
+            }
+            .frame(height: 180)
+            .frame(maxWidth: .infinity)
+        }
+        .padding(16)
+    }
+}
+
+private struct AnchorDotView: View {
+    let preset: PillPosition
+    let isSelected: Bool
+    let action: () -> Void
+
+    @State private var isHovered = false
+
+    var body: some View {
+        Button(action: action) {
+            ZStack {
+                // Generous 26x26 hit area
+                Color.clear
+                    .frame(width: 26, height: 26)
+                    .contentShape(Circle())
+
+                // Selection aura
+                if isSelected {
+                    Circle()
+                        .stroke(NuviPalette.lavender, lineWidth: 2)
+                        .frame(width: 18, height: 18)
+                        .shadow(color: NuviPalette.lavender.opacity(0.6), radius: 4)
+                }
+
+                // Dot
+                Circle()
+                    .fill(
+                        isSelected
+                            ? NuviPalette.lavender
+                            : (isHovered ? NuviPalette.softWhite : NuviPalette.softWhite.opacity(0.35))
+                    )
+                    .frame(
+                        width: isSelected ? 10 : (isHovered ? 9 : 7),
+                        height: isSelected ? 10 : (isHovered ? 9 : 7)
+                    )
+            }
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            withAnimation(.easeInOut(duration: 0.12)) {
+                isHovered = hovering
+            }
+        }
+        .help(preset.displayName)
+    }
+}
+
+private struct CustomIndicatorDotView: View {
+    var body: some View {
+        ZStack {
+            // Diamond ring
+            Rectangle()
+                .stroke(NuviPalette.lavender.opacity(0.7), lineWidth: 1.5)
+                .frame(width: 16, height: 16)
+                .rotationEffect(.degrees(45))
+
+            // Diamond center
+            Rectangle()
+                .fill(NuviPalette.softWhite)
+                .frame(width: 8, height: 8)
+                .rotationEffect(.degrees(45))
+                .shadow(color: NuviPalette.lavender.opacity(0.8), radius: 4)
+        }
+        .help(tr("Custom (dragged)", "Personalizada (arrastrada)"))
     }
 }
 

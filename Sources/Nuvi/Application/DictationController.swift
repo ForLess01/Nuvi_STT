@@ -274,6 +274,7 @@ public final class DictationController: ObservableObject {
 
     @Published public private(set) var state: DictationState = .idle
     @Published public private(set) var level: Float = 0
+    @Published public private(set) var spectrum: AudioSpectrum = .zero
     @Published public private(set) var transcript: String = ""
     @Published public private(set) var isLiveSession = false
 
@@ -398,6 +399,14 @@ public final class DictationController: ObservableObject {
                 self.processSilenceDetection(level: level)
             }
         }
+        self.audio.onSpectrum = { [weak self] spectrum in
+            Task { @MainActor in
+                guard let self else { return }
+                self.spectrum = spectrum
+                self.level = spectrum.level
+                self.processSilenceDetection(level: spectrum.level)
+            }
+        }
     }
 
     /// Applies an engine/model change immediately when idle, or safely defers it
@@ -462,6 +471,7 @@ public final class DictationController: ObservableObject {
                 NSLog("Nuvi/notice [\(error.code)]: \(error.message)")
                 state = .notice(error.display)
                 level = 0
+                spectrum = .zero
                 return
             }
             liveInsertionStarted = true
@@ -679,6 +689,7 @@ public final class DictationController: ObservableObject {
         cancelCompletionFeedback()
         state = .idle
         level = 0
+        spectrum = .zero
         transcript = ""
         session = nil
         sessionID = nil
@@ -692,6 +703,7 @@ public final class DictationController: ObservableObject {
         cancelCompletionFeedback()
         state = completionState
         level = 0
+        spectrum = .zero
         transcript = ""
         session = nil
         sessionID = nil
@@ -731,6 +743,7 @@ public final class DictationController: ObservableObject {
         ducker.restore()
         state = .notice(error.display)
         level = 0
+        spectrum = .zero
         transcript = ""
         session = nil
         sessionID = nil
@@ -749,6 +762,7 @@ public final class DictationController: ObservableObject {
         ducker.restore()
         state = .error(error.display)
         level = 0
+        spectrum = .zero
         transcript = ""
         session = nil
         sessionID = nil

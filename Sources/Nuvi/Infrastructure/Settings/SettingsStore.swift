@@ -6,6 +6,7 @@ extension Notification.Name {
     static let nuviTranscriptionConfigurationDidChange = Notification.Name("nuvi.transcriptionConfigurationDidChange")
     static let nuviOutputPreferencesDidChange = Notification.Name("nuvi.outputPreferencesDidChange")
     static let nuviPresentationPreferencesDidChange = Notification.Name("nuvi.presentationPreferencesDidChange")
+    public static let nuviPillPositionDidChange = Notification.Name("nuvi.pillPositionDidChange")
 }
 
 public struct TranscriptionConfiguration: Equatable, Sendable {
@@ -104,6 +105,22 @@ public final class SettingsStore: @unchecked Sendable {
             guard newValue != showPill else { return }
             defaults.set(newValue, forKey: Keys.showPill)
             notifyPresentationPreferencesChanged()
+        }
+    }
+
+    /// Screen anchor position for the floating dictation pill.
+    public var pillPosition: PillPosition {
+        get {
+            if let raw = defaults.string(forKey: Keys.pillPosition),
+               let pos = PillPosition(serializedString: raw) {
+                return pos
+            }
+            return .topLeft
+        }
+        set {
+            guard newValue != pillPosition else { return }
+            defaults.set(newValue.serializedString, forKey: Keys.pillPosition)
+            notifyPillPositionChanged()
         }
     }
 
@@ -223,6 +240,10 @@ public final class SettingsStore: @unchecked Sendable {
         NotificationCenter.default.post(name: .nuviPresentationPreferencesDidChange, object: self)
     }
 
+    private func notifyPillPositionChanged() {
+        NotificationCenter.default.post(name: .nuviPillPositionDidChange, object: self)
+    }
+
     /// Parakeet model ids that finished downloading at least once. FluidAudio
     /// owns its model cache (no documented path), so we track "downloaded" with
     /// our own persisted flag rather than scanning disk.
@@ -250,6 +271,7 @@ public final class SettingsStore: @unchecked Sendable {
         static let engine = "nuvi.engine"
         static let soundEffects = "nuvi.soundEffects"
         static let showPill = "nuvi.showPill"
+        static let pillPosition = "nuvi.pillPosition"
         static let showMenuBarStatus = "nuvi.showMenuBarStatus"
         static let translationTarget = "nuvi.translationTarget"
         static let dictationDeliveryMode = "nuvi.dictationDeliveryMode"

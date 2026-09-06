@@ -9,7 +9,6 @@ struct PillView: View {
     @ObservedObject var ferrofluid: FerrofluidSettingsStore = .shared
     @ObservedObject private var localization = LocalizationStore.shared
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var activeLabelWidth: CGFloat = 0
 
     var body: some View {
         HStack(spacing: 12) {
@@ -50,6 +49,7 @@ struct PillView: View {
                     )
                 FerrofluidView(
                     level: controller.level,
+                    spectrum: controller.spectrum,
                     settings: ferrofluid.settings,
                     paused: isCompleted
                 )
@@ -104,22 +104,8 @@ struct PillView: View {
             .foregroundStyle(labelColor)
             .lineLimit(2)
             .frame(maxWidth: 320, alignment: .leading)
-            .background {
-                GeometryReader { proxy in
-                    Color.clear.preference(key: PillLabelWidthKey.self, value: proxy.size.width)
-                }
-            }
-            // Keep the last active width through the short success state. The
-            // AppKit host measures this view on every state change; retaining
-            // the width prevents the entire pill from snapping narrower while
-            // the ferrofluid crossfades into the checkmark.
-            .frame(minWidth: isCompleted ? activeLabelWidth : nil, alignment: .leading)
             .contentTransition(.opacity)
             .animation(completionTransition, value: isCompleted)
-            .onPreferenceChange(PillLabelWidthKey.self) { width in
-                guard !isCompleted, width > 0 else { return }
-                activeLabelWidth = width
-            }
     }
 
     private var displayText: String {
@@ -243,14 +229,6 @@ enum PillDisplayText {
         default:
             return transcript.isEmpty ? stateLabel : transcript
         }
-    }
-}
-
-private struct PillLabelWidthKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
-
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = max(value, nextValue())
     }
 }
 

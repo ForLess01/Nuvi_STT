@@ -38,17 +38,18 @@ public struct FerrofluidSettings: Codable, Sendable, Equatable {
     public var viscosity: Float   // edge softness (lower = crisper liquid)
     public var speed: Float       // animation speed
     public var spikeCount: Float  // number of angular fingers
+    public var sensitivity: Float // audio responsiveness multiplier (0.2...3.0)
     public var fluidColor: RGBColor       // the liquid ink
     public var backgroundColor: RGBColor  // the chamber behind it
 
     // Decodes older persisted data (before colors existed) by defaulting the
     // color fields, so a saved look never fails to load.
     enum CodingKeys: String, CodingKey {
-        case coreSize, reach, spikiness, viscosity, speed, spikeCount, fluidColor, backgroundColor
+        case coreSize, reach, spikiness, viscosity, speed, spikeCount, sensitivity, fluidColor, backgroundColor
     }
 
     public init(coreSize: Float, reach: Float, spikiness: Float, viscosity: Float,
-                speed: Float, spikeCount: Float,
+                speed: Float, spikeCount: Float, sensitivity: Float = 1.0,
                 fluidColor: RGBColor = .nuviCharcoal,
                 backgroundColor: RGBColor = .nuviSoftWhite) {
         self.coreSize = coreSize
@@ -57,6 +58,7 @@ public struct FerrofluidSettings: Codable, Sendable, Equatable {
         self.viscosity = viscosity
         self.speed = speed
         self.spikeCount = spikeCount
+        self.sensitivity = sensitivity
         self.fluidColor = fluidColor
         self.backgroundColor = backgroundColor
     }
@@ -69,6 +71,7 @@ public struct FerrofluidSettings: Codable, Sendable, Equatable {
         viscosity = try c.decode(Float.self, forKey: .viscosity)
         speed = try c.decode(Float.self, forKey: .speed)
         spikeCount = try c.decode(Float.self, forKey: .spikeCount)
+        sensitivity = try c.decodeIfPresent(Float.self, forKey: .sensitivity) ?? 1.0
         fluidColor = (try c.decodeIfPresent(RGBColor.self, forKey: .fluidColor) ?? .nuviCharcoal)
             .nearestNuviPaletteColor
         backgroundColor = (try c.decodeIfPresent(RGBColor.self, forKey: .backgroundColor) ?? .nuviSoftWhite)
@@ -82,6 +85,7 @@ public struct FerrofluidSettings: Codable, Sendable, Equatable {
         viscosity: 0.035,
         speed: 1.12,
         spikeCount: 8,
+        sensitivity: 1.0,
         fluidColor: .nuviCharcoal,
         backgroundColor: .nuviSoftWhite
     )

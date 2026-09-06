@@ -829,6 +829,7 @@ private final class FakeAudioDucker: AudioDucking, @unchecked Sendable {
 
 private final class FakeAudioCapture: AudioCapturing, @unchecked Sendable {
     var onLevel: (@Sendable (Float) -> Void)?
+    var onSpectrum: (@Sendable (AudioSpectrum) -> Void)?
     var permission = true
     var startError: Error?
     private(set) var permissionRequestCount = 0

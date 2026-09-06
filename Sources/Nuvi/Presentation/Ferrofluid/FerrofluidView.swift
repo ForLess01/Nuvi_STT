@@ -5,7 +5,8 @@ import MetalKit
 /// tunable look into the renderer. Set `simulate` for the Settings preview so it
 /// animates without a microphone.
 struct FerrofluidView: NSViewRepresentable {
-    var level: Float
+    var level: Float = 0
+    var spectrum: AudioSpectrum = .zero
     var settings: FerrofluidSettings
     var simulate: Bool = false
     var paused: Bool = false
@@ -24,6 +25,7 @@ struct FerrofluidView: NSViewRepresentable {
 
     func updateNSView(_ nsView: MTKView, context: Context) {
         context.coordinator.renderer?.level = level
+        context.coordinator.renderer?.spectrum = spectrum
         context.coordinator.renderer?.settings = settings
         context.coordinator.renderer?.simulate = simulate
         (nsView as? AutoPauseMTKView)?.explicitlyPaused = paused

@@ -8,6 +8,7 @@ import Combine
 @MainActor
 public final class FerrofluidMicProbe: ObservableObject {
     @Published public private(set) var level: Float = 0
+    @Published public private(set) var spectrum: AudioSpectrum = .zero
     @Published public private(set) var active = false
     @Published public private(set) var denied = false
 
@@ -31,6 +32,12 @@ public final class FerrofluidMicProbe: ObservableObject {
             capture.onLevel = { [weak self] lvl in
                 Task { @MainActor in self?.level = lvl }
             }
+            capture.onSpectrum = { [weak self] spec in
+                Task { @MainActor in
+                    self?.spectrum = spec
+                    self?.level = spec.level
+                }
+            }
             do {
                 let stream = try capture.start()
                 active = true
@@ -46,6 +53,7 @@ public final class FerrofluidMicProbe: ObservableObject {
         capture.stop()
         drainTask?.cancel()
         drainTask = nil
+        spectrum = .zero
         level = 0
         active = false
     }

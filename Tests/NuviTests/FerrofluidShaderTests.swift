@@ -15,6 +15,24 @@ final class FerrofluidShaderTests: XCTestCase {
         }
     }
 
+    func testShaderDeclaresMultiBandUniforms() {
+        for field in ["float bass;", "float mid;", "float treble;"] {
+            XCTAssertTrue(FerrofluidShaderSource.contains(field), "Shader missing uniform \(field)")
+        }
+    }
+
+    func testShaderContainsFluidPhysicsAndPBRFeatures() {
+        XCTAssertTrue(FerrofluidShaderSource.contains("stretchedMetaball"), "Shader should use smooth stretched metaballs")
+        XCTAssertTrue(FerrofluidShaderSource.contains("chamberField"), "Shader should compute organic chamber field")
+        XCTAssertTrue(FerrofluidShaderSource.contains("fresnel"), "Shader should use Fresnel approximation")
+    }
+
+    func testSettingsCarrySensitivity() {
+        XCTAssertEqual(FerrofluidSettings.default.sensitivity, 1.0)
+        let custom = FerrofluidSettings(coreSize: 0.1, reach: 0.5, spikiness: 2, viscosity: 0.03, speed: 1, spikeCount: 6, sensitivity: 1.8)
+        XCTAssertEqual(custom.sensitivity, 1.8)
+    }
+
     func testSettingsCarryColorsAndPresets() {
         XCTAssertEqual(FerrofluidSettings.default.backgroundColor, .nuviSoftWhite)
         XCTAssertEqual(FerrofluidSettings.default.fluidColor, .nuviCharcoal)
