@@ -23,14 +23,27 @@ final class FerrofluidShaderTests: XCTestCase {
 
     func testShaderContainsFluidPhysicsAndPBRFeatures() {
         XCTAssertTrue(FerrofluidShaderSource.contains("stretchedMetaball"), "Shader should use smooth stretched metaballs")
-        XCTAssertTrue(FerrofluidShaderSource.contains("chamberField"), "Shader should compute organic chamber field")
+        XCTAssertTrue(FerrofluidShaderSource.contains("organicChamberField"), "Shader should compute organic chamber field")
+        XCTAssertTrue(FerrofluidShaderSource.contains("spikesFluidSDF"), "Shader should compute magnetic spikes SDF")
+        XCTAssertTrue(FerrofluidShaderSource.contains("float style;"), "Shader should declare style uniform")
+        XCTAssertTrue(FerrofluidShaderSource.contains("float coreSens;"), "Shader should declare coreSens uniform")
+        XCTAssertTrue(FerrofluidShaderSource.contains("float dropletSens;"), "Shader should declare dropletSens uniform")
         XCTAssertTrue(FerrofluidShaderSource.contains("fresnel"), "Shader should use Fresnel approximation")
     }
 
-    func testSettingsCarrySensitivity() {
+    func testSettingsCarrySensitivityAndStyle() {
         XCTAssertEqual(FerrofluidSettings.default.sensitivity, 1.0)
-        let custom = FerrofluidSettings(coreSize: 0.1, reach: 0.5, spikiness: 2, viscosity: 0.03, speed: 1, spikeCount: 6, sensitivity: 1.8)
+        XCTAssertEqual(FerrofluidSettings.default.coreSensitivity, 1.0)
+        XCTAssertEqual(FerrofluidSettings.default.dropletSensitivity, 1.0)
+        XCTAssertEqual(FerrofluidSettings.default.style, .organic)
+        let custom = FerrofluidSettings(
+            coreSize: 0.1, reach: 0.5, spikiness: 2, viscosity: 0.03, speed: 1, spikeCount: 6,
+            sensitivity: 1.8, coreSensitivity: 1.5, dropletSensitivity: 2.2, style: .spikes
+        )
         XCTAssertEqual(custom.sensitivity, 1.8)
+        XCTAssertEqual(custom.coreSensitivity, 1.5)
+        XCTAssertEqual(custom.dropletSensitivity, 2.2)
+        XCTAssertEqual(custom.style, .spikes)
     }
 
     func testSettingsCarryColorsAndPresets() {

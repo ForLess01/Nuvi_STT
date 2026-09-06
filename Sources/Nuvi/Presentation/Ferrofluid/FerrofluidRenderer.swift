@@ -16,10 +16,20 @@ final class FerrofluidRenderer: NSObject, MTKViewDelegate {
     var settings: FerrofluidSettings = .default
     var simulate: Bool = false
 
-    private var smoothed: Float = 0
-    private var smoothedBass: Float = 0
-    private var smoothedMid: Float = 0
-    private var smoothedTreble: Float = 0
+    // 2nd-order harmonic spring-damper physical state (mass + viscous fluid damping)
+    private var levelPos: Float = 0
+    private var levelVel: Float = 0
+
+    private var bassPos: Float = 0
+    private var bassVel: Float = 0
+
+    private var midPos: Float = 0
+    private var midVel: Float = 0
+
+    private var treblePos: Float = 0
+    private var trebleVel: Float = 0
+
+    private var lastFrameTime: Double = 0
 
     private struct Uniforms {
         var time: Float
@@ -40,6 +50,9 @@ final class FerrofluidRenderer: NSObject, MTKViewDelegate {
         var bass: Float
         var mid: Float
         var treble: Float
+        var style: Float
+        var coreSens: Float
+        var dropletSens: Float
     }
 
     init?(mtkView: MTKView) {
@@ -124,25 +137,45 @@ final class FerrofluidRenderer: NSObject, MTKViewDelegate {
             }
         }
 
-        // Bass: heavier mass, slower decay
-        let bassCoeff: Float = targetBass > smoothedBass ? 0.25 : 0.08
-        smoothedBass += (targetBass - smoothedBass) * bassCoeff
+        let currentRealTime = CACurrentMediaTime()
+        let dt: Float
+        if lastFrameTime > 0 {
+            dt = Float(min(0.04, max(0.001, currentRealTime - lastFrameTime)))
+        } else {
+            dt = 1.0 / 60.0
+        }
+        lastFrameTime = currentRealTime
 
-        // Mid: moderate fluid damping
-        let midCoeff: Float = targetMid > smoothedMid ? 0.35 : 0.18
-        smoothedMid += (targetMid - smoothedMid) * midCoeff
+        // 2nd-order physical spring-damper integrator (symplectic Euler)
+        // Eliminates impulse jerk; yields physical fluid inertia, mass, and viscous rebound
+        func stepSpring(pos: inout Float, vel: inout Float, target: Float, omega: Float, damping: Float) {
+            let effectiveDamping = target < pos ? damping * 1.12 : damping
+            let k = omega * omega
+            let c = 2.0 * effectiveDamping * omega
+            let accel = -k * (pos - target) - c * vel
+            vel += accel * dt
+            pos += vel * dt
+            if pos < 0.0001 && target <= 0.0001 && abs(vel) < 0.001 {
+                pos = 0
+                vel = 0
+            }
+        }
 
-        // Treble: fast, sharp reaction for surface micro-spikes
-        let trebleCoeff: Float = targetTreble > smoothedTreble ? 0.65 : 0.35
-        smoothedTreble += (targetTreble - smoothedTreble) * trebleCoeff
+        // Bass: heavy fluid mass (omega = 15.0, damping = 0.94)
+        stepSpring(pos: &bassPos, vel: &bassVel, target: targetBass, omega: 15.0, damping: 0.94)
 
-        // Level: overall fluid volume easing
-        let levelCoeff: Float = targetLevel > smoothed ? 0.28 : 0.18
-        smoothed += (targetLevel - smoothed) * levelCoeff
+        // Mid: vocal core resonance (omega = 20.0, damping = 0.88 - organic droplet bounce)
+        stepSpring(pos: &midPos, vel: &midVel, target: targetMid, omega: 20.0, damping: 0.88)
+
+        // Treble: surface harmonic agility (omega = 24.0, damping = 0.96 - zero jitter)
+        stepSpring(pos: &treblePos, vel: &trebleVel, target: targetTreble, omega: 24.0, damping: 0.96)
+
+        // Level: overall fluid breathing envelope (omega = 17.0, damping = 1.0)
+        stepSpring(pos: &levelPos, vel: &levelVel, target: targetLevel, omega: 17.0, damping: 1.0)
 
         var uniforms = Uniforms(
             time: time,
-            level: smoothed,
+            level: levelPos,
             resolution: SIMD2(Float(view.drawableSize.width), Float(view.drawableSize.height)),
             coreSize: settings.coreSize,
             reach: settings.reach,
@@ -156,9 +189,12 @@ final class FerrofluidRenderer: NSObject, MTKViewDelegate {
             bgR: settings.backgroundColor.r,
             bgG: settings.backgroundColor.g,
             bgB: settings.backgroundColor.b,
-            bass: smoothedBass,
-            mid: smoothedMid,
-            treble: smoothedTreble
+            bass: bassPos,
+            mid: midPos,
+            treble: treblePos,
+            style: settings.style == .spikes ? 1.0 : 0.0,
+            coreSens: max(0.1, settings.coreSensitivity),
+            dropletSens: max(0.1, settings.dropletSensitivity)
         )
 
         encoder.setRenderPipelineState(pipeline)

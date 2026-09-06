@@ -516,11 +516,15 @@ private struct AppearancePanel: View {
                 HStack(alignment: .top, spacing: 28) {
                     preview
                     VStack(alignment: .leading, spacing: 14) {
+                        stylePickerRow
+                        RowDivider()
                         presetRow
                         RowDivider()
                         brandPaletteRow
                         RowDivider()
                         slider(tr("Sensitivity", "Sensibilidad"), value: $store.settings.sensitivity, range: 0.2...3.0)
+                        slider(tr("Core responsiveness", "Sensibilidad del núcleo"), value: $store.settings.coreSensitivity, range: 0.2...3.0)
+                        slider(tr("Droplet responsiveness", "Sensibilidad de las gotas"), value: $store.settings.dropletSensitivity, range: 0.2...3.0)
                         slider(tr("Core size", "Tamaño del núcleo"), value: $store.settings.coreSize, range: 0.05...0.4)
                         slider(tr("Reach", "Alcance"), value: $store.settings.reach, range: 0.1...1.2)
                         slider(tr("Spikiness", "Puntas"), value: $store.settings.spikiness, range: 1...8)
@@ -536,6 +540,21 @@ private struct AppearancePanel: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .nuviPillPositionDidChange)) { _ in
             pillPosition = SettingsStore.shared.pillPosition
+        }
+    }
+
+    private var stylePickerRow: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(tr("Style", "Estilo visual"))
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
+            Picker("", selection: $store.settings.style) {
+                ForEach(FerrofluidStyle.allCases) { style in
+                    Text(style.label).tag(style)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
         }
     }
 

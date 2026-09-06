@@ -103,7 +103,7 @@ internal final class AudioCaptureSession: @unchecked Sendable {
          spectrumHandler: (@Sendable (AudioSpectrum) -> Void)? = nil,
          usesBluetoothInput: Bool,
          ring: AudioChunkRing? = nil,
-         levelEmissionIntervalNanos: UInt64 = 50_000_000) {
+         levelEmissionIntervalNanos: UInt64 = 16_000_000) {
         self.lifecycle = lifecycle
         self.format = format
         self.continuation = continuation

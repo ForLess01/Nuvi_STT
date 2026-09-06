@@ -1,15 +1,16 @@
 /// The ferrofluid fragment shader, embedded as source and compiled at runtime.
 ///
-/// Curvy organic ferrofluid model:
-/// - Smooth potential field with stretched metaballs and organic undulating lobes
-///   giving natural, continuous liquid curvature without geometric or angular artifacts.
-/// - Multi-band real acoustic driving:
-///   - Bass: volumetric core breathing, heavy mass inertia, and deep chamber turbulence.
-///   - Mid: vocal range resonance driving satellite droplet emergence and liquid neck formation.
-///   - Treble: fine harmonic excitation and agile droplet stretching.
-/// - Surface tension and sticky oil bridges: forming smooth catenoid necks before droplet detachment.
-/// - PBR Magnetic Oil Shading: Schlick Fresnel (F0 ~ 0.12), dual specular highlights,
-///   contact shadows, and subtle rim lighting.
+/// Dual-style ferrofluid model:
+/// 1. Organic Liquid Style (u.style <= 0.5):
+///    - Continuous scalar potential field with stretched metaballs and smooth undulating lobes.
+///    - Analytical capillary catenoid bridges for surface tension without geometric cusps.
+/// 2. Magnetic Spikes Style (u.style > 0.5):
+///    - Conical Rosensweig instability spikes along magnetic field lines.
+///    - Polynomial smooth minimum (smin) and dynamic satellite droplet ejections.
+/// Shared between both styles:
+/// - Multi-band real FFT acoustic driving (bass, mid, treble).
+/// - PBR Magnetic Oil Shading (Schlick Fresnel F0=0.12, dual specular highlights,
+///   crevice ambient occlusion/contact shadow, and rim lighting).
 let FerrofluidShaderSource = """
 #include <metal_stdlib>
 using namespace metal;
@@ -36,6 +37,9 @@ struct Uniforms {
     float bass;
     float mid;
     float treble;
+    float style; // 0.0 = organic liquid, 1.0 = magnetic spikes
+    float coreSens;
+    float dropletSens;
 };
 
 struct VOut {
@@ -72,7 +76,7 @@ static inline float vnoise(float2 p) {
 static inline float fbm(float2 p) {
     float v = 0.0;
     float a = 0.5;
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 4; i++) {
         v += a * vnoise(p);
         p = p * 2.03 + float2(7.13, -3.71);
         a *= 0.5;
@@ -80,22 +84,31 @@ static inline float fbm(float2 p) {
     return v;
 }
 
-// Organic undulating lobes on liquid droplet boundaries
+// Polynomial smooth minimum (surface tension / coalescence blend for Spikes style)
+static inline float smin(float a, float b, float k) {
+    float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+    return mix(b, a, h) - k * h * (1.0 - h);
+}
+
+// -----------------------------------------------------------------------------
+// STYLE 1: ORGANIC LIQUID (Smooth Metaballs & Capillary Catenoid Bridges)
+// -----------------------------------------------------------------------------
+
 static inline float organicLobes(float2 sample, float2 center, float radius,
                                  float energy, float lobes, float index, float time,
                                  float spikiness) {
     float2 d = sample - center;
     float dist = length(d);
-    if (dist > radius * 3.2) { return 0.0; }
+    if (dist > radius * 2.8) { return 0.0; }
 
     float angle = atan2(d.y, d.x);
-    float wave = sin(angle * lobes + time * (1.7 + index * 0.13));
-    float detail = fbm(d * (5.4 + index * 0.37) + float2(time * 0.22, -time * 0.18));
-    float rounded = pow(abs(wave) * 0.72 + detail * 0.35, max(1.0, spikiness * 0.58));
-    return (rounded - 0.28) * energy * radius * 0.56;
+    float smoothWave = 0.5 + 0.5 * sin(angle * lobes + time * (1.35 + index * 0.12));
+    float detail = fbm(d * (2.4 + index * 0.18) + float2(time * 0.16, -time * 0.14));
+    float rounded = mix(smoothWave, detail, 0.28);
+    float spikeFactor = clamp(spikiness / 3.5, 0.6, 1.4);
+    return (rounded - 0.45) * energy * radius * (0.32 * spikeFactor);
 }
 
-// Stretched metaball producing smooth, organic, continuous liquid curvature
 static inline float stretchedMetaball(float2 sample, float2 center, float radius,
                                       float2 velocityAxis, float stretch) {
     float2 d = sample - center;
@@ -108,131 +121,227 @@ static inline float stretchedMetaball(float2 sample, float2 center, float radius
         d = axis * (along / stretch) + normal * (across * stretch);
     }
 
-    float dd = dot(d, d) + 0.00008;
-    return pow((radius * radius) / dd, 1.18);
+    float dd = dot(d, d) + 0.00012;
+    return pow((radius * radius) / dd, 1.15);
 }
 
-// Scalar potential field of the viscous magnetic liquid chamber
-static inline float chamberField(float2 uv, constant Uniforms& u) {
+static inline float organicChamberField(float2 uv, constant Uniforms& u) {
     float t = u.time * max(0.08, u.speed);
     float lvl = clamp(u.level, 0.0, 1.0);
     float bass = clamp(u.bass, 0.0, 1.0);
     float mid = clamp(u.mid, 0.0, 1.0);
     float treble = clamp(u.treble, 0.0, 1.0);
 
-    float breath = 0.5 + 0.5 * sin(t * 1.65);
+    float breath = 0.5 + 0.5 * sin(t * 1.5);
     float energy = smoothstep(0.02, 0.72, lvl);
 
-    // Low-frequency domain warp: the entire chamber breathes like viscous oil.
-    // Bass drives macro fluid turbulence organically.
-    float2 warp = float2(fbm(uv * 2.05 + float2(0.0, t * 0.28)),
-                         fbm(uv * 2.05 + float2(4.7, -t * 0.24))) - 0.5;
-    float2 p = uv + warp * (0.035 + (0.075 * energy + 0.045 * bass));
+    float2 warp = float2(fbm(uv * 1.8 + float2(0.0, t * 0.22)),
+                         fbm(uv * 1.8 + float2(4.7, -t * 0.19))) - 0.5;
+    float2 p = uv + warp * (0.028 + (0.055 * energy + 0.035 * bass) * u.coreSens);
 
     float field = 0.0;
+    float2 cCore = float2(0.0, -0.045);
 
-    // Core: heavy, cohesive, almost always near center.
-    // Bass directly inflates the core volume with real acoustic energy.
-    float coreRadius = u.coreSize * (1.08 + 0.22 * energy + 0.20 * bass) + 0.011 * breath;
-    float coreLobe = organicLobes(p, float2(0.0, -0.045), coreRadius,
-                                  0.18 + energy * 0.28 + bass * 0.16, 3.0, 0.0, t, u.spikiness);
-    field += stretchedMetaball(p, float2(0.0, -0.045), coreRadius + coreLobe,
-                               float2(0.03 * sin(t), 0.02 * cos(t * 0.8)),
-                               1.0 + energy * 0.10 + bass * 0.08);
+    float coreRadius = u.coreSize * (1.08 + (0.22 * energy + 0.22 * bass) * u.coreSens) + 0.010 * breath;
+    float coreLobe = organicLobes(p, cCore, coreRadius,
+                                  (0.16 + energy * 0.24 + bass * 0.15) * u.coreSens, 3.0, 0.0, t, u.spikiness);
+    field += stretchedMetaball(p, cCore, coreRadius + coreLobe,
+                               float2(0.025 * sin(t), 0.018 * cos(t * 0.8)) * (1.0 + (energy * 0.40 + bass * 0.40) * u.coreSens),
+                               1.0 + (energy * 0.06 + bass * 0.05) * u.coreSens);
 
-    // Seven satellites driven by REAL frequency spectrum bands:
-    // i = 1, 2: Low-frequency (Bass) satellites
-    // i = 3, 4, 5: Mid-frequency (Voice resonance) satellites
-    // i = 6, 7: High-frequency (Treble/Sibilance) satellites
     for (int i = 1; i < 8; i++) {
         float fi = float(i);
         float seed = hash21(float2(fi, 9.17));
         float baseAngle = fi * 2.399963 + seed * 0.9;
-        float orbit = t * (0.24 + 0.08 * seed) + sin(t * 0.41 + fi) * 0.22;
+        float orbit = t * (0.16 + 0.04 * seed) + sin(t * 0.25 + fi) * 0.12;
         float angle = baseAngle + orbit;
 
-        // Map satellite to real frequency band
-        float freqBand;
-        if (i <= 2) {
-            // Bass band
-            freqBand = bass;
-        } else if (i <= 5) {
-            // Mid band (core human voice fundamental)
-            freqBand = mid;
-        } else {
-            // Treble band (consonants, sibilance)
-            freqBand = treble;
-        }
+        // Dedicated acoustic frequency mapping per satellite:
+        // i = 1, 2: Bass (chest resonance, low pitch)
+        // i = 3, 4, 5: Mid (speech fundamental, vowel formants)
+        // i = 6, 7: Treble (sibilants, consonants, breath)
+        float freqBand = (i <= 2) ? bass : ((i <= 5) ? mid : treble);
 
-        // Combine subtle organic breathing with real spectral response
-        float organicWiggle = 0.52 + 0.48 * sin(t * (1.1 + seed * 1.6) + fi * 1.37);
-        float band = smoothstep(0.08, 0.95, freqBand * (0.70 + 0.30 * organicWiggle) + energy * (0.35 + seed * 0.2));
+        // Direct real-time audio drive without synthetic sine multipliers
+        float band = clamp((freqBand * 1.30 + energy * 0.15) * u.dropletSens, 0.0, 1.0);
 
-        float restDistance = u.coreSize * (0.36 + 0.12 * seed);
-        float pushedDistance = u.coreSize * (0.68 + seed * 0.35) + u.reach * band * 0.38;
-        float cohesion = 1.0 - exp(-2.8 * (energy * 0.7 + freqBand * 0.6));
+        float restDistance = u.coreSize * (0.35 + 0.10 * seed);
+        float pushedDistance = u.coreSize * (0.65 + seed * 0.32) + u.reach * band * (0.35 * u.dropletSens);
+        float cohesion = 1.0 - exp(-3.2 * (energy * 0.70 + freqBand * 0.70) * u.dropletSens);
         float distance = mix(restDistance, pushedDistance, cohesion);
 
         float2 radial = float2(cos(angle), sin(angle));
         float2 tangent = float2(-radial.y, radial.x);
-        float2 center = float2(0.0, -0.045) + radial * distance + tangent * (0.018 * sin(t * 1.4 + fi));
+        float2 center = cCore + radial * distance + tangent * (0.012 * sin(t * 1.2 + fi));
 
-        float baseRadius = u.coreSize * mix(0.27, 0.58, hash21(float2(fi, 2.4)));
-        baseRadius *= (1.0 + band * 0.28);
+        float baseRadius = u.coreSize * mix(0.28, 0.52, hash21(float2(fi, 2.4)));
+        baseRadius *= (1.0 + band * 0.25 * u.dropletSens);
 
-        float lobes = mix(2.0, 6.0, hash21(float2(fi, 5.8)));
-        float lobeOffset = organicLobes(p, center, baseRadius, band, lobes, fi, t, u.spikiness);
+        float lobes = mix(2.0, 5.0, hash21(float2(fi, 5.8)));
+        float lobeOffset = organicLobes(p, center, baseRadius, band * u.dropletSens, lobes, fi, t, u.spikiness);
 
-        // Velocity-like direction: outward plus orbit tangent forms smooth teardrops
         float2 velocityAxis = normalize(radial * (0.55 + band) + tangent * (0.28 + seed * 0.34));
-        float stretch = clamp(1.0 + band * (0.32 + u.reach * 0.32), 1.0, 1.95);
+        float stretch = clamp(1.0 + band * (0.16 + u.reach * 0.18) * u.dropletSens, 1.0, 1.35);
 
         field += stretchedMetaball(p, center, baseRadius + lobeOffset, velocityAxis, stretch);
-    }
 
-    // Sticky oil necks & surface tension bridges during active voice
-    float bridgeNoise = fbm(p * (4.8 + u.spikeCount * 0.22) + float2(t * 0.35, -t * 0.31));
-    float ridge = 1.0 - abs(2.0 * bridgeNoise - 1.0);
-    field += pow(clamp(ridge, 0.0, 1.0), 2.2) * clamp(field, 0.0, 1.0) * energy * 0.34;
+        float2 toSat = center - cCore;
+        float satDist = length(toSat);
+        if (satDist > 0.001 && cohesion > 0.05) {
+            float2 satAxis = toSat / satDist;
+            float proj = clamp(dot(p - cCore, satAxis), 0.0, satDist);
+            float2 bridgePoint = cCore + satAxis * proj;
+            float dBridge = length(p - bridgePoint);
+
+            float waist = sin((proj / satDist) * 3.14159265);
+            float bridgeRadius = mix(coreRadius, baseRadius, proj / satDist) * (0.30 + 0.16 * (1.0 - waist));
+            float bridgeField = (bridgeRadius * bridgeRadius) / (dBridge * dBridge + 0.00035);
+            field += bridgeField * (cohesion * (0.26 + 0.10 * band));
+        }
+    }
 
     return field;
 }
+
+// -----------------------------------------------------------------------------
+// STYLE 2: MAGNETIC SPIKES (Rosensweig Instability & Conical Spikes)
+// -----------------------------------------------------------------------------
+
+static inline float dropletSDF(float2 p, float2 center, float radius, float2 velocity, float stretch) {
+    float2 d = p - center;
+    float speed = length(velocity);
+    if (speed > 0.001) {
+        float2 dir = velocity / speed;
+        float2 norm = float2(-dir.y, dir.x);
+        float along = dot(d, dir);
+        float across = dot(d, norm);
+        d = dir * (along / stretch) + norm * (across * stretch);
+    }
+    return length(d) - radius;
+}
+
+static inline float spikesFluidSDF(float2 p, constant Uniforms& u, float t, float k) {
+    float lvl = clamp(u.level, 0.0, 1.0);
+    float bass = clamp(u.bass, 0.0, 1.0);
+    float mid = clamp(u.mid, 0.0, 1.0);
+    float treble = clamp(u.treble, 0.0, 1.0);
+
+    float2 warp = float2(fbm(p * 2.1 + float2(0.0, t * 0.22)),
+                         fbm(p * 2.1 + float2(4.7, -t * 0.19))) - 0.5;
+    float2 wp = p + warp * (0.025 + 0.065 * bass * u.coreSens);
+
+    float2 cCore = float2(0.0, -0.045);
+    float2 dCoreVec = wp - cCore;
+    float coreDist = length(dCoreVec);
+    float theta = atan2(dCoreVec.y, dCoreVec.x);
+
+    // Subtle magnetic micro-ripples: reduced by ~75% so it's not pointy or aggressive
+    float spikeCount = max(6.0, u.spikeCount);
+    float spikePhase = theta * spikeCount + t * 0.55;
+    float cone = pow(max(0.0, cos(spikePhase)), max(1.1, u.spikiness * 2.0));
+    float cone2 = pow(max(0.0, cos(spikePhase * 2.0 - 1.2)), max(1.0, u.spikiness * 1.2)) * 0.25;
+    float spikeHeight = (u.spikiness * 0.008 + treble * 0.016 * u.coreSens) * (cone + cone2);
+    float microSpikes = sin(theta * (spikeCount * 2.5) + t * 4.2) * (treble * 0.006 * u.coreSens);
+
+    float breath = 0.5 + 0.5 * sin(t * 1.5);
+    float coreRadius = u.coreSize * (1.02 + (0.30 * bass + 0.12 * lvl) * u.coreSens) + 0.010 * breath;
+    float dFluid = coreDist - (coreRadius + spikeHeight + microSpikes);
+
+    for (int i = 1; i < 8; i++) {
+        float fi = float(i);
+        float seed = hash21(float2(fi, 9.17));
+        float baseAngle = fi * 2.399963 + seed * 0.9;
+        float orbit = t * (0.16 + 0.04 * seed) + sin(t * 0.25 + fi) * 0.12;
+        float angle = baseAngle + orbit;
+
+        float freqBand = (i <= 2) ? bass : ((i <= 5) ? mid : treble);
+        float ejection = clamp((freqBand * 1.30 + lvl * 0.15) * u.dropletSens, 0.0, 1.0);
+
+        float restDist = u.coreSize * (0.35 + 0.10 * seed);
+        float pushedDist = u.coreSize * (0.70 + seed * 0.35) + u.reach * (0.28 + 0.38 * ejection) * u.dropletSens + bass * 0.10;
+        float dist = mix(restDist, pushedDist, ejection);
+
+        float2 radial = float2(cos(angle), sin(angle));
+        float2 tangent = float2(-radial.y, radial.x);
+        float2 center = cCore + radial * dist + tangent * (0.014 * sin(t * 1.2 + fi));
+
+        float radius = u.coreSize * mix(0.24, 0.48, hash21(float2(fi, 2.4)));
+        radius *= (1.0 + ejection * 0.20 * u.dropletSens + bass * 0.08);
+
+        float2 velocity = normalize(radial * (0.50 + ejection) + tangent * (0.28 + seed * 0.32));
+        float stretch = clamp(1.0 + ejection * (0.20 + u.reach * 0.18) * u.dropletSens, 1.0, 1.45);
+
+        // Subtle micro-surface ripple on satellite
+        float satTheta = atan2(wp.y - center.y, wp.x - center.x);
+        float satSpike = pow(max(0.0, cos(satTheta * 4.0 + t * 2.2 + fi)), 2.2) * (treble * 0.005 * u.spikiness);
+
+        float dSat = dropletSDF(wp, center, radius + satSpike, velocity, stretch);
+        dFluid = smin(dFluid, dSat, k);
+    }
+
+    return dFluid;
+}
+
+// -----------------------------------------------------------------------------
+// UNIFIED FRAGMENT SHADER (PBR Magnetic Liquid Shading)
+// -----------------------------------------------------------------------------
 
 fragment float4 nuvi_fragment(VOut in [[stage_in]],
                               constant Uniforms& u [[buffer(0)]]) {
     float2 uv = in.uv;
     float distFromCenter = length(uv);
 
-    // Round white chamber mask with soft hardware-like falloff.
     float disk = smoothstep(1.0, 0.972, distFromCenter);
     if (disk <= 0.001) { return float4(0.0); }
 
-    float field = chamberField(uv, u);
-    float lvl = clamp(u.level, 0.0, 1.0);
-    float edgeWidth = clamp(0.045 + u.viscosity * 2.6, 0.035, 0.18);
-    float ink = smoothstep(1.05 - edgeWidth, 1.05 + edgeWidth, field);
+    float t = u.time * max(0.08, u.speed);
+    float ink = 0.0;
+    float contact = 0.0;
+    float3 normal = float3(0.0, 0.0, 1.0);
+
+    if (u.style > 0.5) {
+        // --- Magnetic Spikes Style ---
+        float k = mix(0.06, 0.18, clamp(u.viscosity * 2.5, 0.0, 1.0));
+        float d = spikesFluidSDF(uv, u, t, k);
+        float pixelSize = 2.0 / max(u.resolution.x, 1.0);
+        float edge = clamp(0.003 + u.viscosity * 0.006, pixelSize, 0.018);
+        ink = smoothstep(edge, -edge, d);
+        contact = smoothstep(0.08, 0.0, d) * (1.0 - ink) * 0.28;
+
+        float2 eps = float2(0.008, 0.0);
+        float dX = spikesFluidSDF(uv + eps.xy, u, t, k) - spikesFluidSDF(uv - eps.xy, u, t, k);
+        float dY = spikesFluidSDF(uv + eps.yx, u, t, k) - spikesFluidSDF(uv - eps.yx, u, t, k);
+        float2 grad = float2(dX, dY) / (2.0 * eps.x);
+        float nz = max(0.22, 1.0 - clamp(-d / 0.08, 0.0, 0.95));
+        normal = normalize(float3(grad.x, grad.y, nz));
+    } else {
+        // --- Organic Liquid Style ---
+        float field = organicChamberField(uv, u);
+        float edgeWidth = clamp(0.045 + u.viscosity * 2.6, 0.035, 0.18);
+        ink = smoothstep(1.05 - edgeWidth, 1.05 + edgeWidth, field);
+        contact = smoothstep(0.20, 1.08, field) * (1.0 - ink);
+
+        float2 eps = float2(0.008, 0.0);
+        float fx = organicChamberField(uv + eps.xy, u) - organicChamberField(uv - eps.xy, u);
+        float fy = organicChamberField(uv + eps.yx, u) - organicChamberField(uv - eps.yx, u);
+        normal = normalize(float3(fx, fy, 0.40));
+    }
+
     ink *= smoothstep(0.97, 0.76, distFromCenter);
 
     float3 bgColor = float3(u.bgR, u.bgG, u.bgB);
     float3 fluidColor = float3(u.fluidR, u.fluidG, u.fluidB);
 
-    // Contact shadow on the backlit chamber before fluid appears.
-    float contact = smoothstep(0.20, 1.08, field) * (1.0 - ink);
+    // Backlit chamber background with contact shadow
     float vignette = smoothstep(1.0, 0.15, distFromCenter);
     float3 chamber = bgColor - vignette * 0.045 - contact * 0.20;
-
-    // Surface normal from field derivatives for wet highlights.
-    float2 eps = float2(0.010, 0.0);
-    float fx = chamberField(uv + eps.xy, u) - chamberField(uv - eps.xy, u);
-    float fy = chamberField(uv + eps.yx, u) - chamberField(uv - eps.yx, u);
-    float3 normal = normalize(float3(fx, fy, 0.42));
 
     float3 lightA = normalize(float3(-0.45, -0.62, 1.0));
     float3 lightB = normalize(float3(0.72, 0.34, 0.85));
     float diffuse = max(dot(normal, lightA), 0.0) * 0.38 + max(dot(normal, lightB), 0.0) * 0.16;
     float3 view = float3(0.0, 0.0, 1.0);
 
-    // Realistic PBR Fresnel for magnetic liquid
+    // Schlick Fresnel approximation for magnetic liquid
     float F0 = 0.12;
     float cosTheta = max(dot(normal, view), 0.0);
     float fresnel = F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0);
@@ -240,24 +349,19 @@ fragment float4 nuvi_fragment(VOut in [[stage_in]],
     float specA = pow(max(dot(reflect(-lightA, normal), view), 0.0), 42.0);
     float specB = pow(max(dot(reflect(-lightB, normal), view), 0.0), 24.0) * 0.24;
 
-    float rim = smoothstep(1.10, 1.45, field) * (1.0 - smoothstep(1.48, 2.3, field));
+    float rim = pow(1.0 - cosTheta, 3.2);
 
-    // Base fluid is the chosen color, lifted slightly by diffuse light.
     float fluidLum = dot(fluidColor, float3(0.299, 0.587, 0.114));
     float darkLift = mix(0.16, 0.06, smoothstep(0.0, 0.5, fluidLum));
     float3 fluid = fluidColor + diffuse * darkLift;
 
-    // Specular stays near-white but is tinted toward the fluid so colored fluids
-    // keep wet, believable highlights instead of washing out to gray.
     float3 specTint = mix(float3(0.95, 0.97, 1.0), normalize(fluidColor + 0.001), 0.35);
     fluid += (specA + specB) * specTint * (1.0 + fresnel * 0.5);
 
-    // Rim light picks up the fluid hue so the edge glows in-color.
-    fluid += rim * (fluidColor * 0.35 + 0.03) * (0.6 + lvl);
+    fluid += rim * (fluidColor * 0.35 + 0.03) * (0.6 + u.level);
 
     float3 color = mix(chamber, fluid, ink);
 
-    // Subtle glass/chamber boundary shading
     float bgLum = dot(bgColor, float3(0.299, 0.587, 0.114));
     float rimShade = smoothstep(0.78, 1.0, distFromCenter);
     color -= rimShade * mix(0.04, 0.11, smoothstep(0.2, 0.9, bgLum));

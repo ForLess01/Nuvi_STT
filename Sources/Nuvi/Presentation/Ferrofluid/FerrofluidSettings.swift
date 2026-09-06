@@ -29,6 +29,21 @@ public struct RGBColor: Codable, Sendable, Equatable {
     }
 }
 
+/// Visual rendering style for the ferrofluid.
+public enum FerrofluidStyle: String, Codable, CaseIterable, Identifiable, Sendable {
+    case organic = "organic"
+    case spikes = "spikes"
+
+    public var id: String { rawValue }
+
+    public var label: String {
+        switch self {
+        case .organic: return tr("Organic Liquid", "Líquido orgánico")
+        case .spikes: return tr("Magnetic Spikes", "Espigas magnéticas")
+        }
+    }
+}
+
 /// Tunable look of the ferrofluid. These map 1:1 to shader uniforms, so the
 /// Settings controls adjust the render in real time.
 public struct FerrofluidSettings: Codable, Sendable, Equatable {
@@ -38,18 +53,25 @@ public struct FerrofluidSettings: Codable, Sendable, Equatable {
     public var viscosity: Float   // edge softness (lower = crisper liquid)
     public var speed: Float       // animation speed
     public var spikeCount: Float  // number of angular fingers
-    public var sensitivity: Float // audio responsiveness multiplier (0.2...3.0)
+    public var sensitivity: Float // master audio responsiveness multiplier (0.2...3.0)
+    public var coreSensitivity: Float    // core acoustic expansion & breathing reactivity (0.2...3.0)
+    public var dropletSensitivity: Float // satellite droplet ejection & stretch reactivity (0.2...3.0)
+    public var style: FerrofluidStyle     // organic liquid or magnetic spikes
     public var fluidColor: RGBColor       // the liquid ink
     public var backgroundColor: RGBColor  // the chamber behind it
 
     // Decodes older persisted data (before colors existed) by defaulting the
     // color fields, so a saved look never fails to load.
     enum CodingKeys: String, CodingKey {
-        case coreSize, reach, spikiness, viscosity, speed, spikeCount, sensitivity, fluidColor, backgroundColor
+        case coreSize, reach, spikiness, viscosity, speed, spikeCount
+        case sensitivity, coreSensitivity, dropletSensitivity, style, fluidColor, backgroundColor
     }
 
     public init(coreSize: Float, reach: Float, spikiness: Float, viscosity: Float,
                 speed: Float, spikeCount: Float, sensitivity: Float = 1.0,
+                coreSensitivity: Float = 1.0,
+                dropletSensitivity: Float = 1.0,
+                style: FerrofluidStyle = .organic,
                 fluidColor: RGBColor = .nuviCharcoal,
                 backgroundColor: RGBColor = .nuviSoftWhite) {
         self.coreSize = coreSize
@@ -59,6 +81,9 @@ public struct FerrofluidSettings: Codable, Sendable, Equatable {
         self.speed = speed
         self.spikeCount = spikeCount
         self.sensitivity = sensitivity
+        self.coreSensitivity = coreSensitivity
+        self.dropletSensitivity = dropletSensitivity
+        self.style = style
         self.fluidColor = fluidColor
         self.backgroundColor = backgroundColor
     }
@@ -72,6 +97,9 @@ public struct FerrofluidSettings: Codable, Sendable, Equatable {
         speed = try c.decode(Float.self, forKey: .speed)
         spikeCount = try c.decode(Float.self, forKey: .spikeCount)
         sensitivity = try c.decodeIfPresent(Float.self, forKey: .sensitivity) ?? 1.0
+        coreSensitivity = try c.decodeIfPresent(Float.self, forKey: .coreSensitivity) ?? 1.0
+        dropletSensitivity = try c.decodeIfPresent(Float.self, forKey: .dropletSensitivity) ?? 1.0
+        style = try c.decodeIfPresent(FerrofluidStyle.self, forKey: .style) ?? .organic
         fluidColor = (try c.decodeIfPresent(RGBColor.self, forKey: .fluidColor) ?? .nuviCharcoal)
             .nearestNuviPaletteColor
         backgroundColor = (try c.decodeIfPresent(RGBColor.self, forKey: .backgroundColor) ?? .nuviSoftWhite)
@@ -86,6 +114,9 @@ public struct FerrofluidSettings: Codable, Sendable, Equatable {
         speed: 1.12,
         spikeCount: 8,
         sensitivity: 1.0,
+        coreSensitivity: 1.0,
+        dropletSensitivity: 1.0,
+        style: .organic,
         fluidColor: .nuviCharcoal,
         backgroundColor: .nuviSoftWhite
     )
