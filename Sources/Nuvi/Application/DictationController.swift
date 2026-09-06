@@ -291,6 +291,8 @@ public final class DictationController: ObservableObject {
     private let deliveryMode: () -> DictationDeliveryMode
     private let silenceDetectionEnabled: () -> Bool
     private let silenceDurationThreshold: () -> TimeInterval
+    private let duckAudioDuringDictation: () -> Bool
+    private let ducker: AudioDucking
     private let completionScheduler: CompletionFeedbackScheduling
     private var session: Task<Void, Never>?
     private var sessionID: UUID?
@@ -322,6 +324,10 @@ public final class DictationController: ObservableObject {
                             silenceDurationThreshold: @escaping () -> TimeInterval = {
                                 SettingsStore.shared.silenceDurationThreshold
                             },
+                            duckAudioDuringDictation: @escaping () -> Bool = {
+                                SettingsStore.shared.duckAudioDuringDictation
+                            },
+                            ducker: AudioDucking = SystemAudioDuckingService(),
                             engineConfigurationID: String? = nil) {
         self.init(
             audio: audio,
@@ -336,6 +342,8 @@ public final class DictationController: ObservableObject {
             deliveryMode: deliveryMode,
             silenceDetectionEnabled: silenceDetectionEnabled,
             silenceDurationThreshold: silenceDurationThreshold,
+            duckAudioDuringDictation: duckAudioDuringDictation,
+            ducker: ducker,
             engineConfigurationID: engineConfigurationID,
             completionScheduler: LiveCompletionFeedbackScheduler()
         )
@@ -361,6 +369,10 @@ public final class DictationController: ObservableObject {
          silenceDurationThreshold: @escaping () -> TimeInterval = {
              SettingsStore.shared.silenceDurationThreshold
          },
+         duckAudioDuringDictation: @escaping () -> Bool = {
+             SettingsStore.shared.duckAudioDuringDictation
+         },
+         ducker: AudioDucking = SystemAudioDuckingService(),
          engineConfigurationID: String?,
          completionScheduler: CompletionFeedbackScheduling) {
         self.audio = audio
@@ -376,6 +388,8 @@ public final class DictationController: ObservableObject {
         self.deliveryMode = deliveryMode
         self.silenceDetectionEnabled = silenceDetectionEnabled
         self.silenceDurationThreshold = silenceDurationThreshold
+        self.duckAudioDuringDictation = duckAudioDuringDictation
+        self.ducker = ducker
         self.completionScheduler = completionScheduler
         self.audio.onLevel = { [weak self] level in
             Task { @MainActor in
@@ -455,6 +469,10 @@ public final class DictationController: ObservableObject {
             NSLog("Nuvi/live: editable target captured, engine=\(engine.identifier)")
         }
 
+        if duckAudioDuringDictation() {
+            ducker.duck()
+        }
+
         let id = UUID()
         sessionID = id
         session = Task { await runSession(id: id, isLive: isLive) }
@@ -476,6 +494,7 @@ public final class DictationController: ObservableObject {
         cancelSilenceTimer()
         state = .transcribing
         NuviSound.stop()
+        ducker.restore()
         audio.stop() // ends the buffer stream → engine emits the final segment
     }
 
@@ -490,6 +509,7 @@ public final class DictationController: ObservableObject {
         audio.stop()
         cancelLiveInsertion()
         NuviSound.cancel()
+        ducker.restore()
         clearSessionState()
     }
 
@@ -648,6 +668,7 @@ public final class DictationController: ObservableObject {
 
     private func reset(ownedBy id: UUID) {
         guard ownsSession(id) else { return }
+        ducker.restore()
         clearSessionState()
     }
 
@@ -707,6 +728,7 @@ public final class DictationController: ObservableObject {
         cancelCompletionFeedback()
         cancelLiveInsertion()
         NSLog("Nuvi/notice [\(error.code)]: \(error.message)")
+        ducker.restore()
         state = .notice(error.display)
         level = 0
         transcript = ""
@@ -724,6 +746,7 @@ public final class DictationController: ObservableObject {
         NSLog("Nuvi/error [\(error.code)]: \(error.message)")
         audio.stop()
         NuviSound.error()
+        ducker.restore()
         state = .error(error.display)
         level = 0
         transcript = ""

@@ -1,4 +1,6 @@
 import Foundation
+import SwiftUI
+
 
 extension Notification.Name {
     static let nuviTranscriptionConfigurationDidChange = Notification.Name("nuvi.transcriptionConfigurationDidChange")
@@ -91,6 +93,8 @@ public final class SettingsStore: @unchecked Sendable {
         get { defaults.object(forKey: Keys.soundEffects) as? Bool ?? true }
         set { defaults.set(newValue, forKey: Keys.soundEffects) }
     }
+
+    @AppStorage("duckAudioDuringDictation") public var duckAudioDuringDictation: Bool = true
 
     /// Keeps the floating transcription pill available by default, while
     /// allowing users who prefer a menu-bar-only workflow to suppress it.
@@ -258,6 +262,7 @@ public final class SettingsStore: @unchecked Sendable {
         static let inputDeviceUID = "nuvi.inputDeviceUID"
         static let selectedModelID = "nuvi.selectedModelID"
         static let downloadedParakeet = "nuvi.downloadedParakeetModels"
+        static let duckAudioDuringDictation = "duckAudioDuringDictation"
 
         static func soundPreset(_ event: SoundEvent) -> String {
             "nuvi.sound.\(event.rawValue)"

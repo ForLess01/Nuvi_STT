@@ -690,6 +690,7 @@ private struct AccessibilityStatus: View {
 
 private struct SoundPanel: View {
     @State private var enabled = SettingsStore.shared.soundEffects
+    @State private var duckAudio = SettingsStore.shared.duckAudioDuringDictation
     @ObservedObject private var loc = LocalizationStore.shared
 
     var body: some View {
@@ -700,6 +701,15 @@ private struct SoundPanel: View {
                            subtitle: tr("Subtle cues when recording starts, stops, and text is inserted", "Señales sutiles al iniciar, detener e insertar texto")) {
                     Toggle("", isOn: $enabled).labelsHidden()
                         .onChange(of: enabled) { _, new in SettingsStore.shared.soundEffects = new }
+                }
+            }
+
+            SectionHeader(text: tr("Audio Ducking", "Atenuación de audio"))
+            Card {
+                SettingRow(title: tr("Duck system audio", "Atenuar audio del sistema"),
+                           subtitle: tr("Smoothly lowers system volume while dictating and restores it when finished", "Baja suavemente el volumen del sistema al dictar y lo restablece al terminar")) {
+                    Toggle("", isOn: $duckAudio).labelsHidden()
+                        .onChange(of: duckAudio) { _, new in SettingsStore.shared.duckAudioDuringDictation = new }
                 }
             }
 
