@@ -39,7 +39,9 @@ public final class FerrofluidMicProbe: ObservableObject {
                 }
             }
             do {
-                let stream = try capture.start()
+                let stream = try capture.start(
+                    configuration: AudioCaptureConfiguration(duckOtherAudio: false)
+                )
                 active = true
                 // Drain the PCM stream so it doesn't accumulate in memory.
                 drainTask = Task { for await _ in stream {} }

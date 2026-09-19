@@ -7,59 +7,42 @@ import Synchronization
 
 /// Port for microphone capture. Keeping the controller on this abstraction lets
 /// tests drive dictation without touching real hardware.
+public struct AudioCaptureConfiguration: Equatable, Sendable {
+    public let duckOtherAudio: Bool
+
+    public init(duckOtherAudio: Bool = false) {
+        self.duckOtherAudio = duckOtherAudio
+    }
+}
+
 public enum AudioCaptureError: Error, Sendable, Equatable {
     case microphoneInUse
     case microphoneUnavailable(String)
+    case nativeDuckingUnavailable(String)
 }
 
 public protocol AudioCapturing: AnyObject, Sendable {
     var onLevel: (@Sendable (Float) -> Void)? { get set }
     var onSpectrum: (@Sendable (AudioSpectrum) -> Void)? { get set }
     func requestPermission() async -> Bool
-    func start() throws -> AsyncStream<AVAudioPCMBuffer>
+    func start(configuration: AudioCaptureConfiguration) throws -> AsyncStream<AVAudioPCMBuffer>
     func stop()
 }
 
 public extension AudioCapturing {
+    /// Preview and other source-compatible callers stay explicitly on the
+    /// non-ducking HAL path unless they opt into a configuration.
+    func start() throws -> AsyncStream<AVAudioPCMBuffer> {
+        try start(configuration: AudioCaptureConfiguration())
+    }
+
     var onSpectrum: (@Sendable (AudioSpectrum) -> Void)? {
         get { nil }
         set {}
     }
 }
 
-/// The control-plane lifecycle for one HAL instance. The render callback only
-/// reads the immutable `unit` reference; cleanup is kept on the control side.
-internal protocol AudioUnitLifecycle: AnyObject {
-    var unit: AudioUnit? { get }
-    func stop()
-    func uninitialize()
-    func dispose()
-}
-
-private final class HALAudioUnitLifecycle: AudioUnitLifecycle, @unchecked Sendable {
-    let unit: AudioUnit?
-
-    init(unit: AudioUnit) {
-        self.unit = unit
-    }
-
-    func stop() {
-        guard let unit else { return }
-        _ = AudioOutputUnitStop(unit)
-    }
-
-    func uninitialize() {
-        guard let unit else { return }
-        _ = AudioUnitUninitialize(unit)
-    }
-
-    func dispose() {
-        guard let unit else { return }
-        _ = AudioComponentInstanceDispose(unit)
-    }
-}
-
-/// Per-run state retained by the service while the HAL callback is installed.
+/// Per-run state retained by the service while the native callback is installed.
 /// The callback never reaches back into `AudioCaptureService`, so stopping one
 /// run cannot expose another run's unit, format, or stream continuation.
 ///
@@ -82,11 +65,13 @@ internal final class AudioCaptureSession: @unchecked Sendable {
 
     private let callbackState = Atomic<UInt64>(0)
     private let cleanupState = Atomic<Bool>(false)
+    private let cleanupFinished = Atomic<Bool>(false)
     private let streamTerminated = Atomic<Bool>(false)
     private let publisherStartedState = Atomic<Bool>(false)
     private let streamDropped = Atomic<UInt64>(0)
     private let allocationFailures = Atomic<UInt64>(0)
     private let publisherCompletion = DispatchSemaphore(value: 0)
+    private let fatalRenderRequested = Atomic<Bool>(false)
 
     private var captureGain: AdaptiveCaptureGain
     private var lastLevelEmissionNanos: UInt64 = 0
@@ -95,6 +80,7 @@ internal final class AudioCaptureSession: @unchecked Sendable {
 
     private static let admissionClosedBit: UInt64 = 1 << 63
     private static let callbackCountMask: UInt64 = admissionClosedBit - 1
+    internal static let fatalRenderStatus: OSStatus = OSStatus(paramErr)
 
     init(lifecycle: AudioUnitLifecycle,
          format: AVAudioFormat?,
@@ -132,7 +118,8 @@ internal final class AudioCaptureSession: @unchecked Sendable {
             // A running publisher performs cleanup after it has signalled its
             // completion semaphore. This avoids a re-entrant deadlock if
             // AsyncStream invokes this handler while `yield` returns `.terminated`.
-            if !self.publisherStartedState.load(ordering: .acquiring) {
+            if !self.publisherStartedState.load(ordering: .acquiring),
+               !self.cleanupState.load(ordering: .acquiring) {
                 self.cleanup()
             }
         }
@@ -152,15 +139,27 @@ internal final class AudioCaptureSession: @unchecked Sendable {
         publisherTask = task
     }
 
-    /// Stops the HAL before completing the stream. Calls are control-side and
+    /// Stops the native audio unit before completing the stream. Calls are control-side and
     /// intentionally idempotent so failed starts and stream cancellation
     /// cannot double-dispose a unit.
     func cleanup() {
-        guard !cleanupState.exchange(true, ordering: .acquiringAndReleasing) else { return }
+        cleanup(waitForPublisher: true)
+    }
+
+    private func cleanup(waitForPublisher: Bool) {
+        guard !cleanupState.exchange(true, ordering: .acquiringAndReleasing) else {
+            if waitForPublisher {
+                while !cleanupFinished.load(ordering: .acquiring) {
+                    sched_yield()
+                }
+            }
+            return
+        }
+        defer { cleanupFinished.store(true, ordering: .releasing) }
 
         closeCallbackAdmission()
-        lifecycle.stop()
         waitForCallbacks()
+        lifecycle.stop()
         lifecycle.uninitialize()
         lifecycle.dispose()
 
@@ -168,7 +167,7 @@ internal final class AudioCaptureSession: @unchecked Sendable {
         // still own queued slots, so close first and let it drain before the
         // final control-side safety drain.
         ring.close()
-        if publisherStarted {
+        if publisherStarted, waitForPublisher {
             publisherCompletion.wait()
             publisherTask = nil
         }
@@ -179,6 +178,14 @@ internal final class AudioCaptureSession: @unchecked Sendable {
         levelHandler?(0)
         spectrumHandler?(.zero)
         continuation.finish()
+    }
+
+    internal var fatalRenderCleanupRequested: Bool {
+        fatalRenderRequested.load(ordering: .acquiring)
+    }
+
+    internal var cleanupRequested: Bool {
+        cleanupState.load(ordering: .acquiring)
     }
 
     /// The callback's admission gate. A single CAS combines the closed bit and
@@ -210,7 +217,9 @@ internal final class AudioCaptureSession: @unchecked Sendable {
                 timeStamp: UnsafePointer<AudioTimeStamp>,
                 busNumber: UInt32,
                 frames: UInt32) -> OSStatus {
-        guard let unit = lifecycle.unit else { return noErr }
+        guard !fatalRenderRequested.load(ordering: .acquiring) else {
+            return Self.fatalRenderStatus
+        }
         let reservationResult = ring.beginWrite(
             frames: frames,
             channelCount: UInt32(ring.channelCount)
@@ -224,19 +233,27 @@ internal final class AudioCaptureSession: @unchecked Sendable {
                 frames: frames,
                 channelCount: UInt32(ring.channelCount)
             ) else { return noErr }
-            return AudioUnitRender(unit, actionFlags, timeStamp, busNumber, frames, discard)
-        case .oversized, .closed:
+            return lifecycle.render(
+                actionFlags: actionFlags,
+                timeStamp: timeStamp,
+                busNumber: busNumber,
+                frames: frames,
+                data: discard
+            )
+        case .oversized:
             // Oversized slices cannot safely be rendered into fixed storage;
-            // they are counted by the ring and dropped without resizing.
+            // signal the publisher to clean up away from the realtime callback.
+            fatalRenderRequested.store(true, ordering: .releasing)
+            return Self.fatalRenderStatus
+        case .closed:
             return noErr
         case .reserved(let reservation):
-            let status = AudioUnitRender(
-                unit,
-                actionFlags,
-                timeStamp,
-                busNumber,
-                frames,
-                ring.audioBufferList(for: reservation)
+            let status = lifecycle.render(
+                actionFlags: actionFlags,
+                timeStamp: timeStamp,
+                busNumber: busNumber,
+                frames: frames,
+                data: ring.audioBufferList(for: reservation)
             )
             guard status == noErr else {
                 ring.abandonWrite(reservation)
@@ -277,18 +294,24 @@ internal final class AudioCaptureSession: @unchecked Sendable {
             publisherCompletion.signal()
             if streamTerminated.load(ordering: .acquiring),
                !cleanupState.load(ordering: .acquiring) {
-                // The completion signal is already available, so cleanup can
-                // synchronously finish lifecycle disposal without waiting on
-                // this task (which is the current execution context).
-                cleanup()
+                cleanup(waitForPublisher: false)
             }
         }
 
         while true {
+            if fatalRenderRequested.load(ordering: .acquiring) {
+                cleanup(waitForPublisher: false)
+                return
+            }
             var processedAny = false
             while let chunk = ring.pop() {
                 processedAny = true
                 publish(chunk)
+            }
+
+            if fatalRenderRequested.load(ordering: .acquiring) {
+                cleanup(waitForPublisher: false)
+                return
             }
 
             if streamTerminated.load(ordering: .acquiring) || ring.isClosed {
@@ -400,10 +423,14 @@ internal final class AudioCaptureSession: @unchecked Sendable {
     }
 }
 
-/// Captures microphone audio with a dedicated CoreAudio HAL I/O unit (AUHAL)
-/// pinned to a specific device, and exposes two things:
+/// Captures microphone audio with a dedicated CoreAudio I/O backend pinned to a
+/// specific device, and exposes two things:
 ///   • an AsyncStream of PCM buffers for the transcription engine, and
 ///   • a normalized RMS level (0...1) for the ferrofluid visualizer.
+///
+/// Ordinary capture uses an input-only HAL unit. Opt-in audio ducking uses a
+/// full-duplex VoiceProcessingIO unit with a silent output renderer so macOS
+/// applies native other-audio ducking without changing the system volume.
 ///
 /// Why not AVAudioEngine: its input node always binds the *system default* input
 /// and rebuilds an aggregate around it, so it cannot reliably capture from the
@@ -418,20 +445,43 @@ internal final class AudioCaptureSession: @unchecked Sendable {
 /// delivery, so consumers never retain a buffer that the callback may reuse.
 public final class AudioCaptureService: AudioCapturing, @unchecked Sendable {
     private var activeSession: AudioCaptureSession?
+    private let backendFactory: AudioCaptureBackendFactory
+    private let inputDeviceOverride: AudioDeviceID?
+    private let controlLock = NSRecursiveLock()
+    private var activeDiagnostics: AudioCaptureDiagnostics?
+
+    internal private(set) var lastDiagnostics: AudioCaptureDiagnostics?
+    internal private(set) var lastCleanupStatus = AudioUnitCleanupStatus.successful
 
     public var onLevel: (@Sendable (Float) -> Void)?
     public var onSpectrum: (@Sendable (AudioSpectrum) -> Void)?
 
-    public init() {}
+    public init() {
+        backendFactory = NativeAudioCaptureBackendFactory()
+        inputDeviceOverride = nil
+    }
 
     // Internal seam for lifecycle tests; production construction uses the
     // public no-argument initializer and creates sessions in start().
     internal init(activeSession: AudioCaptureSession?) {
+        backendFactory = NativeAudioCaptureBackendFactory()
+        inputDeviceOverride = nil
         self.activeSession = activeSession
     }
 
+    // Internal seam for backend selection and startup failure tests.
+    internal init(
+        backendFactory: AudioCaptureBackendFactory,
+        inputDeviceOverride: AudioDeviceID? = nil
+    ) {
+        self.backendFactory = backendFactory
+        self.inputDeviceOverride = inputDeviceOverride
+    }
+
     deinit {
-        cleanupCapture()
+        controlLock.lock()
+        cleanupCaptureLocked()
+        controlLock.unlock()
     }
 
     public func requestPermission() async -> Bool {
@@ -447,37 +497,31 @@ public final class AudioCaptureService: AudioCapturing, @unchecked Sendable {
         }
     }
 
-    public func start() throws -> AsyncStream<AVAudioPCMBuffer> {
-        stop()
+    public func start(configuration: AudioCaptureConfiguration) throws -> AsyncStream<AVAudioPCMBuffer> {
+        controlLock.lock()
+        defer { controlLock.unlock() }
+        stopLocked()
 
-        var lifecycle: AudioUnitLifecycle?
+        var backendForCleanup: AudioCaptureBackend?
         do {
-            let unit = try makeInputUnit()
-            let liveLifecycle = HALAudioUnitLifecycle(unit: unit)
-            lifecycle = liveLifecycle
-
-            let device = chosenInputDevice()
-            try setCurrentDevice(device, on: unit)
-            let usesBluetoothInput = AudioInputDevice.isBluetoothInputDevice(device)
-            if usesBluetoothInput {
+            let selection = try inputDeviceOverride.map { (id: $0, uid: Optional<String>.none) }
+                ?? chosenInputDevice(configuration: configuration)
+            let device = selection.id
+            let backend = try backendFactory.makeBackend(
+                configuration: configuration,
+                inputDevice: device
+            )
+            backendForCleanup = backend
+            activeDiagnostics = backend.diagnostics.with(selectedInputUID: selection.uid)
+            lastDiagnostics = activeDiagnostics
+            if backend.usesBluetoothInput {
                 NSLog("Nuvi/audio: Bluetooth input selected; applying speech gain while macOS uses hands-free/HFP quality")
             }
 
-            // Hardware format on the input element drives the client format we ask
-            // the unit to deliver: same rate and channel count, but plain Float32 so
-            // downstream conversion is trivial.
-            let hardware = try inputStreamFormat(of: unit)
-            guard hardware.mSampleRate > 0, hardware.mChannelsPerFrame > 0 else {
-                throw AudioCaptureError.microphoneInUse
-            }
-            var asbd = makeClientFormat(sampleRate: hardware.mSampleRate,
-                                        channels: hardware.mChannelsPerFrame)
-            try setClientFormat(asbd, on: unit)
-            guard let avFormat = AVAudioFormat(streamDescription: &asbd) else {
-                throw AudioCaptureError.microphoneInUse
-            }
-            let maximumFrames = try maximumFramesPerSlice(of: unit)
-            NSLog("Nuvi/audio: HAL input device=\(device), sampleRate=\(avFormat.sampleRate), channels=\(avFormat.channelCount)")
+            NSLog(
+                "Nuvi/audio: backend=\(backend.kind), input device=\(device), " +
+                "sampleRate=\(backend.captureFormat.sampleRate), channels=\(backend.captureFormat.channelCount)"
+            )
 
             let (stream, continuation) = AsyncStream<AVAudioPCMBuffer>.makeStream(
                 // The ring and stream both use drop-newest semantics. Keeping
@@ -486,17 +530,17 @@ public final class AudioCaptureService: AudioCapturing, @unchecked Sendable {
                 bufferingPolicy: .bufferingOldest(AudioCaptureSession.streamBufferCapacity)
             )
             let ring = AudioChunkRing(
-                maxFrames: Int(maximumFrames),
-                channelCount: Int(hardware.mChannelsPerFrame),
+                maxFrames: Int(backend.maximumFramesPerSlice),
+                channelCount: backend.captureChannelCount,
                 capacity: AudioCaptureSession.ringCapacity
             )
             let session = AudioCaptureSession(
-                lifecycle: liveLifecycle,
-                format: avFormat,
+                lifecycle: backend.lifecycle,
+                format: backend.captureFormat,
                 continuation: continuation,
                 levelHandler: onLevel,
                 spectrumHandler: onSpectrum,
-                usesBluetoothInput: usesBluetoothInput,
+                usesBluetoothInput: backend.usesBluetoothInput,
                 ring: ring
             )
             activeSession = session
@@ -504,31 +548,43 @@ public final class AudioCaptureService: AudioCapturing, @unchecked Sendable {
             session.startPublisher()
             // From this point on, the session owns all callback state and the
             // catch path must clean it through `activeSession`.
-            lifecycle = nil
+            backendForCleanup = nil
 
-            try setInputCallback(on: unit, session: session)
-
-            var status = AudioUnitInitialize(unit)
-            guard status == noErr else { throw AudioCaptureError.microphoneInUse }
-            status = AudioOutputUnitStart(unit)
-            guard status == noErr else { throw AudioCaptureError.microphoneInUse }
+            try backend.installCallbacks(for: session)
+            try backend.start()
+            guard !session.cleanupRequested else {
+                throw configuration.duckOtherAudio
+                    ? AudioCaptureError.nativeDuckingUnavailable(
+                        nativeDuckingUnavailableMessage("The audio route changed during startup")
+                    )
+                    : AudioCaptureError.microphoneInUse
+            }
+            activeDiagnostics = backend.diagnostics.with(selectedInputUID: selection.uid)
+            lastDiagnostics = activeDiagnostics
 
             NSLog("Nuvi/audio: capture started")
             return stream
         } catch let error as AudioCaptureError {
-            cleanupCapture()
-            cleanup(lifecycle)
+            cleanupCaptureLocked()
+            cleanup(backend: backendForCleanup)
             throw error
         } catch {
-            cleanupCapture()
-            cleanup(lifecycle)
+            cleanupCaptureLocked()
+            cleanup(backend: backendForCleanup)
             NSLog("Nuvi/audio: failed to start microphone capture: \(String(describing: error))")
+            if configuration.duckOtherAudio {
+                throw AudioCaptureError.nativeDuckingUnavailable(
+                    nativeDuckingUnavailableMessage(String(describing: error))
+                )
+            }
             throw AudioCaptureError.microphoneInUse
         }
     }
 
     public func stop() {
-        let hadSession = cleanupCapture()
+        controlLock.lock()
+        let hadSession = stopLocked()
+        controlLock.unlock()
         if !hadSession {
             onLevel?(0)
             onSpectrum?(.zero)
@@ -536,156 +592,77 @@ public final class AudioCaptureService: AudioCapturing, @unchecked Sendable {
     }
 
     @discardableResult
-    private func cleanupCapture() -> Bool {
+    private func stopLocked() -> Bool {
+        cleanupCaptureLocked()
+    }
+
+    @discardableResult
+    private func cleanupCaptureLocked() -> Bool {
         // Detach first. The local strong reference keeps the callback-owned
         // session alive through stop/uninitialize/dispose.
         let session = activeSession
         activeSession = nil
-        session?.cleanup()
-        return session != nil
+        guard let session else {
+            activeDiagnostics = nil
+            return false
+        }
+        session.cleanup()
+        let status = session.lifecycle.cleanupStatus
+        lastCleanupStatus = status
+        if let activeDiagnostics {
+            lastDiagnostics = activeDiagnostics.with(cleanupComplete: status.isComplete)
+        }
+        self.activeDiagnostics = nil
+        return true
     }
 
-    private func cleanup(_ lifecycle: AudioUnitLifecycle?) {
-        guard let lifecycle else { return }
-        lifecycle.stop()
-        lifecycle.uninitialize()
-        lifecycle.dispose()
+    private func cleanup(backend: AudioCaptureBackend?) {
+        guard let backend else { return }
+        backend.cleanup()
+        let status = backend.lifecycle.cleanupStatus
+        lastCleanupStatus = status
+        lastDiagnostics = backend.diagnostics.with(cleanupComplete: status.isComplete)
+        activeDiagnostics = nil
     }
 
     // MARK: - Device selection
 
-    private func chosenInputDevice() -> AudioDeviceID {
-        let unknown = AudioDeviceID(kAudioObjectUnknown)
+    private func chosenInputDevice(
+        configuration: AudioCaptureConfiguration
+    ) throws -> (id: AudioDeviceID, uid: String?) {
         switch SettingsStore.shared.inputDeviceUID {
         case "":
             // Automatic: prefer built-in so a Bluetooth headset stays in A2DP.
             if let builtIn = AudioInputDevice.builtInInputDeviceID() {
                 NSLog("Nuvi/audio: input=automatic (built-in id=\(builtIn))")
-                return builtIn
+                return (builtIn, nil)
             }
-            return AudioInputDevice.defaultInputDeviceID() ?? unknown
+            if let device = AudioInputDevice.defaultInputDeviceID() {
+                return (device, nil)
+            }
+            throw AudioCaptureError.microphoneUnavailable("No input device is available")
         case "default":
-            let device = AudioInputDevice.defaultInputDeviceID() ?? unknown
+            guard let device = AudioInputDevice.defaultInputDeviceID() else {
+                throw AudioCaptureError.microphoneUnavailable("No system default input device is available")
+            }
             NSLog("Nuvi/audio: input=system default (id=\(device))")
-            return device
+            return (device, nil)
         case let uid:
             if let device = AudioInputDevice.deviceID(forUID: uid) {
                 NSLog("Nuvi/audio: input=pinned uid=\(uid) (id=\(device))")
-                return device
+                return (device, uid)
             }
-            NSLog("Nuvi/audio: selected input device unavailable; falling back to built-in/default")
-            return AudioInputDevice.builtInInputDeviceID()
-                ?? AudioInputDevice.defaultInputDeviceID() ?? unknown
+            NSLog("Nuvi/audio: selected input device unavailable; refusing substitution")
+            let detail = "The selected input device UID \(uid) is unavailable"
+            if configuration.duckOtherAudio {
+                throw AudioCaptureError.nativeDuckingUnavailable(
+                    nativeDuckingUnavailableMessage(detail)
+                )
+            }
+            throw AudioCaptureError.microphoneUnavailable(detail)
         }
     }
 
-    // MARK: - HAL unit plumbing
-
-    private func makeInputUnit() throws -> AudioUnit {
-        var description = AudioComponentDescription(
-            componentType: kAudioUnitType_Output,
-            componentSubType: kAudioUnitSubType_HALOutput,
-            componentManufacturer: kAudioUnitManufacturer_Apple,
-            componentFlags: 0,
-            componentFlagsMask: 0
-        )
-        guard let component = AudioComponentFindNext(nil, &description) else {
-            throw AudioCaptureError.microphoneUnavailable("No HAL audio component")
-        }
-        var unit: AudioUnit?
-        guard AudioComponentInstanceNew(component, &unit) == noErr, let unit else {
-            throw AudioCaptureError.microphoneUnavailable("Could not create input unit")
-        }
-
-        // Enable input (element 1), disable output (element 0).
-        var enable: UInt32 = 1
-        try set(unit, kAudioOutputUnitProperty_EnableIO, .input, 1, &enable, UInt32(MemoryLayout<UInt32>.size))
-        var disable: UInt32 = 0
-        try set(unit, kAudioOutputUnitProperty_EnableIO, .output, 0, &disable, UInt32(MemoryLayout<UInt32>.size))
-        return unit
-    }
-
-    private func setCurrentDevice(_ device: AudioDeviceID, on unit: AudioUnit) throws {
-        guard device != AudioDeviceID(kAudioObjectUnknown) else {
-            throw AudioCaptureError.microphoneUnavailable("No input device")
-        }
-        var value = device
-        try set(unit, kAudioOutputUnitProperty_CurrentDevice, .global, 0, &value,
-                UInt32(MemoryLayout<AudioDeviceID>.size))
-    }
-
-    private func inputStreamFormat(of unit: AudioUnit) throws -> AudioStreamBasicDescription {
-        var format = AudioStreamBasicDescription()
-        var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
-        let status = AudioUnitGetProperty(unit, kAudioUnitProperty_StreamFormat,
-                                          kAudioUnitScope_Input, 1, &format, &size)
-        guard status == noErr else {
-            throw AudioCaptureError.microphoneUnavailable("Could not read input format")
-        }
-        return format
-    }
-
-    private func maximumFramesPerSlice(of unit: AudioUnit) throws -> UInt32 {
-        var maxFrames: UInt32 = 0
-        var size = UInt32(MemoryLayout<UInt32>.size)
-        let status = AudioUnitGetProperty(
-            unit,
-            kAudioUnitProperty_MaximumFramesPerSlice,
-            kAudioUnitScope_Global,
-            0,
-            &maxFrames,
-            &size
-        )
-        guard status == noErr, maxFrames > 0 else {
-            throw AudioCaptureError.microphoneUnavailable("Could not read maximum frames per slice")
-        }
-        return maxFrames
-    }
-
-    private func makeClientFormat(sampleRate: Float64, channels: UInt32) -> AudioStreamBasicDescription {
-        let bytes = UInt32(MemoryLayout<Float32>.size)
-        return AudioStreamBasicDescription(
-            mSampleRate: sampleRate,
-            mFormatID: kAudioFormatLinearPCM,
-            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked | kAudioFormatFlagIsNonInterleaved,
-            mBytesPerPacket: bytes,
-            mFramesPerPacket: 1,
-            mBytesPerFrame: bytes,
-            mChannelsPerFrame: channels,
-            mBitsPerChannel: bytes * 8,
-            mReserved: 0
-        )
-    }
-
-    private func setClientFormat(_ asbd: AudioStreamBasicDescription, on unit: AudioUnit) throws {
-        var value = asbd
-        try set(unit, kAudioUnitProperty_StreamFormat, .output, 1, &value,
-                UInt32(MemoryLayout<AudioStreamBasicDescription>.size))
-    }
-
-    private func setInputCallback(on unit: AudioUnit, session: AudioCaptureSession) throws {
-        var callback = AURenderCallbackStruct(
-            inputProc: captureRenderCallback,
-            inputProcRefCon: Unmanaged.passUnretained(session).toOpaque()
-        )
-        try set(unit, kAudioOutputUnitProperty_SetInputCallback, .global, 0, &callback,
-                UInt32(MemoryLayout<AURenderCallbackStruct>.size))
-    }
-
-    private enum Scope { case input, output, global }
-    private func set(_ unit: AudioUnit, _ property: AudioUnitPropertyID, _ scope: Scope,
-                     _ element: AudioUnitElement, _ value: UnsafeMutableRawPointer, _ size: UInt32) throws {
-        let auScope: AudioUnitScope
-        switch scope {
-        case .input: auScope = kAudioUnitScope_Input
-        case .output: auScope = kAudioUnitScope_Output
-        case .global: auScope = kAudioUnitScope_Global
-        }
-        let status = AudioUnitSetProperty(unit, property, auScope, element, value, size)
-        guard status == noErr else {
-            throw AudioCaptureError.microphoneUnavailable("AudioUnitSetProperty \(property) failed: \(status)")
-        }
-    }
 }
 
 private struct AdaptiveCaptureGain {
@@ -718,14 +695,41 @@ private struct AdaptiveCaptureGain {
 }
 
 /// C render callback. Forwards to the callback-owned session via the ref-con pointer.
-private func captureRenderCallback(refCon: UnsafeMutableRawPointer,
-                                   actionFlags: UnsafeMutablePointer<AudioUnitRenderActionFlags>,
-                                   timeStamp: UnsafePointer<AudioTimeStamp>,
-                                   busNumber: UInt32,
-                                   frames: UInt32,
-                                   data: UnsafeMutablePointer<AudioBufferList>?) -> OSStatus {
+internal func captureRenderCallback(refCon: UnsafeMutableRawPointer,
+                                    actionFlags: UnsafeMutablePointer<AudioUnitRenderActionFlags>,
+                                    timeStamp: UnsafePointer<AudioTimeStamp>,
+                                    busNumber: UInt32,
+                                    frames: UInt32,
+                                    data: UnsafeMutablePointer<AudioBufferList>?) -> OSStatus {
     let session = Unmanaged<AudioCaptureSession>.fromOpaque(refCon).takeUnretainedValue()
     guard session.enterCallback() else { return noErr }
     defer { session.leaveCallback() }
     return session.render(actionFlags: actionFlags, timeStamp: timeStamp, busNumber: busNumber, frames: frames)
+}
+
+/// Supplies the enabled VPIO output bus with real silence. This callback is
+/// intentionally context-free and realtime-safe: it only clears the bytes the
+/// audio unit supplied and sets the corresponding silence hint.
+internal func silenceRenderCallback(refCon: UnsafeMutableRawPointer,
+                                    actionFlags: UnsafeMutablePointer<AudioUnitRenderActionFlags>,
+                                    timeStamp: UnsafePointer<AudioTimeStamp>,
+                                    busNumber: UInt32,
+                                    frames: UInt32,
+                                    data: UnsafeMutablePointer<AudioBufferList>?) -> OSStatus {
+    _ = refCon
+    _ = timeStamp
+    _ = busNumber
+    _ = frames
+
+    if let data {
+        let buffers = UnsafeMutableAudioBufferListPointer(data)
+        for index in 0..<buffers.count {
+            let buffer = buffers[index]
+            if let address = buffer.mData, buffer.mDataByteSize > 0 {
+                memset(address, 0, Int(buffer.mDataByteSize))
+            }
+        }
+    }
+    actionFlags.pointee.formUnion(AudioUnitRenderActionFlags(rawValue: 1 << 4))
+    return noErr
 }

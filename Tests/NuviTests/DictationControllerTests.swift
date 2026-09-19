@@ -27,6 +27,39 @@ final class DictationControllerTests: XCTestCase {
         controller.cancel()
     }
 
+    func testStartSnapshotsAudioDuckingBeforePermissionAwaits() async {
+        let audio = FakeAudioCapture()
+        audio.holdPermission = true
+        let engine = FakeEngine()
+        var requestedDucking = true
+        let controller = DictationController(
+            audio: audio,
+            engine: engine,
+            history: HistoryStore(),
+            vocabulary: VocabularyStore(),
+            modes: ModesStore(),
+            textInjector: FakeTextInjector(),
+            duckAudioDuringDictation: { requestedDucking }
+        )
+
+        controller.start()
+        await waitUntil { audio.permissionRequestCount == 1 }
+        requestedDucking = false
+        audio.releasePermission()
+        await waitUntil { controller.state == .listening }
+
+        XCTAssertEqual(audio.configurations, [AudioCaptureConfiguration(duckOtherAudio: true)])
+        controller.cancel()
+    }
+
+    func testAudioCaptureConvenienceStartDefaultsToNonDuckingConfiguration() throws {
+        let audio = FakeAudioCapture()
+        _ = try audio.start()
+
+        XCTAssertEqual(audio.configurations, [AudioCaptureConfiguration(duckOtherAudio: false)])
+        audio.stop()
+    }
+
 
     func testMicrophoneInUseShowsSpecificError() async throws {
         let audio = FakeAudioCapture()
@@ -698,100 +731,6 @@ final class DictationControllerTests: XCTestCase {
         XCTAssertEqual(controller.state, .inserted)
     }
 
-    func testAudioDuckingTriggeredOnStartAndRestoredOnStop() async throws {
-        let audio = FakeAudioCapture()
-        let engine = FakeEngine()
-        let fakeDucker = FakeAudioDucker()
-        let controller = DictationController(
-            audio: audio,
-            engine: engine,
-            history: HistoryStore(),
-            vocabulary: VocabularyStore(),
-            modes: ModesStore(),
-            textInjector: FakeTextInjector(),
-            duckAudioDuringDictation: { true },
-            ducker: fakeDucker
-        )
-
-        controller.start()
-        await waitUntil { controller.state == .listening }
-        XCTAssertEqual(fakeDucker.duckCount, 1)
-        XCTAssertEqual(fakeDucker.restoreCount, 0)
-
-        controller.stop()
-        await waitUntil { controller.state == .transcribing }
-        XCTAssertEqual(fakeDucker.restoreCount, 1)
-
-        controller.cancel()
-    }
-
-    func testAudioDuckingRestoredOnCancel() async throws {
-        let audio = FakeAudioCapture()
-        let engine = FakeEngine()
-        let fakeDucker = FakeAudioDucker()
-        let controller = DictationController(
-            audio: audio,
-            engine: engine,
-            history: HistoryStore(),
-            vocabulary: VocabularyStore(),
-            modes: ModesStore(),
-            textInjector: FakeTextInjector(),
-            duckAudioDuringDictation: { true },
-            ducker: fakeDucker
-        )
-
-        controller.start()
-        await waitUntil { controller.state == .listening }
-        XCTAssertEqual(fakeDucker.duckCount, 1)
-
-        controller.cancel()
-        XCTAssertEqual(fakeDucker.restoreCount, 1)
-    }
-
-    func testAudioDuckingRestoredOnFailure() async throws {
-        let audio = FakeAudioCapture()
-        let engine = FakeEngine()
-        engine.prepareError = FakeError.prepareFailed
-        let fakeDucker = FakeAudioDucker()
-        let controller = DictationController(
-            audio: audio,
-            engine: engine,
-            history: HistoryStore(),
-            vocabulary: VocabularyStore(),
-            modes: ModesStore(),
-            textInjector: FakeTextInjector(),
-            duckAudioDuringDictation: { true },
-            ducker: fakeDucker
-        )
-
-        controller.start()
-        await waitUntil { if case .error = controller.state { return true }; return false }
-        XCTAssertEqual(fakeDucker.duckCount, 1)
-        XCTAssertEqual(fakeDucker.restoreCount, 1)
-    }
-
-    func testAudioDuckingRespectsDisabledSetting() async throws {
-        let audio = FakeAudioCapture()
-        let engine = FakeEngine()
-        let fakeDucker = FakeAudioDucker()
-        let controller = DictationController(
-            audio: audio,
-            engine: engine,
-            history: HistoryStore(),
-            vocabulary: VocabularyStore(),
-            modes: ModesStore(),
-            textInjector: FakeTextInjector(),
-            duckAudioDuringDictation: { false },
-            ducker: fakeDucker
-        )
-
-        controller.start()
-        await waitUntil { controller.state == .listening }
-        XCTAssertEqual(fakeDucker.duckCount, 0)
-
-        controller.cancel()
-    }
-
     private func yieldUntil(_ predicate: @escaping @MainActor () -> Bool) async {
         for _ in 0..<1_000 where !predicate() {
             await Task.yield()
@@ -809,40 +748,37 @@ private enum FakeError: Error {
     case prepareFailed
 }
 
-private final class FakeAudioDucker: AudioDucking, @unchecked Sendable {
-    private let lock = NSLock()
-    private(set) var duckCount = 0
-    private(set) var restoreCount = 0
-
-    func duck() {
-        lock.lock()
-        defer { lock.unlock() }
-        duckCount += 1
-    }
-
-    func restore() {
-        lock.lock()
-        defer { lock.unlock() }
-        restoreCount += 1
-    }
-}
-
 private final class FakeAudioCapture: AudioCapturing, @unchecked Sendable {
     var onLevel: (@Sendable (Float) -> Void)?
     var onSpectrum: (@Sendable (AudioSpectrum) -> Void)?
     var permission = true
     var startError: Error?
+    var holdPermission = false
     private(set) var permissionRequestCount = 0
     private(set) var startCount = 0
+    private(set) var configurations: [AudioCaptureConfiguration] = []
     private var continuation: AsyncStream<AVAudioPCMBuffer>.Continuation?
+    private var permissionContinuation: CheckedContinuation<Bool, Never>?
 
     func requestPermission() async -> Bool {
         permissionRequestCount += 1
+        if holdPermission {
+            return await withCheckedContinuation { continuation in
+                permissionContinuation = continuation
+            }
+        }
         return permission
     }
 
-    func start() throws -> AsyncStream<AVAudioPCMBuffer> {
+    func releasePermission() {
+        holdPermission = false
+        permissionContinuation?.resume(returning: permission)
+        permissionContinuation = nil
+    }
+
+    func start(configuration: AudioCaptureConfiguration) throws -> AsyncStream<AVAudioPCMBuffer> {
         startCount += 1
+        configurations.append(configuration)
         if let startError { throw startError }
         let pair = AsyncStream<AVAudioPCMBuffer>.makeStream()
         continuation = pair.continuation

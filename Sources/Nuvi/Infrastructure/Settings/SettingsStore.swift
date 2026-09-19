@@ -1,5 +1,4 @@
 import Foundation
-import SwiftUI
 
 
 extension Notification.Name {
@@ -95,7 +94,16 @@ public final class SettingsStore: @unchecked Sendable {
         set { defaults.set(newValue, forKey: Keys.soundEffects) }
     }
 
-    @AppStorage("duckAudioDuringDictation") public var duckAudioDuringDictation: Bool = true
+    /// Routes other audio through macOS VoiceProcessingIO ducking while a
+    /// dictation capture is active. This never changes the system output volume.
+    public var duckAudioDuringDictation: Bool {
+        get { defaults.object(forKey: Keys.duckAudioDuringDictation) as? Bool ?? true }
+        set {
+            guard newValue != duckAudioDuringDictation else { return }
+            defaults.set(newValue, forKey: Keys.duckAudioDuringDictation)
+            notifyOutputPreferencesChanged()
+        }
+    }
 
     /// Keeps the floating transcription pill available by default, while
     /// allowing users who prefer a menu-bar-only workflow to suppress it.

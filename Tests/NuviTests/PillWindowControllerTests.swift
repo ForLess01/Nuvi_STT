@@ -259,7 +259,7 @@ private final class TestAudioCapture: AudioCapturing, @unchecked Sendable {
     var onLevel: (@Sendable (Float) -> Void)?
     var onSpectrum: (@Sendable (AudioSpectrum) -> Void)?
     func requestPermission() async -> Bool { true }
-    func start() throws -> AsyncStream<AVAudioPCMBuffer> {
+    func start(configuration: AudioCaptureConfiguration) throws -> AsyncStream<AVAudioPCMBuffer> {
         AsyncStream { $0.finish() }
     }
     func stop() {}

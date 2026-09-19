@@ -92,6 +92,29 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertEqual(SettingsStore(defaults: defaults).dictationDeliveryMode, .live)
     }
 
+    func testAudioDuckingDefaultsToTruePersistsThroughInjectedDefaultsAndNotifies() {
+        let suite = "NuviTests.AudioDucking.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = SettingsStore(defaults: defaults)
+
+        XCTAssertTrue(store.duckAudioDuringDictation)
+        let changed = expectation(description: "audio preferences changed")
+        let observer = NotificationCenter.default.addObserver(
+            forName: .nuviOutputPreferencesDidChange,
+            object: store,
+            queue: nil
+        ) { _ in
+            changed.fulfill()
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+
+        store.duckAudioDuringDictation = false
+
+        wait(for: [changed], timeout: 0.1)
+        XCTAssertFalse(SettingsStore(defaults: defaults).duckAudioDuringDictation)
+    }
+
     func testOutputPreferenceChangesNotifyOtherConfigurationSurfaces() {
         let suite = "NuviTests.OutputPreferences.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!

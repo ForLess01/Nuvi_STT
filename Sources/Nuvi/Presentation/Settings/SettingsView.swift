@@ -918,10 +918,18 @@ private struct SoundPanel: View {
 
             SectionHeader(text: tr("Audio Ducking", "Atenuación de audio"))
             Card {
-                SettingRow(title: tr("Duck system audio", "Atenuar audio del sistema"),
-                           subtitle: tr("Smoothly lowers system volume while dictating and restores it when finished", "Baja suavemente el volumen del sistema al dictar y lo restablece al terminar")) {
-                    Toggle("", isOn: $duckAudio).labelsHidden()
-                        .onChange(of: duckAudio) { _, new in SettingsStore.shared.duckAudioDuringDictation = new }
+                SettingRow(
+                    title: tr("Duck other audio", "Atenuar otros audios"),
+                    subtitle: tr(
+                        "Temporarily lowers other audio through macOS while dictating; system volume is not changed",
+                        "Reduce temporalmente otros audios mediante macOS mientras dictás; no modifica el volumen del sistema"
+                    )
+                ) {
+                    Toggle("", isOn: $duckAudio)
+                        .labelsHidden()
+                        .onChange(of: duckAudio) { _, new in
+                            SettingsStore.shared.duckAudioDuringDictation = new
+                        }
                 }
             }
 
@@ -932,6 +940,9 @@ private struct SoundPanel: View {
                     SoundPresetRow(event: event)
                 }
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .nuviOutputPreferencesDidChange)) { _ in
+            duckAudio = SettingsStore.shared.duckAudioDuringDictation
         }
     }
 }

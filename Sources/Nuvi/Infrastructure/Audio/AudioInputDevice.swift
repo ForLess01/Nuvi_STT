@@ -10,6 +10,12 @@ import AVFoundation
 /// mic is released. Capturing from the BUILT-IN microphone instead leaves the
 /// headset in A2DP, so playback is never degraded.
 enum AudioInputDevice {
+    struct OutputState: Equatable, Sendable {
+        let deviceID: AudioDeviceID
+        let volume: Float32?
+        let muted: Bool?
+    }
+
     /// A selectable capture device (anything with input channels).
     struct Device: Identifiable, Hashable, Sendable {
         let id: AudioDeviceID
@@ -62,6 +68,68 @@ enum AudioInputDevice {
         var size = UInt32(MemoryLayout<AudioDeviceID>.size)
         let status = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &device)
         return (status == noErr && device != AudioDeviceID(kAudioObjectUnknown)) ? device : nil
+    }
+
+    /// The system's current default output device, read without changing it.
+    static func defaultOutputDeviceID() -> AudioDeviceID? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var device: AudioDeviceID = 0
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let status = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &device)
+        return (status == noErr && device != AudioDeviceID(kAudioObjectUnknown)) ? device : nil
+    }
+
+    /// Reads the current output controls without changing the default device,
+    /// volume, or mute state. This is diagnostic-only evidence for the native
+    /// ducking probe; ducking itself is owned by VoiceProcessingIO.
+    static func currentOutputState() -> OutputState? {
+        guard let deviceID = defaultOutputDeviceID() else { return nil }
+
+        var volumeAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyVolumeScalar,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var volume: Float32 = 0
+        var volumeSize = UInt32(MemoryLayout<Float32>.size)
+        let volumeStatus = AudioObjectGetPropertyData(
+            deviceID,
+            &volumeAddress,
+            0,
+            nil,
+            &volumeSize,
+            &volume
+        )
+
+        var muteAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyMute,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var mute: UInt32 = 0
+        var muteSize = UInt32(MemoryLayout<UInt32>.size)
+        let muteStatus = AudioObjectGetPropertyData(
+            deviceID,
+            &muteAddress,
+            0,
+            nil,
+            &muteSize,
+            &mute
+        )
+
+        return OutputState(
+            deviceID: deviceID,
+            volume: volumeStatus == noErr && volumeSize >= UInt32(MemoryLayout<Float32>.size)
+                ? volume
+                : nil,
+            muted: muteStatus == noErr && muteSize >= UInt32(MemoryLayout<UInt32>.size)
+                ? mute != 0
+                : nil
+        )
     }
 
     /// Points an AVAudioEngine's input node at a specific device. Must be called

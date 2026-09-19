@@ -28,6 +28,9 @@ public extension NuviError {
     static func micUnavailable(_ reason: String) -> NuviError { NuviError("NUVI-A03", reason) }
     static let captureFailed       = NuviError("NUVI-A04", "Could not start microphone capture")
     static let noAudioReceived     = NuviError("NUVI-A05", "No audio reached Nuvi from the microphone")
+    static func nativeDuckingUnavailable(_ reason: String) -> NuviError {
+        NuviError("NUVI-A06", reason)
+    }
 
     // MARK: Transcription (T)
     static func unsupportedLocale(_ id: String) -> NuviError { NuviError("NUVI-T01", "Language not supported: \(id)") }
