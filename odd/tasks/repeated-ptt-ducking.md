@@ -31,7 +31,7 @@ This repository baseline is `f812d32` (`v2.2.0`, build 5 metadata); the worktree
 
 ## Tasks
 
-- [ ] **T1 — Prove and fix unresolved native teardown overlap.** Add the failure-injection regression first, run it against baseline and record RED, implement the smallest lifecycle/quarantine fix, extend the opt-in hardware probe to two sequential cycles, then run the regression GREEN and all required checks. Route: delegated. Acceptance: criteria 1–6. Estimated authored delta: under 400 lines. Commit and evidence: pending.
+- [ ] **T1 — Prove and fix unresolved native teardown overlap.** Add the failure-injection regression first, run it against baseline and record RED, implement the smallest lifecycle/quarantine fix, extend the opt-in hardware probe to two sequential cycles, then run the regression GREEN and all required checks. Route: delegated. Acceptance: criteria 1–6. Estimated authored delta: under 400 lines. Work-unit commit: `bbe842e03d2cee5217dc05f16d30052b84ec9e05` (`fix(audio): prevent VPIO overlap after failed cleanup`). Task remains partial pending full-suite crash investigation and user-owned live QA.
 
 ## Verification
 
@@ -54,11 +54,12 @@ This repository baseline is `f812d32` (`v2.2.0`, build 5 metadata); the worktree
 - Unarmed probe guard: `NUVI_RUN_NATIVE_DUCKING_PROBE=0 swift test --filter NativeAudioDuckingProbeTests/testPreauthorizedNativeDuckingCaptureDeliversFrames` skipped before permission access (1 skipped, 0 failures). The real probe was not run.
 - Full `swift test` is partial: after the audio backend suite passed, `xctest` exited with signal code 5 at `SpeechAnalyzerEngineTests/testAnalyzerInputQueueCountsDropsAndPreservesOldestSlices`; the same filtered test also exited with signal code 5, while the sibling locale-only test passed. This test/source is unchanged by this feature; cause and baseline behavior are unverified.
 - `git diff --check` passed.
-- Commit and Engram mirror: pending. Physical music/PTT QA remains user-owned and unrun.
+- Work-unit commit: `bbe842e03d2cee5217dc05f16d30052b84ec9e05` (`fix(audio): prevent VPIO overlap after failed cleanup`) on `codex/repeated-ptt-ducking`.
+- Engram mirror remains pending because multiple active runtime sessions matched and no authoritative session ID was available. Physical music/PTT QA remains user-owned and unrun.
 
 ## Next step
 
-Review the final diff, run the required native assessment/review gates, and complete the work-unit commit if they permit. Report the full-suite signal-5 failure as unresolved; do not claim physical attenuation or live audio validation.
+Obtain the parent’s committed-range assessment and independent investigation of the full-suite signal-5 failure. Keep task status partial until required checks are resolved; manual music/PTT QA remains user-owned.
 
 ## Relevant files
 
