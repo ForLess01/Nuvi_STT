@@ -32,7 +32,7 @@ This repository baseline is `f812d32` (`v2.2.0`, build 5 metadata); the worktree
 ## Tasks
 
 - [ ] **T1 — Prove and fix unresolved native teardown overlap.** Add the failure-injection regression first, run it against baseline and record RED, implement the lifecycle/quarantine fix, extend the opt-in hardware probe to two sequential cycles, then run the regression GREEN and required checks. Route: delegated. Acceptance: criteria 1–6. Work-unit commit: `bbe842e03d2cee5217dc05f16d30052b84ec9e05` (`fix(audio): prevent VPIO overlap after failed cleanup`). Implementation and focused tests passed; full-suite signal-5 and user-owned live QA remain pending.
-- [ ] **T2 — Allow capture after disposed-unit listener cleanup failure.** Add a regression first for failed route-listener removal after AudioUnit disposal, observe RED, then allow admission only when quarantined AudioUnits are disposed and capacity remains; preserve blocking for unresolved native teardown. Run focused/backend/full tests, release build, and diff check. Route: delegated correction. Acceptance: criterion 3 and preservation of criteria 1–6. Rollback boundary: reverting only T2 restores the previous blanket admission gate while retaining T1's stop retry and unresolved-teardown protection. Work-unit commit: pending.
+- [ ] **T2 — Allow capture after disposed-unit listener cleanup failure.** Add a regression first for failed route-listener removal after AudioUnit disposal, observe RED, then allow admission only when quarantined AudioUnits are disposed and capacity remains; preserve blocking for unresolved native teardown. Run focused/backend/full tests, release build, and diff check. Route: delegated correction. Acceptance: criterion 3 and preservation of criteria 1–6. Rollback boundary: reverting only T2 restores the previous blanket admission gate while retaining T1's stop retry and unresolved-teardown protection. Work-unit commit: `2fd878474c4b2c103758f7deb2a3f510008caa26` (`fix(audio): admit capture after disposed listener failures`).
 
 ## Verification
 
@@ -64,7 +64,7 @@ This repository baseline is `f812d32` (`v2.2.0`, build 5 metadata); the worktree
 - Follow-up full `swift test` remains partial: XCTest exited with signal code 5 at `SpeechAnalyzerEngineTests/testAnalyzerInputQueueCountsDropsAndPreservesOldestSlices`. The parent independently confirmed this same failure on baseline `f812d32`. The verifier's separate HistoryMenu failure was not reproduced: `HistoryMenuTests` passed 16/16 on the candidate and 16/16 on a local source archive of baseline `f812d32` with package resolution and update disabled.
 - Follow-up `swift build -c release` passed (`Build complete!`); this run did not reproduce the verifier's reported `dsymutil` permission failure. `git diff --check` passed after the task-document update.
 - Follow-up probe guard: `NUVI_RUN_NATIVE_DUCKING_PROBE=0 swift test --filter NativeAudioDuckingProbeTests/testPreauthorizedNativeDuckingCaptureDeliversFrames` skipped before any permission access (1 skipped, 0 failures). Physical probe remains unrun.
-- Follow-up commit: pending. Native audio probe remains unrun, and manual music/PTT QA remains user-owned.
+- Follow-up work-unit commit: `2fd878474c4b2c103758f7deb2a3f510008caa26` (`fix(audio): admit capture after disposed listener failures`) on `codex/repeated-ptt-ducking`. Native audio probe remains unrun, and manual music/PTT QA remains user-owned.
 
 ## Next step
 
