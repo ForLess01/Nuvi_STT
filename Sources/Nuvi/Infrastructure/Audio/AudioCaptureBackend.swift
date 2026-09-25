@@ -782,6 +782,10 @@ internal final class NativeAudioUnitLifecycle: AudioUnitLifecycle, @unchecked Se
         }
     }
 
+    var isAudioUnitDisposed: Bool {
+        withControlLock { lifecycleState == .disposed }
+    }
+
     func retryCleanupFromQuarantine() {
         withControlLock {
             guard !isFullyReleased else { return }
@@ -833,9 +837,20 @@ internal final class NativeAudioUnitFailureQuarantine: @unchecked Sendable {
 
     func acquireCaptureSlot() -> Bool {
         retryAll()
+
+        lock.lock()
+        let snapshot = entries.map(\.lifecycle)
+        lock.unlock()
+
+        // A failed listener removal can outlive an already-disposed AudioUnit.
+        // Keep that inactive registration quarantined and capacity-bounded,
+        // but do not treat it as an overlapping capture lifecycle.
+        guard snapshot.allSatisfy(\.isAudioUnitDisposed) else { return false }
+
         lock.lock()
         defer { lock.unlock() }
-        guard entries.isEmpty, entries.count + reservations < capacity else { return false }
+        guard entries.map(\.lifecycle).elementsEqual(snapshot, by: { $0 === $1 }),
+              entries.count + reservations < capacity else { return false }
         reservations += 1
         return true
     }

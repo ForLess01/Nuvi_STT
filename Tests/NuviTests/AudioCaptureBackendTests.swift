@@ -522,6 +522,59 @@ final class AudioCaptureBackendTests: XCTestCase {
         recoveredBackend.cleanup()
     }
 
+    func testDisposedUnitWithFailedListenerRemovalDoesNotBlockNextCapture() throws {
+        let operations = RecordingNativeOperations()
+        let factory = NativeAudioCaptureBackendFactory(
+            operations: operations,
+            devices: TestAudioDeviceProvider(outputDevice: 202)
+        )
+        let backend = try factory.makeBackend(
+            configuration: AudioCaptureConfiguration(duckOtherAudio: true),
+            inputDevice: 101
+        )
+        let (_, continuation) = AsyncStream<AVAudioPCMBuffer>.makeStream()
+        let session = AudioCaptureSession(
+            lifecycle: backend.lifecycle,
+            format: backend.captureFormat,
+            continuation: continuation,
+            levelHandler: nil,
+            usesBluetoothInput: backend.usesBluetoothInput,
+            ring: AudioChunkRing(
+                maxFrames: Int(backend.maximumFramesPerSlice),
+                channelCount: backend.captureChannelCount
+            )
+        )
+        try backend.installCallbacks(for: session)
+        XCTAssertFalse(operations.addedListeners.isEmpty)
+
+        operations.removeListenerStatus = -10879
+        backend.cleanup()
+        XCTAssertEqual(backend.lifecycle.cleanupStatus.dispose, noErr)
+        XCTAssertGreaterThan(backend.lifecycle.cleanupStatus.failedListenerRemovals, 0)
+
+        defer {
+            operations.removeListenerStatus = noErr
+            NativeAudioUnitFailureQuarantine.retryAllForTesting()
+        }
+
+        let nextOperations = RecordingNativeOperations()
+        let nextFactory = NativeAudioCaptureBackendFactory(
+            operations: nextOperations,
+            devices: TestAudioDeviceProvider(outputDevice: 202)
+        )
+        do {
+            let nextBackend = try nextFactory.makeBackend(
+                configuration: AudioCaptureConfiguration(duckOtherAudio: false),
+                inputDevice: 101
+            )
+            XCTAssertEqual(nextBackend.kind, .hal)
+            XCTAssertEqual(nextOperations.createdSubtypes, [UInt32(kAudioUnitSubType_HALOutput)])
+            nextBackend.cleanup()
+        } catch {
+            XCTFail("A disposed unit with only a listener-removal failure must not block HAL capture: \(error)")
+        }
+    }
+
     func testVPIORouteChangeRunsExistingSessionCleanupAndStopsListening() async throws {
         let operations = RecordingNativeOperations()
         let factory = NativeAudioCaptureBackendFactory(
