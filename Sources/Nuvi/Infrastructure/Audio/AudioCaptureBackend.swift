@@ -663,7 +663,7 @@ internal final class NativeAudioUnitLifecycle: AudioUnitLifecycle, @unchecked Se
     private func stopLocked() -> OSStatus {
         if lifecycleState == .disposed { return noErr }
         if stopStatus == noErr { return noErr }
-        if lifecycleState == .uninitialized || lifecycleState == .disposePending {
+        if lifecycleState == .uninitialized || (lifecycleState == .disposePending && uninitializeStatus == noErr) {
             return stopStatus ?? Self.lifecycleClosedStatus
         }
 
@@ -790,7 +790,7 @@ internal final class NativeAudioUnitLifecycle: AudioUnitLifecycle, @unchecked Se
                 return
             }
             quarantineRetryAttempts += 1
-            if let stopStatus, stopStatus != noErr, lifecycleState != .uninitialized, lifecycleState != .disposePending {
+            if let stopStatus, stopStatus != noErr, uninitializeStatus != noErr, lifecycleState != .uninitialized {
                 _ = stopLocked()
             }
             if let uninitializeStatus, uninitializeStatus != noErr {
@@ -835,7 +835,7 @@ internal final class NativeAudioUnitFailureQuarantine: @unchecked Sendable {
         retryAll()
         lock.lock()
         defer { lock.unlock() }
-        guard entries.count + reservations < capacity else { return false }
+        guard entries.isEmpty, entries.count + reservations < capacity else { return false }
         reservations += 1
         return true
     }

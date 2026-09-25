@@ -466,6 +466,62 @@ final class AudioCaptureBackendTests: XCTestCase {
         XCTAssertEqual(operations.disposeCount, 2)
     }
 
+    func testRepeatedCaptureWaitsForNativeTeardownAndRetriesStop() throws {
+        let operations = RecordingNativeOperations()
+        operations.stopStatus = -10879
+        operations.uninitializeStatus = -10879
+        operations.disposeStatus = -10879
+        let backend = try NativeAudioCaptureBackendFactory(
+            operations: operations,
+            devices: TestAudioDeviceProvider(outputDevice: 202)
+        ).makeBackend(
+            configuration: AudioCaptureConfiguration(duckOtherAudio: true),
+            inputDevice: 101
+        )
+
+        backend.cleanup()
+        XCTAssertEqual(backend.lifecycle.cleanupStatus.stop, -10879)
+        XCTAssertEqual(backend.lifecycle.cleanupStatus.uninitialize, -10879)
+        XCTAssertEqual(backend.lifecycle.cleanupStatus.dispose, -10879)
+
+        let nextOperations = RecordingNativeOperations()
+        let nextFactory = NativeAudioCaptureBackendFactory(
+            operations: nextOperations,
+            devices: TestAudioDeviceProvider(outputDevice: 202)
+        )
+        do {
+            let overlappingBackend = try nextFactory.makeBackend(
+                configuration: AudioCaptureConfiguration(duckOtherAudio: true),
+                inputDevice: 101
+            )
+            overlappingBackend.cleanup()
+            XCTFail("A new VPIO capture must wait for the previous unit's teardown")
+        } catch let error as AudioCaptureError {
+            guard case let .nativeDuckingUnavailable(reason) = error else {
+                return XCTFail("Expected native teardown to block ducking capture, got \(error)")
+            }
+            XCTAssertTrue(reason.contains("cleanup"))
+        }
+        XCTAssertTrue(nextOperations.createdSubtypes.isEmpty)
+        XCTAssertEqual(operations.stopCount, 2, "Quarantine retry should retry the failed stop before uninitializing")
+
+        operations.stopStatus = noErr
+        NativeAudioUnitFailureQuarantine.retryAllForTesting()
+        XCTAssertEqual(operations.stopCount, 3, "A later cleanup retry should stop the unit before retrying uninitialize")
+
+        operations.uninitializeStatus = noErr
+        operations.disposeStatus = noErr
+        NativeAudioUnitFailureQuarantine.retryAllForTesting()
+        XCTAssertEqual(backend.lifecycle.cleanupStatus, .successful)
+
+        let recoveredBackend = try nextFactory.makeBackend(
+            configuration: AudioCaptureConfiguration(duckOtherAudio: true),
+            inputDevice: 101
+        )
+        XCTAssertEqual(nextOperations.createdSubtypes, [UInt32(kAudioUnitSubType_VoiceProcessingIO)])
+        recoveredBackend.cleanup()
+    }
+
     func testVPIORouteChangeRunsExistingSessionCleanupAndStopsListening() async throws {
         let operations = RecordingNativeOperations()
         let factory = NativeAudioCaptureBackendFactory(
