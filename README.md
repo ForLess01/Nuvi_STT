@@ -22,7 +22,7 @@ Built purely in Swift, AppKit, SwiftUI, AVFoundation, and Metal. No Electron. No
   <img src="docs/assets/releases/v2.1.0/menubar-status.gif" alt="Nuvi v2.1 menu-bar status" width="100%">
 </p>
 
-See the complete [Nuvi v2.1.0 release notes](docs/releases/v2.1.0.md).
+See the complete [Nuvi v2.2.1 fix release notes](docs/releases/v2.2.1.md).
 
 ## Quick Install
 
