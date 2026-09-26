@@ -42,9 +42,11 @@ brew install --cask nuvi
   <img src="Resources/NUVI_STT.gif" alt="Nuvi Demo" width="100%">
 </p>
 
-## Verified status
+## Historical verification status
 
-Verified in this repository on **2026-08-14**:
+Last verified in this repository on **2026-08-14**. This is historical evidence
+that predates Nuvi 2.2.1 and does **not** establish verification of the 2.2.1
+candidate:
 
 - `swift test` ✅ 117 tests, 0 failures (2 opt-in runtime probes skipped)
 - Release bundle ✅ built, signed, installed, and matched byte-for-byte with the

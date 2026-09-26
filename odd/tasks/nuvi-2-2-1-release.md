@@ -46,8 +46,8 @@ Estimated authored diff: approximately 130 additions plus deletions, excluding g
 |---|---|---|---|
 | R221-1 | Confirm clean baseline and create the release branch and this tracking document before source edits. | Complete | Baseline `2ea75d10e9a2d930078b5ae4b47b717585e015c4`; branch `codex/release-nuvi-2-2-1`. |
 | R221-2 | Set bundle version/build to 2.2.1 (6) and update the README's current release-notes link. | Complete | `Resources/Info.plist` identifies 2.2.1 (6); `README.md` links to `docs/releases/v2.2.1.md`. |
-| R221-3 | Add accurate 2.2.1 fix-release notes and explicit validation limits. | Complete | Notes describe listener/native cleanup recovery and explicitly exclude independent physical microphone/PTT/audio-route QA. |
-| R221-4 | Run the required checks, build the local app/ZIP, and record identity, signature, contents, hash, and provenance. | Complete with caveats | Results are recorded below. The full test command exits 1 and signature trust is not verified; no publication is authorized. |
+| R221-3 | Add accurate 2.2.1 fix-release notes and explicit validation limits. | Complete with review correction | Notes scope overlap prevention to serialized PTT capture, describe failed listener removal after AudioUnit disposal, and do not present quarantine removal as a trust fix. |
+| R221-4 | Run the required checks, build the local app/ZIP, and record identity, signature, contents, hash, and provenance. | Blocked for publication | The previous local artifact predates the final documentation correction; strict signature/Gatekeeper checks fail and the test suite exits 1. Rebuild from the immutable final source commit and reverify before any publication. |
 | R221-5 | Review the final diff, commit the coherent local work unit, and record the commit identity. | Complete | Work-unit commit `f4b163edfd4d04763a9045a4401869088b48fa0d`; no push or publication. |
 
 ## Verification results
@@ -63,10 +63,17 @@ Estimated authored diff: approximately 130 additions plus deletions, excluding g
 - `git diff --cached --check`: PASS. Post-commit `git status --short --branch`: clean on `codex/release-nuvi-2-2-1`.
 - Work-unit commit: `f4b163edfd4d04763a9045a4401869088b48fa0d` — `fix(release): prepare Nuvi 2.2.1 fix release`.
 
+## Independent review correction and provenance blocker
+
+- The review found that the original notes overstated non-overlap beyond the serialized PTT flow and incorrectly described a callback arriving for a disposed listener. The notes now scope the guarantee to serialized PTT and describe route-listener removal failure persisting after AudioUnit disposal.
+- The original quarantine-removal command could be read as a remedy for the candidate's trust failure. It has been removed; the notes now state that quarantine removal does not resolve `CSSMERR_TP_NOT_TRUSTED` or the Gatekeeper assessment error.
+- The README's 2026-08-14 verification is explicitly historical and is not evidence for 2.2.1.
+- `/Users/rendoaltar/Nuvi/build/Nuvi.app` and `/Users/rendoaltar/Nuvi/build/Nuvi.zip` were built before this correction, from commit `f4b163edfd4d04763a9045a4401869088b48fa0d`. The recorded ZIP hash is historical and must not be used for publication. After the final documentation/source commit is immutable, rebuild and reverify the app, ZIP, signature status, and hash before any publication decision. Do not claim the current artifact is ready.
+
 ## Persistence status
 
 The full-document Engram mirror at `odd/nuvi-2-2-1-release/tasks` is pending. Engram rejected the save because multiple active runtime sessions matched this project and directory; no session ID was available to disambiguate safely. Do not attach this artifact to an invented or guessed session. The local task document remains the progress source for this run.
 
 ## Next step
 
-The local preparation is committed. Preserve the test-suite failure and untrusted signature as blockers for any publication decision; remote release, Homebrew, push, tag, and PR actions remain unauthorized.
+The documentation correction is pending commit. The existing package is not ready or valid for publication; rebuild and reverify from the immutable final source commit, then resolve test/signature blockers. Remote release, Homebrew, push, tag, and PR actions remain unauthorized.
