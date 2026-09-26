@@ -68,6 +68,7 @@ Estimated authored diff: approximately 130 additions plus deletions, excluding g
 - The review found that the original notes overstated non-overlap beyond the serialized PTT flow and incorrectly described a callback arriving for a disposed listener. The notes now scope the guarantee to serialized PTT and describe route-listener removal failure persisting after AudioUnit disposal.
 - The original quarantine-removal command could be read as a remedy for the candidate's trust failure. It has been removed; the notes now state that quarantine removal does not resolve `CSSMERR_TP_NOT_TRUSTED` or the Gatekeeper assessment error.
 - The README's 2026-08-14 verification is explicitly historical and is not evidence for 2.2.1.
+- Documentation correction commit: `be421e0ad49f9cf30ebaaea8b5c26f147c394bf7` — `docs(release): correct Nuvi 2.2.1 candidate notes`.
 - `/Users/rendoaltar/Nuvi/build/Nuvi.app` and `/Users/rendoaltar/Nuvi/build/Nuvi.zip` were built before this correction, from commit `f4b163edfd4d04763a9045a4401869088b48fa0d`. The recorded ZIP hash is historical and must not be used for publication. After the final documentation/source commit is immutable, rebuild and reverify the app, ZIP, signature status, and hash before any publication decision. Do not claim the current artifact is ready.
 
 ## Persistence status
@@ -76,4 +77,4 @@ The full-document Engram mirror at `odd/nuvi-2-2-1-release/tasks` is pending. En
 
 ## Next step
 
-The documentation correction is pending commit. The existing package is not ready or valid for publication; rebuild and reverify from the immutable final source commit, then resolve test/signature blockers. Remote release, Homebrew, push, tag, and PR actions remain unauthorized.
+The documentation correction is committed. The existing package is not ready or valid for publication; rebuild and reverify from the immutable final source commit, then resolve test/signature blockers. Remote release, Homebrew, push, tag, and PR actions remain unauthorized.
