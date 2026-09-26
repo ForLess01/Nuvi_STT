@@ -48,7 +48,7 @@ Estimated authored diff: approximately 130 additions plus deletions, excluding g
 | R221-2 | Set bundle version/build to 2.2.1 (6) and update the README's current release-notes link. | Complete | `Resources/Info.plist` identifies 2.2.1 (6); `README.md` links to `docs/releases/v2.2.1.md`. |
 | R221-3 | Add accurate 2.2.1 fix-release notes and explicit validation limits. | Complete | Notes describe listener/native cleanup recovery and explicitly exclude independent physical microphone/PTT/audio-route QA. |
 | R221-4 | Run the required checks, build the local app/ZIP, and record identity, signature, contents, hash, and provenance. | Complete with caveats | Results are recorded below. The full test command exits 1 and signature trust is not verified; no publication is authorized. |
-| R221-5 | Review the final diff, commit the coherent local work unit, and record the commit identity. | Pending | — |
+| R221-5 | Review the final diff, commit the coherent local work unit, and record the commit identity. | Complete | Work-unit commit `f4b163edfd4d04763a9045a4401869088b48fa0d`; no push or publication. |
 
 ## Verification results
 
@@ -60,7 +60,8 @@ Estimated authored diff: approximately 130 additions plus deletions, excluding g
 - `codesign --verify --deep --strict --verbose=2 build/Nuvi.app`: FAIL with `CSSMERR_TP_NOT_TRUSTED`. Signature details report authority unavailable. `spctl --assess --type execute --verbose=4 build/Nuvi.app`: FAIL with `internal error in Code Signing subsystem`. The existing signing configuration was not changed; trust/notarization is not claimed.
 - `ditto -c -k --sequesterRsrc --keepParent build/Nuvi.app build/Nuvi.zip`: PASS. `unzip -t` reports no compressed-data errors; archive contains the app bundle paths and 26 `__MACOSX` AppleDouble entries from the documented sequestered-resource flow, with no `.DS_Store` entries. ZIP size: 4,710,296 bytes. SHA-256: `6f2dcf0885238971894c55d3fcfddfacab862b6bae11645ee93bb8f28efaa4fd`.
 - This local artifact was built from the release branch at baseline `2ea75d10e9a2d930078b5ae4b47b717585e015c4` plus the version and documentation changes tracked here; it is not a published or hardware-validated release.
-- `git diff --check` and final repository status remain to be run after staging.
+- `git diff --cached --check`: PASS. Post-commit `git status --short --branch`: clean on `codex/release-nuvi-2-2-1`.
+- Work-unit commit: `f4b163edfd4d04763a9045a4401869088b48fa0d` — `fix(release): prepare Nuvi 2.2.1 fix release`.
 
 ## Persistence status
 
@@ -68,4 +69,4 @@ The full-document Engram mirror at `odd/nuvi-2-2-1-release/tasks` is pending. En
 
 ## Next step
 
-Run final diff/status checks and commit the local source/document/task work unit. Keep the test-suite failure and untrusted signature visible; do not publish.
+The local preparation is committed. Preserve the test-suite failure and untrusted signature as blockers for any publication decision; remote release, Homebrew, push, tag, and PR actions remain unauthorized.
