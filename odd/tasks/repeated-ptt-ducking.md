@@ -65,10 +65,12 @@ This repository baseline is `f812d32` (`v2.2.0`, build 5 metadata); the worktree
 - Follow-up `swift build -c release` passed (`Build complete!`); this run did not reproduce the verifier's reported `dsymutil` permission failure. `git diff --check` passed after the task-document update.
 - Follow-up probe guard: `NUVI_RUN_NATIVE_DUCKING_PROBE=0 swift test --filter NativeAudioDuckingProbeTests/testPreauthorizedNativeDuckingCaptureDeliversFrames` skipped before any permission access (1 skipped, 0 failures). Physical probe remains unrun.
 - Follow-up work-unit commit: `2fd878474c4b2c103758f7deb2a3f510008caa26` (`fix(audio): admit capture after disposed listener failures`) on `codex/repeated-ptt-ducking`. Native audio probe remains unrun, and manual music/PTT QA remains user-owned.
+- Final committed-range assessment: medium risk, 275 changed lines, `review_due=false` (`under_budget`); no native review transaction was started. Independent review found the listener-only blocker corrected and no remaining actionable finding in the single-service PTT flow. Cross-service capture overlap is possible in principle but predates this change and is not evidence of the reported sequential PTT failure.
+- Independent verification on the final candidate passed both focused regressions and all 21 audio backend tests. Its full suite still exited at the baseline-reproduced SpeechAnalyzer signal-5 failure and also observed a HistoryMenu pasteboard failure that did not reproduce in isolated candidate/baseline runs. Its release build hit a `dsymutil` permission error; a parent spot-check reran `swift build -c release` with sufficient local filesystem permission and passed with existing warnings. The worktree remains clean before this final documentation update.
 
 ## Next step
 
-Obtain the parent’s committed-range assessment and independent review of T2. Keep the task partial because the full-suite command still exits with the baseline-confirmed SpeechAnalyzer signal-5 failure and live audio QA remains user-owned.
+Keep the task partial because the full-suite command still exits with the baseline-confirmed SpeechAnalyzer signal-5 failure and live audio QA remains user-owned. The next acceptance step is user-run PTT/music testing with the newly built candidate; the Homebrew-installed 2.2.0 app has not been replaced, so it does not contain this fix.
 
 ## Relevant files
 
