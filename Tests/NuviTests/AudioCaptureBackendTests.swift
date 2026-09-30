@@ -575,18 +575,17 @@ final class AudioCaptureBackendTests: XCTestCase {
         }
     }
 
-    func testVPIORouteChangeRunsExistingSessionCleanupAndStopsListening() async throws {
-        let operations = RecordingNativeOperations()
-        let factory = NativeAudioCaptureBackendFactory(
-            operations: operations,
-            devices: TestAudioDeviceProvider(outputDevice: 202)
-        )
-        let backend = try factory.makeBackend(
-            configuration: AudioCaptureConfiguration(duckOtherAudio: true),
-            inputDevice: 101
-        )
-
-        let (_, continuation) = AsyncStream<AVAudioPCMBuffer>.makeStream()
+    private func routeFixture(
+        operations: RecordingNativeOperations,
+        devices: TestAudioDeviceProvider = TestAudioDeviceProvider(outputDevice: 202)
+    ) throws -> (
+        backend: AudioCaptureBackend,
+        session: AudioCaptureSession,
+        stream: AsyncStream<AVAudioPCMBuffer>
+    ) {
+        let backend = try NativeAudioCaptureBackendFactory(operations: operations, devices: devices)
+            .makeBackend(configuration: AudioCaptureConfiguration(duckOtherAudio: true), inputDevice: 101)
+        let (stream, continuation) = AsyncStream<AVAudioPCMBuffer>.makeStream()
         let session = AudioCaptureSession(
             lifecycle: backend.lifecycle,
             format: backend.captureFormat,
@@ -599,80 +598,156 @@ final class AudioCaptureBackendTests: XCTestCase {
             )
         )
         try backend.installCallbacks(for: session)
-        operations.fireFirstPropertyListener()
-        try await Task.sleep(nanoseconds: 50_000_000)
-
-        XCTAssertEqual(operations.stopCount, 1)
-        XCTAssertEqual(operations.uninitializeCount, 1)
-        XCTAssertEqual(operations.disposeCount, 1)
-        XCTAssertEqual(operations.addedListeners.count, operations.removedListeners.count)
+        return (backend, session, stream)
     }
 
-    func testRouteEventBeforeStartPreventsStartingDisposedSession() async throws {
+    func testRedundantRouteEventBeforeStartPreservesSession() throws {
         let operations = RecordingNativeOperations()
-        let factory = NativeAudioCaptureBackendFactory(
-            operations: operations,
-            devices: TestAudioDeviceProvider(outputDevice: 202)
-        )
-        let backend = try factory.makeBackend(
-            configuration: AudioCaptureConfiguration(duckOtherAudio: true),
-            inputDevice: 101
-        )
-        let (_, continuation) = AsyncStream<AVAudioPCMBuffer>.makeStream()
-        let session = AudioCaptureSession(
-            lifecycle: backend.lifecycle,
-            format: backend.captureFormat,
-            continuation: continuation,
-            levelHandler: nil,
-            usesBluetoothInput: backend.usesBluetoothInput,
-            ring: AudioChunkRing(
-                maxFrames: Int(backend.maximumFramesPerSlice),
-                channelCount: backend.captureChannelCount
-            )
-        )
-        try backend.installCallbacks(for: session)
+        let fixture = try routeFixture(operations: operations)
+        defer { fixture.session.cleanup() }
         operations.fireFirstPropertyListener()
-        try await Task.sleep(nanoseconds: 50_000_000)
-        XCTAssertTrue(session.cleanupRequested)
+        operations.drainRouteQueue()
 
-        XCTAssertThrowsError(try backend.start())
-        XCTAssertEqual(operations.startStatus, noErr)
-        XCTAssertEqual(operations.stopCount, 1)
-        XCTAssertEqual(operations.uninitializeCount, 1)
-        XCTAssertEqual(operations.disposeCount, 1)
+        XCTAssertFalse(fixture.session.cleanupRequested)
+        XCTAssertEqual(operations.disposeCount, 0)
+        XCTAssertNoThrow(try fixture.backend.start())
     }
 
-    func testConcurrentQueuedRouteCallbacksDrainBeforeCleanup() async throws {
+    func testRedundantEventsDuringInitializeAndStartPreserveCapture() throws {
         let operations = RecordingNativeOperations()
-        let factory = NativeAudioCaptureBackendFactory(
-            operations: operations,
-            devices: TestAudioDeviceProvider(outputDevice: 202)
-        )
-        let backend = try factory.makeBackend(
-            configuration: AudioCaptureConfiguration(duckOtherAudio: true),
-            inputDevice: 101
-        )
+        let fixture = try routeFixture(operations: operations)
+        defer { fixture.session.cleanup() }
+        operations.onInitialize = { [weak operations] in operations?.fireFirstPropertyListener() }
+        operations.onStart = { [weak operations] in operations?.fireFirstPropertyListener() }
+        try fixture.backend.start()
+        operations.drainRouteQueue()
 
-        let (_, continuation) = AsyncStream<AVAudioPCMBuffer>.makeStream()
-        let session = AudioCaptureSession(
-            lifecycle: backend.lifecycle,
-            format: backend.captureFormat,
-            continuation: continuation,
-            levelHandler: nil,
-            usesBluetoothInput: backend.usesBluetoothInput,
-            ring: AudioChunkRing(
-                maxFrames: Int(backend.maximumFramesPerSlice),
-                channelCount: backend.captureChannelCount
-            )
-        )
-        try backend.installCallbacks(for: session)
+        XCTAssertFalse(fixture.session.cleanupRequested)
+        XCTAssertEqual(operations.disposeCount, 0)
+        XCTAssertEqual(fixture.backend.diagnostics.effectiveBackend, .voiceProcessingIO)
+    }
+
+    func testRepeatedCompatibleEventsKeepPublishingFrames() async throws {
+        let operations = RecordingNativeOperations()
+        let devices = TestAudioDeviceProvider(outputDevice: 202)
+        let fixture = try routeFixture(operations: operations, devices: devices)
+        defer { fixture.session.cleanup() }
+        try fixture.backend.start()
+        // A different system default alone is compatible if VPIO remains bound
+        // to its accepted devices; a smaller slice fits existing ring storage.
+        devices.outputDevice = 303
+        operations.maximumFramesPerSlice = 256
         operations.firePropertyListenersConcurrently()
-        try await Task.sleep(nanoseconds: 50_000_000)
+        operations.drainRouteQueue()
+        XCTAssertFalse(fixture.session.cleanupRequested)
+        XCTAssertEqual(operations.disposeCount, 0)
+        guard !fixture.session.cleanupRequested else { return }
 
-        XCTAssertEqual(operations.stopCount, 1)
-        XCTAssertEqual(operations.uninitializeCount, 1)
+        var flags = AudioUnitRenderActionFlags(rawValue: 0)
+        var timestamp = AudioTimeStamp()
+        XCTAssertTrue(fixture.session.enterCallback())
+        XCTAssertEqual(fixture.session.render(
+            actionFlags: &flags, timeStamp: &timestamp, busNumber: 1, frames: 16
+        ), noErr)
+        fixture.session.leaveCallback()
+        fixture.session.publishAvailableChunksForTesting()
+        var iterator = fixture.stream.makeAsyncIterator()
+        let buffer = await iterator.next()
+        XCTAssertEqual(buffer?.frameLength, 16)
+        XCTAssertEqual(operations.renderCount, 1)
+    }
+
+    func testIncompatibleRouteEventsCleanOnceAndLateCallbacksDoNotReadDisposedUnit() throws {
+        let changes = [
+            "input", "output", "inputFormat", "outputFormat", "capacity", "zeroCapacity",
+            "deadInput", "deadOutput", "readFailure", "aliveReadFailure"
+        ]
+        for change in changes {
+            let operations = RecordingNativeOperations()
+            let devices = TestAudioDeviceProvider(outputDevice: 202)
+            let fixture = try routeFixture(operations: operations, devices: devices)
+            defer { fixture.session.cleanup() }
+            try fixture.backend.start()
+            switch change {
+            case "input": operations.readbackOverrides[1] = 303
+            case "output": operations.readbackOverrides[0] = 303
+            case "inputFormat": operations.coercedClientElement = 1
+            case "outputFormat": operations.coercedClientElement = 0
+            case "capacity": operations.maximumFramesPerSlice = 1024
+            case "zeroCapacity": operations.maximumFramesPerSlice = 0
+            case "deadInput": devices.aliveOverrides[101] = false
+            case "deadOutput": devices.aliveOverrides[202] = false
+            case "readFailure": operations.getStatus = -10879
+            default: devices.aliveReadFailure = true
+            }
+            operations.firePropertyListenersConcurrently()
+            operations.drainRouteQueue()
+            XCTAssertTrue(fixture.session.cleanupRequested, change)
+            XCTAssertEqual(operations.stopCount, 1, change)
+            XCTAssertEqual(operations.uninitializeCount, 1, change)
+            XCTAssertEqual(operations.disposeCount, 1, change)
+            XCTAssertEqual(operations.addedListeners.count, operations.removedListeners.count, change)
+            let reads = operations.getCount
+            operations.firePropertyListenersConcurrently()
+            operations.drainRouteQueue()
+            XCTAssertEqual(operations.getCount, reads, change)
+            XCTAssertEqual(operations.disposeCount, 1, change)
+            XCTAssertEqual(operations.createdSubtypes, [UInt32(kAudioUnitSubType_VoiceProcessingIO)], change)
+        }
+    }
+
+    func testChangedRouteBeforeStartIsStillRejectedByStartupReadback() throws {
+        let operations = RecordingNativeOperations()
+        let fixture = try routeFixture(operations: operations)
+        defer { fixture.session.cleanup() }
+        operations.readbackOverrides[1] = 303
+        operations.fireFirstPropertyListener()
+        operations.drainRouteQueue()
+        XCTAssertThrowsError(try fixture.backend.start())
+    }
+
+    func testIncompatibleEventDuringStartDoesNotBypassFinalReadback() throws {
+        let operations = RecordingNativeOperations()
+        let fixture = try routeFixture(operations: operations)
+        defer { fixture.session.cleanup() }
+        operations.onStart = { [weak operations] in
+            operations?.readbackOverrides[0] = 303
+            operations?.fireFirstPropertyListener()
+        }
+        XCTAssertThrowsError(try fixture.backend.start()) { error in
+            guard case AudioCaptureError.nativeDuckingUnavailable = error else {
+                return XCTFail("Expected explicit native ducking unavailability, got \(error)")
+            }
+        }
+        operations.drainRouteQueue()
+        XCTAssertTrue(fixture.session.cleanupRequested)
         XCTAssertEqual(operations.disposeCount, 1)
-        XCTAssertEqual(operations.addedListeners.count, operations.removedListeners.count)
+    }
+
+    func testRouteValidationOutlivesFactoryBackendLocalVariable() throws {
+        let operations = RecordingNativeOperations()
+        var backend: AudioCaptureBackend? = try NativeAudioCaptureBackendFactory(
+            operations: operations, devices: TestAudioDeviceProvider(outputDevice: 202)
+        ).makeBackend(configuration: AudioCaptureConfiguration(duckOtherAudio: true), inputDevice: 101)
+        let (_, continuation) = AsyncStream<AVAudioPCMBuffer>.makeStream()
+        let session = AudioCaptureSession(
+            lifecycle: backend!.lifecycle,
+            format: backend!.captureFormat,
+            continuation: continuation,
+            levelHandler: nil,
+            usesBluetoothInput: false
+        )
+        defer { session.cleanup() }
+        try backend!.installCallbacks(for: session)
+        try backend!.start()
+        backend = nil
+        operations.fireFirstPropertyListener()
+        operations.drainRouteQueue()
+        XCTAssertFalse(session.cleanupRequested)
+        operations.readbackOverrides[0] = 303
+        operations.fireFirstPropertyListener()
+        operations.drainRouteQueue()
+        XCTAssertTrue(session.cleanupRequested)
     }
 
     func testSilenceRenderCallbackClearsEveryProvidedBufferAndSetsSilenceFlag() throws {
@@ -729,7 +804,9 @@ private func makeFormat(sampleRate: Float64, channels: UInt32) -> AudioStreamBas
 }
 
 private final class TestAudioDeviceProvider: AudioDeviceProvider, @unchecked Sendable {
-    let outputDevice: AudioDeviceID
+    var outputDevice: AudioDeviceID
+    var aliveOverrides: [AudioDeviceID: Bool] = [:]
+    var aliveReadFailure = false
     private(set) var defaultOutputReadCount = 0
     private(set) var defaultWriteCount = 0
 
@@ -744,6 +821,10 @@ private final class TestAudioDeviceProvider: AudioDeviceProvider, @unchecked Sen
 
     func isBluetoothInputDevice(_ device: AudioDeviceID) -> Bool {
         false
+    }
+
+    func isDeviceAlive(_ device: AudioDeviceID) -> Bool? {
+        aliveReadFailure ? nil : (aliveOverrides[device] ?? true)
     }
 }
 
@@ -795,6 +876,11 @@ private final class RecordingNativeOperations: AudioUnitNativeOperations, @unche
     var maximumFramesPerSlice: UInt32 = 512
     var bypassReadbackOverride: UInt32?
     var coerceClientFormatsOnReadback = false
+    var coercedClientElement: AudioUnitElement?
+    var onInitialize: (() -> Void)?
+    var onStart: (() -> Void)?
+    private(set) var getCount = 0
+    private(set) var renderCount = 0
     private(set) var stopCount = 0
     private(set) var uninitializeCount = 0
     private(set) var disposeCount = 0
@@ -865,6 +951,7 @@ private final class RecordingNativeOperations: AudioUnitNativeOperations, @unche
         data: UnsafeMutableRawPointer,
         size: inout UInt32
     ) -> OSStatus {
+        getCount += 1
         guard getStatus == noErr else { return getStatus }
         switch property {
         case kAudioOutputUnitProperty_CurrentDevice:
@@ -876,7 +963,7 @@ private final class RecordingNativeOperations: AudioUnitNativeOperations, @unche
         case kAudioUnitProperty_StreamFormat:
             var format = formatValues[FormatKey(scope: scope, element: element)]
                 ?? (scope == kAudioUnitScope_Input && element == 1 ? inputHardware : outputHardware)
-            if coerceClientFormatsOnReadback,
+            if coerceClientFormatsOnReadback || coercedClientElement == element,
                formatValues[FormatKey(scope: scope, element: element)] != nil {
                 format.mChannelsPerFrame += 1
             }
@@ -899,11 +986,13 @@ private final class RecordingNativeOperations: AudioUnitNativeOperations, @unche
 
     func initialize(_ unit: NativeAudioUnitHandle) -> OSStatus {
         events.append("initialize")
+        onInitialize?()
         return initializeStatus
     }
 
     func start(_ unit: NativeAudioUnitHandle) -> OSStatus {
         events.append("start")
+        onStart?()
         return startStatus
     }
 
@@ -933,7 +1022,8 @@ private final class RecordingNativeOperations: AudioUnitNativeOperations, @unche
         frames: UInt32,
         data: UnsafeMutablePointer<AudioBufferList>
     ) -> OSStatus {
-        noErr
+        renderCount += 1
+        return noErr
     }
 
     func addPropertyListenerBlock(
@@ -971,6 +1061,12 @@ private final class RecordingNativeOperations: AudioUnitNativeOperations, @unche
             listener: listener
         ))
         return removeListenerStatus
+    }
+
+    // Listener invocation has returned before this barrier, so all work it
+    // enqueued on the real route-control queue must finish before assertions.
+    func drainRouteQueue() {
+        addedListeners.first?.queue.sync {}
     }
 
     func fireFirstPropertyListener() {
