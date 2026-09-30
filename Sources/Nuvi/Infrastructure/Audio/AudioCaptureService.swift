@@ -68,6 +68,8 @@ internal final class AudioCaptureSession: @unchecked Sendable {
     private let cleanupFinished = Atomic<Bool>(false)
     private let streamTerminated = Atomic<Bool>(false)
     private let publisherStartedState = Atomic<Bool>(false)
+    private let firstPCMPublished = Atomic<Bool>(false)
+    private let createdAt = DispatchTime.now().uptimeNanoseconds
     private let streamDropped = Atomic<UInt64>(0)
     private let allocationFailures = Atomic<UInt64>(0)
     private let publisherCompletion = DispatchSemaphore(value: 0)
@@ -159,9 +161,10 @@ internal final class AudioCaptureSession: @unchecked Sendable {
 
         closeCallbackAdmission()
         waitForCallbacks()
-        lifecycle.stop()
-        lifecycle.uninitialize()
-        lifecycle.dispose()
+        let owner = String(describing: ObjectIdentifier(self))
+        AudioPhaseTiming.measure("native_stop", owner: owner) { lifecycle.stop() }
+        AudioPhaseTiming.measure("native_uninitialize", owner: owner) { lifecycle.uninitialize() }
+        AudioPhaseTiming.measure("native_dispose", owner: owner) { lifecycle.dispose() }
 
         // No callback can publish after the admission wait. The publisher may
         // still own queued slots, so close first and let it drain before the
@@ -369,7 +372,10 @@ internal final class AudioCaptureSession: @unchecked Sendable {
 
         switch continuation.yield(buffer) {
         case .enqueued:
-            break
+            if !firstPCMPublished.exchange(true, ordering: .relaxed) {
+                AudioPhaseTiming.record("first_published_pcm",
+                                        owner: String(describing: ObjectIdentifier(self)), since: createdAt)
+            }
         case .dropped:
             streamDropped.wrappingAdd(1, ordering: .relaxed)
         case .terminated:
@@ -514,7 +520,8 @@ public final class AudioCaptureService: AudioCapturing, @unchecked Sendable {
             backendForCleanup = backend
             // Negotiate native capacity before creating any callback-owned
             // memory; failures here remain owned by backendForCleanup.
-            try backend.prepare()
+            let owner = String(describing: ObjectIdentifier(backend.lifecycle))
+            try AudioPhaseTiming.measure("native_prepare", owner: owner) { try backend.prepare() }
             activeDiagnostics = backend.diagnostics.with(selectedInputUID: selection.uid)
             lastDiagnostics = activeDiagnostics
             if backend.usesBluetoothInput {
@@ -554,7 +561,7 @@ public final class AudioCaptureService: AudioCapturing, @unchecked Sendable {
             backendForCleanup = nil
 
             try backend.installCallbacks(for: session)
-            try backend.start()
+            try AudioPhaseTiming.measure("native_start", owner: owner) { try backend.start() }
             guard !session.cleanupRequested else {
                 throw configuration.duckOtherAudio
                     ? AudioCaptureError.nativeDuckingUnavailable(

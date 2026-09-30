@@ -731,6 +731,50 @@ final class DictationControllerTests: XCTestCase {
         XCTAssertEqual(controller.state, .inserted)
     }
 
+    func testPreparationIsVisibleImmediatelyWhilePermissionIsPending() async {
+        let audio = FakeAudioCapture()
+        audio.holdPermission = true
+        let controller = DictationController(
+            audio: audio, engine: FakeEngine(), history: HistoryStore(),
+            vocabulary: VocabularyStore(), modes: ModesStore(), textInjector: FakeTextInjector()
+        )
+        controller.start()
+        XCTAssertEqual(controller.state, .preparing, "Preparation must be visible before asynchronous work")
+        XCTAssertNotEqual(controller.state, .listening, "Pending permission is not recording")
+        await waitUntil { audio.permissionRequestCount == 1 }
+        controller.cancel()
+        XCTAssertEqual(controller.state, .idle)
+        audio.releasePermission()
+        await yieldUntil { audio.permissionRequestCount == 1 }
+        XCTAssertEqual(audio.startCount, 0, "Cancelled preparation must never start capture")
+    }
+
+    func testReleaseDuringEnginePreparationPreservesVisiblePreparationAndFinalizesOnce() async {
+        let audio = FakeAudioCapture()
+        let engine = FakeEngine()
+        let gate = PreparationGate()
+        engine.preparationGate = gate
+        let injector = FakeTextInjector()
+        let controller = DictationController(
+            audio: audio, engine: engine, history: HistoryStore(),
+            vocabulary: VocabularyStore(), modes: ModesStore(), textInjector: injector
+        )
+        defer { gate.open(); controller.cancel() }
+        controller.start()
+        await fulfillment(of: [gate.entered], timeout: 3)
+        XCTAssertEqual(controller.state, .preparing, "Blocked engine preparation must remain visible")
+        XCTAssertNotEqual(controller.state, .listening)
+        XCTAssertEqual(audio.startCount, 0)
+        controller.stop()
+        gate.open()
+        await waitUntil { audio.stopCount == 1 && controller.state == .transcribing }
+        engine.emit(.final("released during preparation"))
+        engine.finish()
+        await waitUntil { controller.state == .inserted }
+        XCTAssertEqual(injector.insertedTexts, ["released during preparation"])
+        XCTAssertEqual(audio.stopCount, 1)
+    }
+
     func testSlowNativeStartAllowsCancelAndQueuesReplacementAfterTeardown() async {
         let audio = FakeAudioCapture()
         let gate = NativeControlGate()
@@ -742,14 +786,23 @@ final class DictationControllerTests: XCTestCase {
         defer { gate.open(); controller.cancel() }
         controller.start()
         await fulfillment(of: [gate.entered], timeout: 3)
+        XCTAssertEqual(controller.state, .preparing, "Native startup must retain visible preparation")
         XCTAssertFalse(gate.ranOnMain, "Native start must leave the main actor responsive")
         XCTAssertFalse(gate.timedOut, "The user action must run before native startup returns")
         controller.cancel()
         controller.start()
         XCTAssertEqual(audio.startCount, 1, "Replacement must wait for old native teardown")
-        XCTAssertNotEqual(controller.state, .listening, "Cancelled startup cannot publish listening")
+        XCTAssertEqual(controller.state, .preparing, "Replacement must not inherit cancelled startup")
+        XCTAssertEqual(controller.level, 0)
+        XCTAssertEqual(controller.spectrum, .zero)
+        var listeningStartCounts: [Int] = []
+        let states = controller.$state.sink { state in
+            if state == .listening { listeningStartCounts.append(audio.startCount) }
+        }
+        defer { states.cancel() }
         gate.open()
         await waitUntil { audio.startCount == 2 && controller.state == .listening }
+        XCTAssertEqual(listeningStartCounts, [2], "Old startup completion must never publish listening")
         XCTAssertEqual(Array(audio.controlEvents.prefix(3)), ["start", "stop", "start"])
     }
 
@@ -1026,19 +1079,26 @@ private final class FakeAudioCapture: AudioCapturing, @unchecked Sendable {
     private var permissionContinuation: CheckedContinuation<Bool, Never>?
 
     func requestPermission() async -> Bool {
-        lock.withLock { _permissionRequestCount += 1 }
         if holdPermission {
             return await withCheckedContinuation { continuation in
-                permissionContinuation = continuation
+                lock.withLock {
+                    permissionContinuation = continuation
+                    _permissionRequestCount += 1
+                }
             }
         }
+        lock.withLock { _permissionRequestCount += 1 }
         return permission
     }
 
     func releasePermission() {
         holdPermission = false
-        permissionContinuation?.resume(returning: permission)
-        permissionContinuation = nil
+        let pending = lock.withLock {
+            let pending = permissionContinuation
+            permissionContinuation = nil
+            return pending
+        }
+        pending?.resume(returning: permission)
     }
 
     func start(configuration: AudioCaptureConfiguration) throws -> AsyncStream<AVAudioPCMBuffer> {
@@ -1077,6 +1137,7 @@ private final class FakeAudioCapture: AudioCapturing, @unchecked Sendable {
 private final class FakeEngine: TranscriptionEngine, @unchecked Sendable {
     let identifier: String
     var prepareError: Error?
+    var preparationGate: PreparationGate?
     var events: [TranscriptionEvent] = []
     var preparedLocales: [String] = []
     var reportingPartialsRequests: [Bool] = []
@@ -1089,6 +1150,7 @@ private final class FakeEngine: TranscriptionEngine, @unchecked Sendable {
 
     func prepare(locale: Locale) async throws {
         preparedLocales.append(locale.identifier)
+        if let preparationGate { await preparationGate.wait() }
         if let prepareError { throw prepareError }
     }
 
@@ -1303,5 +1365,34 @@ private final class NativeControlGate: @unchecked Sendable {
         opened = true
         lock.unlock()
         release.signal()
+    }
+}
+
+private final class PreparationGate: @unchecked Sendable {
+    let entered = XCTestExpectation(description: "engine preparation suspended")
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var opened = false
+
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            let resume = lock.withLock {
+                if opened { return true }
+                self.continuation = continuation
+                return false
+            }
+            entered.fulfill()
+            if resume { continuation.resume() }
+        }
+    }
+
+    func open() {
+        let pending = lock.withLock {
+            opened = true
+            let pending = continuation
+            continuation = nil
+            return pending
+        }
+        pending?.resume()
     }
 }

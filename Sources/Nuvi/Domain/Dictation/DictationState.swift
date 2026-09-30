@@ -7,6 +7,7 @@ import Foundation
 /// on purpose: no UI, no framework imports.
 public enum DictationState: Equatable, Sendable {
     case idle
+    case preparing
     case listening
     case transcribing
     case inserted

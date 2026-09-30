@@ -21,8 +21,12 @@ internal final class SerialAudioCaptureControl: @unchecked Sendable {
         onSpectrum: @escaping @Sendable (AudioSpectrum) -> Void
     ) async throws -> AsyncStream<AVAudioPCMBuffer> {
         try Task.checkCancellation()
+        let enqueued = DispatchTime.now().uptimeNanoseconds
         return try await withCheckedThrowingContinuation { continuation in
             Self.queue.async { [self] in
+                AudioPhaseTiming.record("start_queue_wait", owner: id.uuidString, since: enqueued)
+                let timing = AudioPhaseTiming("capture_start", owner: id.uuidString)
+                defer { timing.finish() }
                 // A replacement must finish any previous teardown first, even
                 // if a previous task completed without an explicit PTT stop.
                 if activeID != nil { capture.stop() }
@@ -44,10 +48,12 @@ internal final class SerialAudioCaptureControl: @unchecked Sendable {
 
     @MainActor
     func stop(id: UUID) {
+        let enqueued = DispatchTime.now().uptimeNanoseconds
         Self.queue.async { [self] in
             // Old task completion/cancellation must never stop its successor.
             guard activeID == id else { return }
-            capture.stop()
+            AudioPhaseTiming.record("stop_queue_wait", owner: id.uuidString, since: enqueued)
+            AudioPhaseTiming.measure("capture_stop", owner: id.uuidString) { capture.stop() }
             activeID = nil
             capture.onLevel = nil
             capture.onSpectrum = nil

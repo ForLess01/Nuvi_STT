@@ -134,7 +134,7 @@ final class AppEnvironment {
                 guard let self else { return }
                 self.statusItem.update(state: state, isLiveSession: self.controller.isLiveSession)
                 switch state {
-                case .listening, .transcribing:
+                case .preparing, .listening, .transcribing:
                     if SettingsStore.shared.showPill {
                         self.pill.show()
                     } else {
@@ -190,7 +190,7 @@ final class AppEnvironment {
                     return
                 }
                 switch self.controller.state {
-                case .listening, .transcribing, .inserted, .copied, .notice, .error:
+                case .preparing, .listening, .transcribing, .inserted, .copied, .notice, .error:
                     self.pill.show()
                     self.pill.resizeToContent()
                 case .idle:

@@ -126,6 +126,17 @@ final class HistoryMenuTests: XCTestCase {
         )
     }
 
+    func testPreparationStatusIsLocalizedAndNeverClaimsLiveRecording() {
+        for (language, expected) in [(AppLanguage.english, "Preparing…"), (.spanish, "Preparando…")] {
+            XCTAssertEqual(MenuBarStatusPresentation.label(
+                for: .preparing, language: language, showsStatus: true, isLiveSession: true
+            ), expected)
+        }
+        XCTAssertNil(MenuBarStatusPresentation.label(
+            for: .preparing, language: .english, showsStatus: false, isLiveSession: false
+        ))
+    }
+
     func testMenuBarStatusCanBeHiddenOrLocalizedWithoutRemovingTheIsologo() {
         XCTAssertNil(
             MenuBarStatusPresentation.label(

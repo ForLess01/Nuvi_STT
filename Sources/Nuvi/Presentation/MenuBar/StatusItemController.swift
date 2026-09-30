@@ -131,6 +131,8 @@ enum MenuBarStatusPresentation {
         guard showsStatus else { return nil }
         let spanish = language == .spanish
         switch state {
+        case .preparing:
+            return spanish ? "Preparando…" : "Preparing…"
         case .listening:
             return isLiveSession ? "LIVE" : (spanish ? "Escuchando…" : "Listening…")
         case .transcribing:

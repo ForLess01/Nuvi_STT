@@ -2,6 +2,14 @@ import XCTest
 @testable import Nuvi
 
 final class PillViewTests: XCTestCase {
+    func testPreparationOverridesStaleTranscriptAndDoesNotClaimLiveRecording() {
+        XCTAssertEqual(
+            PillDisplayText.resolve(
+                state: .preparing, transcript: "stale preview", stateLabel: "Preparing…", isLiveSession: true
+            ), "Preparing…"
+        )
+    }
+
     func testInsertedStateAlwaysOverridesAStaleTranscript() {
         XCTAssertEqual(
             PillDisplayText.resolve(

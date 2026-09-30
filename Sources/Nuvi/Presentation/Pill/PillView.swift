@@ -37,7 +37,7 @@ struct PillView: View {
                 level: controller.level,
                 spectrum: controller.spectrum,
                 settings: ferrofluid.settings,
-                paused: isCompleted
+                paused: isCompleted || controller.state == .preparing
             )
             .clipShape(Circle())
             .opacity(isCompleted ? 0 : 0.98)
@@ -138,7 +138,9 @@ struct PillView: View {
 
     private var labelColor: Color {
         if isCompleted { return NuviPalette.lavender }
-        if controller.isLiveSession { return NuviPalette.softWhite.opacity(0.92) }
+        if controller.state == .preparing || controller.isLiveSession {
+            return NuviPalette.softWhite.opacity(0.92)
+        }
         return isError
             ? NuviPalette.softWhite.opacity(0.96)
             : NuviPalette.softWhite.opacity(controller.transcript.isEmpty ? 0.55 : 0.92)
@@ -161,6 +163,7 @@ struct PillView: View {
     private var stateLabel: String {
         switch controller.state {
         case .idle: return "Nuvi"
+        case .preparing: return tr("Preparing…", "Preparando…")
         case .listening: return "Listening…"
         case .transcribing: return "Transcribing…"
         case .inserted: return tr("Inserted", "Insertado")
@@ -178,12 +181,12 @@ enum PillDisplayText {
         stateLabel: String,
         isLiveSession: Bool = false
     ) -> String {
-        // Completion is semantic UI, not transcription preview. Published
+        // Preparation and completion are semantic UI, not transcription preview. Published
         // state and transcript changes can render on separate SwiftUI passes,
         // so completion must win even if the previous transcript is still
         // observable for one frame.
         switch state {
-        case .inserted, .copied:
+        case .preparing, .inserted, .copied:
             return stateLabel
         case .listening where isLiveSession:
             return "LIVE"

@@ -425,14 +425,13 @@ public final class DictationController: ObservableObject {
     public func toggle() {
         switch state {
         case .idle, .inserted, .copied, .notice, .error: start()
-        case .listening: stop()
+        case .preparing, .listening: stop()
         case .transcribing: break
         }
     }
 
     public func start() {
-        // Guard on the session itself, not state: during the async start-up gap
-        // state is still .idle, so a second trigger could spawn a 2nd session.
+        // Session ownership, not presentation state, prevents duplicate starts.
         guard session == nil else { return }
         cancelCompletionFeedback()
         cancelSilenceTimer()
@@ -477,6 +476,9 @@ public final class DictationController: ObservableObject {
                 captureConfiguration: captureConfiguration
             )
         }
+        level = 0
+        spectrum = .zero
+        state = .preparing
     }
 
     /// User finished speaking (or released push-to-talk).
@@ -558,7 +560,10 @@ public final class DictationController: ObservableObject {
         defer { audioControl.stop(id: id) }
         do {
             guard ownsSession(id) else { return }
-            guard await audio.requestPermission() else {
+            let permissionTiming = AudioPhaseTiming("permission", owner: id.uuidString)
+            let permissionGranted = await audio.requestPermission()
+            permissionTiming.finish()
+            guard permissionGranted else {
                 fail(.micPermissionDenied, ownedBy: id)
                 return
             }
@@ -571,6 +576,8 @@ public final class DictationController: ObservableObject {
             let preparationKey = "\(engineConfigurationID)|\(locale)"
             if preparedConfiguration != preparationKey {
                 NSLog("Nuvi/session: preparing engine=\(engine.identifier), locale=\(locale)")
+                let timing = AudioPhaseTiming("engine_prepare", owner: id.uuidString)
+                defer { timing.finish() }
                 try await engine.prepare(locale: Locale(identifier: locale))
                 guard ownsSession(id), !Task.isCancelled else {
                     reset(ownedBy: id)
