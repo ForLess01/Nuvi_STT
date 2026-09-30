@@ -24,6 +24,23 @@ Built purely in Swift, AppKit, SwiftUI, AVFoundation, and Metal. No Electron. No
 
 See the complete [Nuvi v2.2.1 fix release notes](docs/releases/v2.2.1.md).
 
+## Automatic update notices
+
+Nuvi 2.2.1 checks the public GitHub stable release on startup and every 12 hours,
+with a persisted throttle across restarts. **Settings → Configuration → Updates**
+shows the installed version, available release, last check, and a manual refresh.
+A system notification announces each newer version once; if macOS denies alerts,
+the update remains visible in Settings. Allow Nuvi under **System Settings →
+Notifications** to enable alerts. Checks contact GitHub for release metadata only;
+audio and transcriptions are never sent. Nothing is downloaded or installed automatically.
+
+Nuvi 2.2.0 has no update checker. Upgrade manually once after 2.2.1 is published:
+
+```bash
+brew update
+brew upgrade --cask nuvi
+```
+
 ## Quick Install
 
 You can install Nuvi instantly using Homebrew Cask:

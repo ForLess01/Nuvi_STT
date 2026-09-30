@@ -7,6 +7,11 @@ import SwiftUI
 @MainActor
 final class SettingsWindowController {
     private var window: NSWindow?
+    private let updates: AppUpdateService
+
+    init(updates: AppUpdateService) {
+        self.updates = updates
+    }
 
     func show() {
         if let window {
@@ -15,7 +20,7 @@ final class SettingsWindowController {
             return
         }
 
-        let hosting = NSHostingController(rootView: SettingsView())
+        let hosting = NSHostingController(rootView: SettingsView(updates: updates))
         let window = NSWindow(contentViewController: hosting)
         window.title = "Nuvi Settings"
         window.styleMask = [.titled, .closable, .miniaturizable]

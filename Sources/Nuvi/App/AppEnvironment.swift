@@ -17,12 +17,25 @@ final class AppEnvironment {
     private let translation: TranslationCoordinator
     private let pill: PillWindowController
     private let statusItem: StatusItemController
-    private let settingsWindow = SettingsWindowController()
+    let updates: AppUpdateService
+    private let updateNotifications: AppUpdateNotificationAdapter
+    private let settingsWindow: SettingsWindowController
     private var hotkeyManager: HotkeyManager?
     private var escHotkey: GlobalHotkey?
     private var cancellables = Set<AnyCancellable>()
 
     init() {
+        let notifications = AppUpdateNotificationAdapter()
+        let http = AppUpdateHTTPClient()
+        let updates = AppUpdateService(
+            installedVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown",
+            defaults: .standard,
+            fetch: { try await http.fetch() },
+            notify: { await notifications.notify($0) }
+        )
+        self.updates = updates
+        updateNotifications = notifications
+        settingsWindow = SettingsWindowController(updates: updates)
         let audio = AudioCaptureService()
         let translation = TranslationCoordinator()
         let configuration = SettingsStore.shared.transcriptionConfiguration
@@ -55,6 +68,17 @@ final class AppEnvironment {
         observeState()
         observeTranscriptionConfiguration()
         observePresentationPreferences()
+        updates.start()
+        observeUpdateLifecycle()
+    }
+
+    private func observeUpdateLifecycle() {
+        NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
+            .merge(with: NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didWakeNotification))
+            .sink { [weak self] _ in
+                Task { @MainActor [weak self] in await self?.updates.check() }
+            }
+            .store(in: &cancellables)
     }
 
     private func observeTranscriptionConfiguration() {

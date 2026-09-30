@@ -35,6 +35,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
 }
 
 struct SettingsView: View {
+    @ObservedObject var updates: AppUpdateService
     @State private var selection: SettingsSection = .configuration
     @ObservedObject private var loc = LocalizationStore.shared
 
@@ -81,8 +82,8 @@ struct SettingsView: View {
     @ViewBuilder
     private var detail: some View {
         switch selection {
-        case .home: HomePanel()
-        case .configuration: ConfigurationPanel()
+        case .home: HomePanel(updates: updates)
+        case .configuration: ConfigurationPanel(updates: updates)
         case .appearance: AppearancePanel()
         case .vocabulary: VocabularyPanel()
         case .history: HistoryPanel()
@@ -111,6 +112,7 @@ private struct PanelScaffold<Content: View>: View {
 // MARK: - Home
 
 private struct HomePanel: View {
+    @ObservedObject var updates: AppUpdateService
     @ObservedObject private var shortcuts = ShortcutsStore.shared
     @ObservedObject private var loc = LocalizationStore.shared
 
@@ -160,6 +162,8 @@ private struct HomePanel: View {
             }
             .padding(.bottom, 4)
 
+            AppUpdatesCard(updates: updates)
+
             SectionHeader(text: tr("Shortcuts", "Atajos"))
             Card {
                 // Live: reflects whatever is configured in Configuration.
@@ -202,6 +206,7 @@ private struct HomePanel: View {
 // MARK: - Configuration
 
 private struct ConfigurationPanel: View {
+    @ObservedObject var updates: AppUpdateService
     @State private var locale = SettingsStore.shared.localeIdentifier
     @State private var restoreClipboard = SettingsStore.shared.restoreClipboard
     @State private var saveHistory = SettingsStore.shared.saveHistory
@@ -235,6 +240,8 @@ private struct ConfigurationPanel: View {
 
     var body: some View {
         PanelScaffold(title: tr("Configuration", "Configuración")) {
+            AppUpdatesCard(updates: updates)
+
             SectionHeader(text: tr("Interface", "Interfaz"))
             Card {
                 SettingRow(title: tr("App language", "Idioma de la app"),
