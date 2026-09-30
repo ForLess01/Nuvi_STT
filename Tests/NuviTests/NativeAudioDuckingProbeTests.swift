@@ -33,7 +33,10 @@ final class NativeAudioDuckingProbeTests: XCTestCase {
                 }
             }
 
-            try await Task.sleep(nanoseconds: 250_000_000)
+            // VPIO can need longer than 250 ms to prime after reinitialization.
+            // Keep this authorized hardware smoke check bounded, without
+            // persisting audio or asserting acoustic attenuation.
+            try await Task.sleep(nanoseconds: 1_500_000_000)
             capture.stop()
             await consumer?.value
             consumer = nil
@@ -50,6 +53,7 @@ final class NativeAudioDuckingProbeTests: XCTestCase {
                 XCTAssertEqual(outputAfter.muted, outputBefore.muted)
             }
 
+            print("NATIVE_DUCKING_CAPACITY cycle=\(cycle) maximum_frames=\(diagnostics.maximumFramesPerSlice) cleanup=\(diagnostics.cleanupComplete)")
             print(
                 "NATIVE_DUCKING_PROBE cycle=\(cycle) setup=ok frames=\(frames) " +
                 "output_device=\(outputAfter?.deviceID as Any) " +

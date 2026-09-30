@@ -213,9 +213,14 @@ internal protocol AudioCaptureBackend: AnyObject {
     var usesBluetoothInput: Bool { get }
     var diagnostics: AudioCaptureDiagnostics { get }
 
+    func prepare() throws
     func installCallbacks(for session: AudioCaptureSession) throws
     func start() throws
     func cleanup()
+}
+
+internal extension AudioCaptureBackend {
+    func prepare() throws {}
 }
 
 internal protocol AudioCaptureBackendFactory: AnyObject {
@@ -530,6 +535,12 @@ internal final class NativeAudioUnitLifecycle: AudioUnitLifecycle, @unchecked Se
         withControlLock { lifecycleState == .initialized || lifecycleState == .running }
     }
 
+    var canPrepareCapture: Bool {
+        withControlLock {
+            (lifecycleState == .configured || lifecycleState == .initialized) && callbackOwner == nil
+        }
+    }
+
     func initializeUnit() -> OSStatus {
         withControlLock {
             switch lifecycleState {
@@ -655,7 +666,8 @@ internal final class NativeAudioUnitLifecycle: AudioUnitLifecycle, @unchecked Se
 
     func installCaptureCallback(for session: AudioCaptureSession) -> OSStatus {
         withControlLock {
-            guard lifecycleState == .configured else { return Self.lifecycleClosedStatus }
+            guard lifecycleState == .configured || lifecycleState == .initialized,
+                  callbackOwner == nil else { return Self.lifecycleClosedStatus }
             callbackOwner = session
             var callback = AURenderCallbackStruct(
                 inputProc: captureRenderCallback,
@@ -950,7 +962,7 @@ private final class NativeAudioCaptureBackend: AudioCaptureBackend, @unchecked S
     let lifecycle: AudioUnitLifecycle
     let captureFormat: AVAudioFormat
     let captureChannelCount: Int
-    let maximumFramesPerSlice: UInt32
+    private(set) var maximumFramesPerSlice: UInt32
     let usesBluetoothInput: Bool
     private(set) var diagnostics: AudioCaptureDiagnostics
 
@@ -1008,6 +1020,29 @@ private final class NativeAudioCaptureBackend: AudioCaptureBackend, @unchecked S
             cleanupComplete: false
         )
         self.setupFailure = setupFailure
+    }
+
+    /// Initialization can renegotiate MaximumFramesPerSlice. No capture
+    /// callback is bound and I/O is not started until the service allocates
+    /// buffers using this final capacity and transfers session ownership.
+    func prepare() throws {
+        try nativeLifecycle.withControlLock {
+            guard nativeLifecycle.canPrepareCapture else {
+                throw setupFailure("Capture preparation requires an unbound, nonrunning unit")
+            }
+            let status = nativeLifecycle.initializeUnit()
+            guard status == noErr else {
+                throw setupFailure("Could not initialize the capture unit (status \(status))")
+            }
+            let negotiatedMaximum = try readMaximumFrames(stage: "preparation")
+            guard negotiatedMaximum > 0 else {
+                throw setupFailure("The native maximum frame capacity is zero during preparation")
+            }
+            maximumFramesPerSlice = negotiatedMaximum
+            try verifyCurrentDevices(stage: "preparation")
+            try verifyDeviceAvailability()
+            try verifyEffectiveFormats(stage: "preparation")
+        }
     }
 
     func installCallbacks(for session: AudioCaptureSession) throws {

@@ -5,6 +5,79 @@ import CoreAudio
 @testable import Nuvi
 
 final class AudioCaptureBackendTests: XCTestCase {
+    func testServiceAllocatesNegotiatedCapacityBeforeBindingAndRendering() async throws {
+        let operations = RecordingNativeOperations()
+        operations.onInitialize = { [weak operations] in
+            operations?.maximumFramesPerSlice = 1200
+            XCTAssertNil(operations?.captureCallback, "Initialization must not see an unbound capture session")
+        }
+        let service = AudioCaptureService(
+            backendFactory: NativeAudioCaptureBackendFactory(
+                operations: operations, devices: TestAudioDeviceProvider(outputDevice: 202)
+            ),
+            inputDeviceOverride: 101
+        )
+        defer { service.stop() }
+        let stream = try service.start(configuration: AudioCaptureConfiguration(duckOtherAudio: true))
+        XCTAssertEqual(service.lastDiagnostics?.maximumFramesPerSlice, 1200)
+        XCTAssertEqual(operations.events.filter { $0 == "initialize" }.count, 1)
+        let callback = try XCTUnwrap(operations.captureCallback)
+        let context = try XCTUnwrap(callback.inputProcRefCon)
+        var flags = AudioUnitRenderActionFlags(rawValue: 0)
+        var timestamp = AudioTimeStamp()
+        XCTAssertEqual(callback.inputProc?(
+            context, &flags, &timestamp, 1, 1200, nil
+        ), noErr)
+        service.stop()
+        var iterator = stream.makeAsyncIterator()
+        let buffer = await iterator.next()
+        XCTAssertEqual(buffer?.frameLength, 1200)
+        XCTAssertEqual(operations.renderCount, 1)
+        XCTAssertTrue(service.lastDiagnostics?.cleanupComplete == true)
+    }
+
+    func testPreparationFailureCleansUnboundUnitWithoutStartingOrFallback() {
+        for failure in ["zero", "read", "initialize"] {
+            let operations = RecordingNativeOperations()
+            operations.onInitialize = { [weak operations] in
+                switch failure {
+                case "zero": operations?.maximumFramesPerSlice = 0
+                case "read": operations?.getStatus = -10879
+                default: operations?.initializeStatus = -10879
+                }
+            }
+            let service = AudioCaptureService(
+                backendFactory: NativeAudioCaptureBackendFactory(
+                    operations: operations, devices: TestAudioDeviceProvider(outputDevice: 202)
+                ), inputDeviceOverride: 101
+            )
+            XCTAssertThrowsError(try service.start(configuration: AudioCaptureConfiguration(duckOtherAudio: true)))
+            XCTAssertNil(operations.captureCallback, failure)
+            XCTAssertFalse(operations.events.contains("start"), failure)
+            XCTAssertEqual(operations.disposeCount, 1, failure)
+            XCTAssertEqual(operations.createdSubtypes, [UInt32(kAudioUnitSubType_VoiceProcessingIO)], failure)
+            service.stop()
+            XCTAssertEqual(operations.disposeCount, 1, failure)
+        }
+    }
+
+    func testNegotiatedCapacityGrowthAtStartStillCleansSafely() {
+        let operations = RecordingNativeOperations()
+        operations.onInitialize = { [weak operations] in operations?.maximumFramesPerSlice = 1200 }
+        operations.onStart = { [weak operations] in operations?.maximumFramesPerSlice = 2400 }
+        let service = AudioCaptureService(
+            backendFactory: NativeAudioCaptureBackendFactory(
+                operations: operations, devices: TestAudioDeviceProvider(outputDevice: 202)
+            ), inputDeviceOverride: 101
+        )
+        XCTAssertThrowsError(try service.start(configuration: AudioCaptureConfiguration(duckOtherAudio: true))) { error in
+            XCTAssertTrue(String(describing: error).contains("effective 2400, allocated 1200"))
+        }
+        XCTAssertEqual(operations.disposeCount, 1)
+        XCTAssertEqual(operations.stopCount, 1)
+        XCTAssertEqual(operations.renderCount, 0)
+    }
+
     func testDisabledConfigurationSelectsHALWithoutVoiceProcessingSetup() throws {
         let operations = RecordingNativeOperations()
         let devices = TestAudioDeviceProvider(outputDevice: 202)
@@ -989,6 +1062,7 @@ private final class RecordingNativeOperations: AudioUnitNativeOperations, @unche
     var coercedClientElement: AudioUnitElement?
     var onInitialize: (() -> Void)?
     var onStart: (() -> Void)?
+    private(set) var captureCallback: AURenderCallbackStruct?
     private(set) var getCount = 0
     private(set) var renderCount = 0
     private(set) var stopCount = 0
@@ -1032,6 +1106,9 @@ private final class RecordingNativeOperations: AudioUnitNativeOperations, @unche
             count: Int(size)
         ))
         setCalls.append(PropertyCall(property: property, scope: scope, element: element, size: size, bytes: bytes))
+        if property == kAudioOutputUnitProperty_SetInputCallback {
+            captureCallback = data.load(as: AURenderCallbackStruct.self)
+        }
         if property == kAudioOutputUnitProperty_CurrentDevice {
             currentDeviceWrites[element] = data.load(as: AudioDeviceID.self)
         }
@@ -1133,6 +1210,12 @@ private final class RecordingNativeOperations: AudioUnitNativeOperations, @unche
         data: UnsafeMutablePointer<AudioBufferList>
     ) -> OSStatus {
         renderCount += 1
+        let buffers = UnsafeMutableAudioBufferListPointer(data)
+        for buffer in buffers {
+            guard let samples = buffer.mData else { continue }
+            XCTAssertGreaterThanOrEqual(buffer.mDataByteSize, frames * UInt32(MemoryLayout<Float>.stride))
+            samples.assumingMemoryBound(to: Float.self).initialize(repeating: 0.25, count: Int(frames))
+        }
         return noErr
     }
 

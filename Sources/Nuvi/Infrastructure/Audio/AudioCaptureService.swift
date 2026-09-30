@@ -512,6 +512,9 @@ public final class AudioCaptureService: AudioCapturing, @unchecked Sendable {
                 inputDevice: device
             )
             backendForCleanup = backend
+            // Negotiate native capacity before creating any callback-owned
+            // memory; failures here remain owned by backendForCleanup.
+            try backend.prepare()
             activeDiagnostics = backend.diagnostics.with(selectedInputUID: selection.uid)
             lastDiagnostics = activeDiagnostics
             if backend.usesBluetoothInput {
