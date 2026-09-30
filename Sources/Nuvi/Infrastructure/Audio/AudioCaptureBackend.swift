@@ -485,7 +485,6 @@ internal final class NativeAudioUnitLifecycle: AudioUnitLifecycle, @unchecked Se
     private var stopStatus: OSStatus?
     private var uninitializeStatus: OSStatus?
     private var disposeStatus: OSStatus?
-    private var quarantineRetryAttempts = 0
 
     private enum LifecycleState {
         case configured
@@ -498,7 +497,6 @@ internal final class NativeAudioUnitLifecycle: AudioUnitLifecycle, @unchecked Se
     }
 
     private static let lifecycleClosedStatus: OSStatus = OSStatus(paramErr)
-    private static let maxQuarantineRetries = 3
 
     var unit: AudioUnit? { handle.raw }
 
@@ -807,11 +805,8 @@ internal final class NativeAudioUnitLifecycle: AudioUnitLifecycle, @unchecked Se
     func retryCleanupFromQuarantine() {
         withControlLock {
             guard !isFullyReleased else { return }
-            guard quarantineRetryAttempts < Self.maxQuarantineRetries else {
-                NSLog("Nuvi/audio: cleanup retry budget exhausted; retaining native resource safely")
-                return
-            }
-            quarantineRetryAttempts += 1
+            // One attempt per admission/control operation, not a lifetime cap.
+            // A later user attempt can recover after transient native failures.
             if let stopStatus, stopStatus != noErr, uninitializeStatus != noErr, lifecycleState != .uninitialized {
                 _ = stopLocked()
             }
@@ -848,8 +843,23 @@ internal final class NativeAudioUnitFailureQuarantine: @unchecked Sendable {
             lifecycle.retryCleanupFromQuarantine()
         }
 
+        pruneReleasedEntries()
+    }
+
+    // The inspection hook is a per-call test barrier, never stored state.
+    func pruneReleasedEntries(beforeInspection: () -> Void = {}) {
         lock.lock()
-        entries.removeAll { $0.lifecycle.isFullyReleased }
+        let snapshot = entries.map(\.lifecycle)
+        lock.unlock()
+
+        beforeInspection()
+        // Lifecycle cleanup can retain itself while holding its own lock.
+        // Never acquire that lock under the quarantine lock in the other
+        // direction. Fully released lifecycles cannot become active again.
+        let released = Set(snapshot.filter(\.isFullyReleased).map(ObjectIdentifier.init))
+
+        lock.lock()
+        entries.removeAll { released.contains(ObjectIdentifier($0.lifecycle)) }
         lock.unlock()
     }
 

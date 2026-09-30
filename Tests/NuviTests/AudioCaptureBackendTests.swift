@@ -522,6 +522,116 @@ final class AudioCaptureBackendTests: XCTestCase {
         recoveredBackend.cleanup()
     }
 
+    func testLaterAdmissionRecoversAfterMoreThanThreeTransientTeardownFailures() throws {
+        let operations = RecordingNativeOperations()
+        operations.stopStatus = -10879
+        operations.uninitializeStatus = -10879
+        operations.disposeStatus = -10879
+        let backend = try NativeAudioCaptureBackendFactory(
+            operations: operations, devices: TestAudioDeviceProvider(outputDevice: 202)
+        ).makeBackend(configuration: AudioCaptureConfiguration(duckOtherAudio: true), inputDevice: 101)
+        defer {
+            // Direct cleanup remains available even on the old exhausted-budget
+            // implementation, keeping the failing regression isolated.
+            operations.stopStatus = noErr
+            operations.uninitializeStatus = noErr
+            operations.disposeStatus = noErr
+            backend.cleanup()
+            NativeAudioUnitFailureQuarantine.retryAllForTesting()
+        }
+        backend.cleanup()
+        let nextOperations = RecordingNativeOperations()
+        let nextFactory = NativeAudioCaptureBackendFactory(
+            operations: nextOperations, devices: TestAudioDeviceProvider(outputDevice: 202)
+        )
+        for _ in 0..<5 {
+            let before = operations.disposeCount
+            XCTAssertThrowsError(try nextFactory.makeBackend(
+                configuration: AudioCaptureConfiguration(duckOtherAudio: true), inputDevice: 101
+            ))
+            XCTAssertLessThanOrEqual(operations.disposeCount - before, 1, "One admission has bounded retry work")
+            XCTAssertTrue(nextOperations.createdSubtypes.isEmpty, "No new unit before teardown succeeds")
+        }
+        operations.stopStatus = noErr
+        operations.uninitializeStatus = noErr
+        operations.disposeStatus = noErr
+        do {
+            let recovered = try nextFactory.makeBackend(
+                configuration: AudioCaptureConfiguration(duckOtherAudio: true), inputDevice: 101
+            )
+            recovered.cleanup()
+            XCTAssertEqual(backend.lifecycle.cleanupStatus, .successful)
+        } catch {
+            XCTFail("A later admission must recover after temporary failures stop: \(error)")
+        }
+    }
+
+    func testQuarantinePruningAllowsConcurrentRetentionWhileLifecycleInspectionWaits() {
+        let quarantine = NativeAudioUnitFailureQuarantine()
+        let operations = RecordingNativeOperations()
+        let lifecycle = NativeAudioUnitLifecycle(handle: operations.handle, operations: operations)
+        quarantine.retain(lifecycle)
+        let lifecycleHeld = DispatchSemaphore(value: 0)
+        let releaseLifecycle = DispatchSemaphore(value: 0)
+        let holderFinished = DispatchSemaphore(value: 0)
+        let inspecting = DispatchSemaphore(value: 0)
+        let pruneFinished = DispatchSemaphore(value: 0)
+        let retained = DispatchSemaphore(value: 0)
+        defer { releaseLifecycle.signal() }
+        DispatchQueue.global().async {
+            lifecycle.withControlLock {
+                lifecycleHeld.signal()
+                _ = releaseLifecycle.wait(timeout: .now() + 5)
+            }
+            holderFinished.signal()
+        }
+        XCTAssertEqual(lifecycleHeld.wait(timeout: .now() + 2), .success)
+        DispatchQueue.global().async {
+            quarantine.pruneReleasedEntries { inspecting.signal() }
+            pruneFinished.signal()
+        }
+        XCTAssertEqual(inspecting.wait(timeout: .now() + 2), .success)
+
+        let newOperations = RecordingNativeOperations()
+        newOperations.disposeStatus = -10879
+        let newLifecycle = NativeAudioUnitLifecycle(handle: newOperations.handle, operations: newOperations)
+        DispatchQueue.global().async {
+            quarantine.retain(newLifecycle)
+            retained.signal()
+        }
+        // Baseline can fail this bounded assertion, then release the lifecycle
+        // and drain every worker rather than leaving a deadlocked test process.
+        let retentionResult = retained.wait(timeout: .now() + 1)
+        XCTAssertEqual(retentionResult, .success,
+                       "Quarantine must not hold its lock while waiting on a lifecycle")
+        releaseLifecycle.signal()
+        XCTAssertEqual(pruneFinished.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(holderFinished.wait(timeout: .now() + 2), .success)
+        if retentionResult == .timedOut {
+            XCTAssertEqual(retained.wait(timeout: .now() + 2), .success)
+        }
+        lifecycle.cleanup()
+        XCTAssertFalse(quarantine.acquireCaptureSlot(), "New unresolved ownership must not be lost while pruning")
+        newOperations.disposeStatus = noErr
+        newLifecycle.cleanup()
+        quarantine.retryAll()
+        NativeAudioUnitFailureQuarantine.retryAllForTesting()
+        XCTAssertTrue(quarantine.acquireCaptureSlot())
+        quarantine.releaseCaptureSlot()
+    }
+
+    func testConcurrentCaptureReservationsStayCapacityBoundedAndReleaseExactlyOnce() {
+        let quarantine = NativeAudioUnitFailureQuarantine()
+        let results = ReservationResults()
+        DispatchQueue.concurrentPerform(iterations: 32) { _ in
+            if quarantine.acquireCaptureSlot() { results.record() }
+        }
+        XCTAssertEqual(results.count, 16, "Concurrent admission must not overbook capacity")
+        for _ in 0..<results.count { quarantine.releaseCaptureSlot() }
+        XCTAssertTrue(quarantine.acquireCaptureSlot(), "All reservations must be available after release")
+        quarantine.releaseCaptureSlot()
+    }
+
     func testDisposedUnitWithFailedListenerRemovalDoesNotBlockNextCapture() throws {
         let operations = RecordingNativeOperations()
         let factory = NativeAudioCaptureBackendFactory(
@@ -1087,5 +1197,22 @@ private final class RecordingNativeOperations: AudioUnitNativeOperations, @unche
                 call.listener(1, pointer)
             }
         }
+    }
+}
+
+private final class ReservationResults: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    func record() {
+        lock.lock()
+        value += 1
+        lock.unlock()
     }
 }

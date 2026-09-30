@@ -43,8 +43,8 @@ No mapped code automatically restarts after route cleanup. The apparent loop is 
 - `delivery_strategy: exception-ok`; chain strategy: **not applicable**; new `size:exception`: **explicitly granted** by the user's `si` on 2026-09-30 for this integrated correction. The updater's separate exception is not reused.
 - Forecast authored additions plus deletions, including tests/docs: L1 **180–280**, L2 **160–240**, L3 **380–560**, shared planning/progress documentation **100–150**; accumulated **820–1,230**. L3 may exceed the approximately 400-line planning heuristic because its API integration and race regressions form one coherent behavior. This is an estimate, not an acceptance cap.
 - The approved integrated delivery keeps the three coherent work-unit boundaries below; it does not authorize remote publication or a PR. Record actual authored counts from subsequent work-unit commits, generated files excluded. Preserve all necessary tests and documentation rather than shrinking code to fit the former budget.
-- Effective configured strict TDD: **not enabled**; no explicit project configuration was found. Runner: `swift test`. Regression-first observed RED/GREEN is recorded for L1 below; the same requested evidence remains pending for L2/L3. Sandbox/tool failure is not a behavioral RED.
-- RDD: **on/default**, read-only status confirmed by parent. L1 candidate risk remains unassessed by this writer; the parent owns the exact committed-range assessment. This bounded writer runs no native review commands. Later parent owns assessment, exact native consent/continuations, and ordinary delivery decisions.
+- Effective configured strict TDD: **not enabled**; no explicit project configuration was found. Runner: `swift test`. Regression-first observed RED/GREEN is recorded for L1/L2 below; the same requested evidence remains pending for L3. Sandbox/tool failure is not a behavioral RED.
+- RDD: **on/default**, read-only status confirmed by parent. L1 native review is closed as recorded below; L2 candidate risk remains unassessed by this writer and the parent owns its exact committed-range assessment. This bounded writer runs no native review commands. Later parent owns assessment, exact native consent/continuations, and ordinary delivery decisions.
 - Checkboxes represent observed outcomes only, never review consent or delivery authority. Every later unit includes a Conventional Commit with its tests/docs, without AI attribution, after its applicable proof and authorized delivery-size resolution.
 
 ## Implementation tasks
@@ -61,7 +61,7 @@ No mapped code automatically restarts after route cleanup. The apparent loop is 
 
 **Checks:** backend and service focused suites, disabled native probe, applicable aggregate checks below.
 
-**Evidence (2026-09-30):** L1 implemented with focused proof; full-suite proof remains partial at the known baseline failure. Commit pending at this record (exact identity is added after committing).
+**Evidence (2026-09-30):** L1 implemented with focused proof; full-suite proof remains partial at the known baseline failure. Local work-unit commit: `7e2244cfab515aee6477e040e0cfc3b42f6ffdd8` (`fix(audio): validate effective routes before canceling capture`). The post-L1 identity record is carried forward with the L2 task-document update, not a separate identity-only commit.
 
 - Regression-first RED before production edits: `/tmp/nuvi-l1-red.log`, backend suite 24 tests, 8 failed assertions across four redundant/startup/compatible/backend-local-lifetime regressions; production diff was empty at that point. These were behavioral failures, not tooling errors.
 - GREEN after implementation and readability normalization: `/tmp/nuvi-l1-backend.log`, **25/25 passed**. Real route-control queue barriers replace sleep-only ordering. Coverage includes compatible frame publication, pre-start and initialization/start notifications, final startup mismatch rejection, 10 incompatible device/client-format/capacity/liveness/readback cases, cleanup once, and late callback no-read safety.
@@ -73,9 +73,11 @@ No mapped code automatically restarts after route cleanup. The apparent loop is 
 - Functional authored diff before task-document inclusion: backend **62 additions / 2 deletions**, tests **169 additions / 73 deletions**, total **306**. The new task document and all progress text are counted in the work-unit commit at handoff.
 - Rollback scope: L1 backend/test/task-document work-unit only, with parent authorization; no installed app was changed. Physical ducking, UI responsiveness and user's exact reproduction remain unverified. L2/L3 stay open; no native review has been run by this worker.
 
+- Parent-reported L1 review closure: the user granted the candidate; native single `review-reliability` returned no findings. Exact acknowledgement returned `gentle-ai.review-acknowledged/v1`, action `acknowledged`, authority burned, lineage `review-c5798ed9a88e250c`, consumed revision `63cda20bf60aecfe6e767a44b138b976d3e49b1698ef17ca7d7e81bf56a4546f`. Reviewed boundary is `7e2244cfab515aee6477e040e0cfc3b42f6ffdd8`; do not reopen this consumed transaction.
+
 ### L2 — Make quarantine recovery bounded per operation and eventually retryable
 
-- [ ] L2: Remove reverse lock acquisition and permanent lifetime retry exhaustion while retaining unresolved native resources and preventing overlap.
+- [x] L2: Remove reverse lock acquisition and permanent lifetime retry exhaustion while retaining unresolved native resources and preventing overlap.
 
 **Route / ownership:** delegated direct, sequential after L1; `AudioCaptureBackend.swift` and `AudioCaptureBackendTests.swift`. Trigger: shared native teardown state and concurrency regressions. This is a genuine independent recovery behavior, not a line-budget split.
 
@@ -85,7 +87,18 @@ No mapped code automatically restarts after route cleanup. The apparent loop is 
 
 **Checks:** backend focused suite, disabled native probe, applicable aggregate checks below.
 
-**Evidence:** pending; no source edits, tests, or commit.
+**Evidence (2026-09-30):** L2 implemented with focused proof; full-suite result remains partial at the known baseline failure. Local work-unit commit pending at this pre-commit snapshot.
+
+- First behavioral RED before any production edit: `/tmp/nuvi-l2-red.log`, **26 backend tests / 1 failure** in `testLaterAdmissionRecoversAfterMoreThanThreeTransientTeardownFailures`; five failed admissions still prevented recovery after native stop/uninitialize/dispose became successful. Direct deferred cleanup isolated the regression on the old implementation.
+- Then the existing unsafe prune was extracted without changing its lock behavior into a narrow per-call inspection-barrier helper. `/tmp/nuvi-l2-lock-red.log`: **28 tests / 2 failures**, including deterministic `testQuarantinePruningAllowsConcurrentRetentionWhileLifecycleInspectionWaits`. The retainer timed out because quarantine held its lock while waiting for the lifecycle; bounded gates then released/drained workers, without wedging the test process.
+- GREEN after the fix and final test readability/safety edits: `/tmp/nuvi-l2-backend.log`, **28/28 PASS**. Tests prove eventual recovery beyond three failures, bounded per-admission native work/no new unit before recovery, concurrent retention while lifecycle inspection waits, preservation of newly retained unresolved ownership, and 32 concurrent admission attempts capped at 16 reservations with all reservations released. Existing L1 route and listener/callback safety regressions remain green.
+- `/tmp/nuvi-l2-service.log`: **6/6 PASS**. `/tmp/nuvi-l2-probe.log`: **1 SKIP / 0 failures**, environment `NUVI_RUN_NATIVE_DUCKING_PROBE=0`; no physical microphone/ducking QA.
+- `/tmp/nuvi-l2-full.log`: **206 passed cases / 2 skipped / no assertion failures**, then actual signal 5 at `SpeechAnalyzerEngineTests/testAnalyzerInputQueueCountsDropsAndPreservesOldestSlices`. Exit 1; full suite **not PASS**, later suites incomplete. `/tmp/nuvi-l2-release.log`: **exit 0 / Build complete (37.49 sec)**. Existing unrelated capture warnings remain, no source workaround or policy change.
+- Exact Swift commands used the planned flags with `CLANG_MODULE_CACHE_PATH=/tmp/nuvi-ptt-module-cache` and `--cache-path /tmp/nuvi-ptt-swift-cache`; GREEN/required checks ran with narrowly scoped normal compiler permissions. `git diff --check`: PASS.
+- Production diff: **18 additions / 8 deletions** in backend quarantine/retry paths; tests **127 additions / 0 deletions**, **153 functional authored lines** before task-document changes. No L1 route-validation, service/controller/hotkey/render/updater changes.
+- Recovery retries occur once per retained lifecycle per explicit admission/control operation, with no lifetime counter/timer/retry loop. Every quarantine-to-lifecycle inspection is outside the quarantine lock; pruning removes only fully released snapshot identities under the quarantine lock, preserving concurrent new entries and reservation accounting.
+- Runtime harness: N/A for this dispatch; actual microphone/UI/native app validation remains excluded and the broader user reproduction is not claimed solved. Rollback boundary is only this L2 backend/test/task-evidence work-unit; preserve L1 route fix and its consumed review. Parent owns L2 native assessment/consent. L3 remains open.
+
 
 ### L3 — Serialize native control off main and own all asynchronous work by session
 
@@ -128,9 +141,9 @@ Future separately authorized real-device validation should cover long held PTT, 
 
 ## Progress and next step
 
-- L1: implemented and focused checks passed; aggregate full-suite proof partial at the documented baseline signal 5. L2/L3 remain open.
-- Current implementation authored count: **306**, plus this new task document; exact commit numstat is reported at handoff. Generated artifacts are excluded.
-- Required checks completed with results and sandbox/normal-permission distinction recorded above. Physical/native runtime QA remains unrun.
-- Delivery: new integrated `size:exception` granted; no remote/install/publication authority added.
-- Local L1 work-unit commit pending at this snapshot; parent owns subsequent native risk assessment and any exact consent lifecycle. No review or remote operation performed by this worker.
-- Next: parent reads the L1 commit/evidence, assesses its exact work-unit range, then separately dispatches L2; do not claim the full renewed audio failure is solved by L1 alone.
+- L1/L2: implemented with focused checks; full-suite proof remains partial at the documented baseline signal 5. L1 native review closed; L2 native assessment pending. L3 remains open.
+- L1 commit authored count: **442** (**367 additions / 75 deletions**). L2 functional authored count: **153**, plus task-document changes; exact L2 commit and accumulated numstat recorded at handoff. Generated artifacts excluded.
+- Required L2 checks and exact logs recorded above. Physical/native runtime QA remains unrun; no installation, version, package or remote changes.
+- Delivery: integrated `size:exception` granted; no remote/install/publication authority added.
+- Local L1 commit: `7e2244cfab515aee6477e040e0cfc3b42f6ffdd8`; local L2 work-unit commit pending at this snapshot. Parent owns its exact-range assessment after handoff; this writer ran no native review operations.
+- Next: parent checks the L2 committed range against the reviewed L1 boundary, then separately dispatches L3; do not claim the full renewed audio failure solved before control/session ownership and authorized physical validation.
