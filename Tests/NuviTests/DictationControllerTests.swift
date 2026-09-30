@@ -731,6 +731,206 @@ final class DictationControllerTests: XCTestCase {
         XCTAssertEqual(controller.state, .inserted)
     }
 
+    func testSlowNativeStartAllowsCancelAndQueuesReplacementAfterTeardown() async {
+        let audio = FakeAudioCapture()
+        let gate = NativeControlGate()
+        audio.startGate = gate
+        let controller = DictationController(
+            audio: audio, engine: FakeEngine(), history: HistoryStore(),
+            vocabulary: VocabularyStore(), modes: ModesStore(), textInjector: FakeTextInjector()
+        )
+        defer { gate.open(); controller.cancel() }
+        controller.start()
+        await fulfillment(of: [gate.entered], timeout: 3)
+        XCTAssertFalse(gate.ranOnMain, "Native start must leave the main actor responsive")
+        XCTAssertFalse(gate.timedOut, "The user action must run before native startup returns")
+        controller.cancel()
+        controller.start()
+        XCTAssertEqual(audio.startCount, 1, "Replacement must wait for old native teardown")
+        XCTAssertNotEqual(controller.state, .listening, "Cancelled startup cannot publish listening")
+        gate.open()
+        await waitUntil { audio.startCount == 2 && controller.state == .listening }
+        XCTAssertEqual(Array(audio.controlEvents.prefix(3)), ["start", "stop", "start"])
+    }
+
+    func testReleaseDuringSlowNativeStartupFinalizesOnce() async {
+        let audio = FakeAudioCapture()
+        let gate = NativeControlGate()
+        audio.startGate = gate
+        let engine = FakeEngine()
+        let injector = FakeTextInjector()
+        let controller = DictationController(
+            audio: audio, engine: engine, history: HistoryStore(),
+            vocabulary: VocabularyStore(), modes: ModesStore(), textInjector: injector
+        )
+        defer { gate.open(); controller.cancel() }
+        controller.start()
+        await fulfillment(of: [gate.entered], timeout: 3)
+        XCTAssertFalse(gate.timedOut)
+        controller.stop()
+        gate.open()
+        await waitUntil { audio.stopCount == 1 && controller.state == .transcribing }
+        engine.emit(.final("released during startup"))
+        engine.finish()
+        await waitUntil { controller.state == .inserted }
+        XCTAssertEqual(injector.insertedTexts, ["released during startup"])
+        XCTAssertEqual(audio.stopCount, 1)
+    }
+
+    func testSlowNativeStopAllowsCancelWithoutStartingReplacementEarly() async {
+        let audio = FakeAudioCapture()
+        let engine = FakeEngine()
+        let controller = DictationController(
+            audio: audio, engine: engine, history: HistoryStore(),
+            vocabulary: VocabularyStore(), modes: ModesStore(), textInjector: FakeTextInjector()
+        )
+        controller.start()
+        await waitUntil { controller.state == .listening }
+        let gate = NativeControlGate()
+        audio.stopGate = gate
+        defer { gate.open(); controller.cancel() }
+        controller.stop()
+        await fulfillment(of: [gate.entered], timeout: 3)
+        XCTAssertFalse(gate.ranOnMain)
+        XCTAssertFalse(gate.timedOut)
+        controller.cancel()
+        controller.start()
+        XCTAssertEqual(audio.startCount, 1)
+        gate.open()
+        await waitUntil { audio.startCount == 2 && controller.state == .listening }
+        XCTAssertEqual(Array(audio.controlEvents.prefix(3)), ["start", "stop", "start"])
+    }
+
+    func testOldCaptureFeedbackCannotArmSilenceOrChangeReplacementSpectrum() async {
+        let audio = FakeAudioCapture()
+        let engine = FakeEngine()
+        let controller = DictationController(
+            audio: audio, engine: engine, history: HistoryStore(),
+            vocabulary: VocabularyStore(), modes: ModesStore(), textInjector: FakeTextInjector(),
+            silenceDetectionEnabled: { true }, silenceDurationThreshold: { 0.1 }
+        )
+        defer { controller.cancel() }
+        controller.start()
+        await waitUntil { controller.state == .listening }
+        let oldLevel = audio.capturedLevels[0]
+        let oldSpectrum = audio.capturedSpectra[0]
+        oldLevel?(0.8)
+        await Task.yield()
+        oldLevel?(0)
+        controller.cancel()
+        controller.start()
+        await waitUntil { audio.startCount == 2 && controller.state == .listening }
+        oldSpectrum?(AudioSpectrum(level: 0.8, bass: 1, mid: 1, treble: 1))
+        oldLevel?(0)
+        engine.oldContinuations[0].yield(.final("stale capture text"))
+        engine.oldContinuations[0].finish(throwing: FakeError.prepareFailed)
+        // This waits past the documented 0.5s silence threshold, not native
+        // queue ordering. The native ordering tests above use explicit gates.
+        try? await Task.sleep(nanoseconds: 650_000_000)
+        XCTAssertEqual(controller.state, .listening)
+        XCTAssertEqual(controller.spectrum, .zero)
+        XCTAssertEqual(controller.level, 0)
+        XCTAssertEqual(controller.transcript, "")
+        XCTAssertEqual(audio.stopCount, 1)
+    }
+
+    func testCanceledStartupErrorCannotFailReplacementSession() async {
+        let audio = FakeAudioCapture()
+        let gate = NativeControlGate()
+        audio.startGate = gate
+        audio.startError = AudioCaptureError.microphoneInUse
+        let controller = DictationController(
+            audio: audio, engine: FakeEngine(), history: HistoryStore(),
+            vocabulary: VocabularyStore(), modes: ModesStore(), textInjector: FakeTextInjector()
+        )
+        defer { gate.open(); controller.cancel() }
+        controller.start()
+        await fulfillment(of: [gate.entered], timeout: 3)
+        controller.cancel()
+        audio.startError = nil
+        controller.start()
+        gate.open()
+        await waitUntil { audio.startCount == 2 && controller.state == .listening }
+        XCTAssertEqual(controller.state, .listening)
+    }
+
+    func testCanceledTranslationCannotDeliverIntoReplacementSession() async {
+        let audio = FakeAudioCapture()
+        let engine = FakeEngine()
+        let translator = SuspendedTextTranslator()
+        let history = HistoryStore(isHistoryEnabled: { true })
+        let injector = FakeTextInjector()
+        let controller = DictationController(
+            audio: audio, engine: engine, history: history,
+            vocabulary: VocabularyStore(), modes: ModesStore(), textInjector: injector,
+            textTranslator: translator, translationTarget: { .portugueseBrazil }
+        )
+        defer { translator.resume(); controller.cancel() }
+        controller.start()
+        await waitUntil { controller.state == .listening }
+        engine.emit(.final("old capture"))
+        engine.finish()
+        await fulfillment(of: [translator.entered], timeout: 1)
+        controller.cancel()
+        controller.start()
+        await waitUntil { audio.startCount == 2 && controller.state == .listening }
+        translator.resume()
+        await fulfillment(of: [translator.returned], timeout: 1)
+        await Task.yield()
+        XCTAssertEqual(controller.state, .listening)
+        XCTAssertEqual(controller.transcript, "")
+        XCTAssertTrue(injector.insertedTexts.isEmpty)
+        XCTAssertTrue(history.entries.isEmpty)
+    }
+
+    func testRepeatedPTTCyclesPreserveDuckingAndFinalizeOncePerSession() async {
+        let audio = FakeAudioCapture()
+        let engine = FakeEngine()
+        let injector = FakeTextInjector()
+        var ducking = true
+        let controller = DictationController(
+            audio: audio, engine: engine, history: HistoryStore(),
+            vocabulary: VocabularyStore(), modes: ModesStore(), textInjector: injector,
+            duckAudioDuringDictation: { ducking }
+        )
+        defer { controller.cancel() }
+        for index in 0..<3 {
+            ducking = index != 1
+            controller.start()
+            await waitUntil { controller.state == .listening }
+            controller.stop()
+            await waitUntil { audio.stopCount == index + 1 }
+            engine.emit(.final("cycle \(index)"))
+            engine.finish()
+            await waitUntil { controller.state == .inserted }
+        }
+        XCTAssertEqual(audio.configurations.map(\.duckOtherAudio), [true, false, true])
+        XCTAssertEqual(injector.insertedTexts, ["cycle 0", "cycle 1", "cycle 2"])
+        XCTAssertEqual(audio.stopCount, 3)
+    }
+
+    func testPreviewCancelDuringNativeStartSharesSerialOwnershipBoundary() async {
+        let audio = FakeAudioCapture()
+        let gate = NativeControlGate()
+        audio.startGate = gate
+        let preview = FerrofluidMicProbe(capture: audio)
+        defer { gate.open(); preview.stop() }
+        preview.start()
+        await fulfillment(of: [gate.entered], timeout: 3)
+        XCTAssertFalse(gate.ranOnMain)
+        XCTAssertFalse(gate.timedOut)
+        preview.toggle()
+        preview.start()
+        XCTAssertEqual(audio.startCount, 1)
+        gate.open()
+        await waitUntil { audio.startCount == 2 && preview.active }
+        audio.capturedSpectra[0]?(AudioSpectrum(level: 1, bass: 1, mid: 1, treble: 1))
+        await Task.yield()
+        XCTAssertEqual(preview.spectrum, .zero)
+        XCTAssertEqual(Array(audio.controlEvents.prefix(3)), ["start", "stop", "start"])
+        XCTAssertTrue(audio.configurations.allSatisfy { !$0.duckOtherAudio })
+    }
+
     private func yieldUntil(_ predicate: @escaping @MainActor () -> Bool) async {
         for _ in 0..<1_000 where !predicate() {
             await Task.yield()
@@ -749,19 +949,55 @@ private enum FakeError: Error {
 }
 
 private final class FakeAudioCapture: AudioCapturing, @unchecked Sendable {
+    private let lock = NSLock()
     var onLevel: (@Sendable (Float) -> Void)?
     var onSpectrum: (@Sendable (AudioSpectrum) -> Void)?
     var permission = true
-    var startError: Error?
+    private var _startError: Error? = nil
+    var startError: Error? {
+        get { lock.withLock { _startError } }
+        set { lock.withLock { _startError = newValue } }
+    }
     var holdPermission = false
-    private(set) var permissionRequestCount = 0
-    private(set) var startCount = 0
-    private(set) var configurations: [AudioCaptureConfiguration] = []
+    private var _permissionRequestCount: Int = 0
+    var permissionRequestCount: Int {
+        get { lock.withLock { _permissionRequestCount } }
+    }
+    private var _startGate: NativeControlGate? = nil
+    var startGate: NativeControlGate? {
+        get { lock.withLock { _startGate } }
+        set { lock.withLock { _startGate = newValue } }
+    }
+    private var _stopGate: NativeControlGate? = nil
+    var stopGate: NativeControlGate? {
+        get { lock.withLock { _stopGate } }
+        set { lock.withLock { _stopGate = newValue } }
+    }
+    private var _controlEvents: [String] = []
+    var controlEvents: [String] {
+        get { lock.withLock { _controlEvents } }
+    }
+    private var _capturedLevels: [(@Sendable (Float) -> Void)?] = []
+    var capturedLevels: [(@Sendable (Float) -> Void)?] {
+        get { lock.withLock { _capturedLevels } }
+    }
+    private var _capturedSpectra: [(@Sendable (AudioSpectrum) -> Void)?] = []
+    var capturedSpectra: [(@Sendable (AudioSpectrum) -> Void)?] {
+        get { lock.withLock { _capturedSpectra } }
+    }
+    private var _startCount: Int = 0
+    var startCount: Int {
+        get { lock.withLock { _startCount } }
+    }
+    private var _configurations: [AudioCaptureConfiguration] = []
+    var configurations: [AudioCaptureConfiguration] {
+        get { lock.withLock { _configurations } }
+    }
     private var continuation: AsyncStream<AVAudioPCMBuffer>.Continuation?
     private var permissionContinuation: CheckedContinuation<Bool, Never>?
 
     func requestPermission() async -> Bool {
-        permissionRequestCount += 1
+        lock.withLock { _permissionRequestCount += 1 }
         if holdPermission {
             return await withCheckedContinuation { continuation in
                 permissionContinuation = continuation
@@ -777,18 +1013,33 @@ private final class FakeAudioCapture: AudioCapturing, @unchecked Sendable {
     }
 
     func start(configuration: AudioCaptureConfiguration) throws -> AsyncStream<AVAudioPCMBuffer> {
-        startCount += 1
-        configurations.append(configuration)
-        if let startError { throw startError }
+        let (capturedError, gate) = lock.withLock {
+            _startCount += 1
+            _controlEvents.append("start")
+            _configurations.append(configuration)
+            _capturedLevels.append(onLevel)
+            _capturedSpectra.append(onSpectrum)
+            return (_startError, _startGate)
+        }
+        gate?.block()
+        if let capturedError { throw capturedError }
         let pair = AsyncStream<AVAudioPCMBuffer>.makeStream()
         continuation = pair.continuation
         return pair.stream
     }
 
-    private(set) var stopCount = 0
+    private var _stopCount: Int = 0
+    var stopCount: Int {
+        get { lock.withLock { _stopCount } }
+    }
 
     func stop() {
-        stopCount += 1
+        let gate = lock.withLock {
+            _stopCount += 1
+            _controlEvents.append("stop")
+            return _stopGate
+        }
+        gate?.block()
         continuation?.finish()
         continuation = nil
     }
@@ -800,6 +1051,7 @@ private final class FakeEngine: TranscriptionEngine, @unchecked Sendable {
     var events: [TranscriptionEvent] = []
     var preparedLocales: [String] = []
     var reportingPartialsRequests: [Bool] = []
+    private(set) var oldContinuations: [AsyncThrowingStream<TranscriptionEvent, Error>.Continuation] = []
     private var continuation: AsyncThrowingStream<TranscriptionEvent, Error>.Continuation?
 
     init(identifier: String = "fake") {
@@ -814,6 +1066,7 @@ private final class FakeEngine: TranscriptionEngine, @unchecked Sendable {
     func transcribe(_ audio: AsyncStream<AVAudioPCMBuffer>) -> AsyncThrowingStream<TranscriptionEvent, Error> {
         AsyncThrowingStream { continuation in
             self.continuation = continuation
+            oldContinuations.append(continuation)
             for event in events {
                 continuation.yield(event)
             }
@@ -910,6 +1163,27 @@ private final class FakeTextTranslator: TextTranslating {
 }
 
 @MainActor
+private final class SuspendedTextTranslator: TextTranslating {
+    let entered = XCTestExpectation(description: "translation suspended")
+    let returned = XCTestExpectation(description: "translation returned")
+    private var continuation: CheckedContinuation<String, Never>?
+
+    func translate(_ text: String, to target: TranslationTarget) async throws -> String {
+        let result = await withCheckedContinuation { continuation in
+            self.continuation = continuation
+            entered.fulfill()
+        }
+        returned.fulfill()
+        return result
+    }
+
+    func resume() {
+        continuation?.resume(returning: "late translation")
+        continuation = nil
+    }
+}
+
+@MainActor
 private final class FailingTextTranslator: TextTranslating {
     private let error: Error
 
@@ -956,5 +1230,49 @@ private final class ManualCompletionFeedbackScheduler: CompletionFeedbackSchedul
 
     func fireAllIncludingCancelled() {
         work.forEach { $0.action() }
+    }
+}
+
+private final class NativeControlGate: @unchecked Sendable {
+    let entered = XCTestExpectation(description: "native operation entered")
+    private let release = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var opened = false
+    private var onMain = false
+    private var timeout = false
+
+    var ranOnMain: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return onMain
+    }
+
+    var timedOut: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return timeout
+    }
+
+    func block() {
+        lock.lock()
+        guard !opened else {
+            lock.unlock()
+            return
+        }
+        onMain = Thread.isMainThread
+        lock.unlock()
+        entered.fulfill()
+        let result = release.wait(timeout: .now() + 2)
+        lock.lock()
+        timeout = result == .timedOut
+        opened = true
+        lock.unlock()
+    }
+
+    func open() {
+        lock.lock()
+        opened = true
+        lock.unlock()
+        release.signal()
     }
 }
