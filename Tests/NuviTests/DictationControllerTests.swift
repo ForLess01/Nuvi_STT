@@ -804,9 +804,10 @@ final class DictationControllerTests: XCTestCase {
     func testOldCaptureFeedbackCannotArmSilenceOrChangeReplacementSpectrum() async {
         let audio = FakeAudioCapture()
         let engine = FakeEngine()
+        let injector = FakeTextInjector()
         let controller = DictationController(
             audio: audio, engine: engine, history: HistoryStore(),
-            vocabulary: VocabularyStore(), modes: ModesStore(), textInjector: FakeTextInjector(),
+            vocabulary: VocabularyStore(), modes: ModesStore(), textInjector: injector,
             silenceDetectionEnabled: { true }, silenceDurationThreshold: { 0.1 }
         )
         defer { controller.cancel() }
@@ -815,23 +816,51 @@ final class DictationControllerTests: XCTestCase {
         let oldLevel = audio.capturedLevels[0]
         let oldSpectrum = audio.capturedSpectra[0]
         oldLevel?(0.8)
-        await Task.yield()
+        await waitUntil { controller.level == 0.8 }
+        XCTAssertEqual(controller.level, 0.8, "A's speech callback must have been processed")
         oldLevel?(0)
+        await waitUntil { self.hasArmedSilenceTimer(controller) }
+        XCTAssertEqual(controller.level, 0)
+        XCTAssertTrue(hasArmedSilenceTimer(controller), "Observe A's actual timer before cancellation")
+        // The timer clamps this fixture's threshold to 0.5s. Only after its
+        // handle exists do we establish a deadline beyond its possible firing.
+        let pastOldDeadline = ContinuousClock.now.advanced(by: .milliseconds(650))
         controller.cancel()
         controller.start()
         await waitUntil { audio.startCount == 2 && controller.state == .listening }
+        XCTAssertFalse(hasArmedSilenceTimer(controller), "B starts without A's timer")
         oldSpectrum?(AudioSpectrum(level: 0.8, bass: 1, mid: 1, treble: 1))
         oldLevel?(0)
-        engine.oldContinuations[0].yield(.final("stale capture text"))
+        // Cancellation already terminates A's iterator: prove that these
+        // attempted late events are dropped, not that its error handler runs.
+        switch engine.oldContinuations[0].yield(.final("stale capture text")) {
+        case .terminated: break
+        default: XCTFail("Canceled capture iterator must reject late events")
+        }
         engine.oldContinuations[0].finish(throwing: FakeError.prepareFailed)
-        // This waits past the documented 0.5s silence threshold, not native
-        // queue ordering. The native ordering tests above use explicit gates.
-        try? await Task.sleep(nanoseconds: 650_000_000)
+        try? await Task.sleep(until: pastOldDeadline, clock: .continuous)
         XCTAssertEqual(controller.state, .listening)
+        XCTAssertFalse(hasArmedSilenceTimer(controller))
         XCTAssertEqual(controller.spectrum, .zero)
         XCTAssertEqual(controller.level, 0)
         XCTAssertEqual(controller.transcript, "")
         XCTAssertEqual(audio.stopCount, 1)
+
+        controller.stop()
+        await waitUntil { audio.stopCount == 2 && controller.state == .transcribing }
+        engine.emit(.final("replacement capture text"))
+        engine.finish()
+        await waitUntil { controller.state == .inserted }
+        XCTAssertEqual(injector.insertedTexts, ["replacement capture text"])
+        XCTAssertEqual(audio.stopCount, 2)
+    }
+
+    private func hasArmedSilenceTimer(_ controller: DictationController) -> Bool {
+        // Read the existing private handle without adding production test API.
+        guard let timer = Mirror(reflecting: controller).children.first(where: {
+            $0.label == "silenceStopTask"
+        })?.value else { return false }
+        return !Mirror(reflecting: timer).children.isEmpty
     }
 
     func testCanceledStartupErrorCannotFailReplacementSession() async {
