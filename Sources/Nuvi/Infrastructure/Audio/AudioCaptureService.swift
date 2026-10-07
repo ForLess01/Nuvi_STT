@@ -42,6 +42,99 @@ public extension AudioCapturing {
     }
 }
 
+/// Stable native callback owner that admits one per-press session at a time.
+/// It retains the active target until admission has closed and every callback
+/// that could have read the target has left, so the VPIO callback property never
+/// needs rebinding between compatible stopped cycles.
+internal final class AudioCaptureCallbackRouter: @unchecked Sendable {
+    private static let closedBit: UInt64 = 1 << 63
+    private static let callbackCountMask: UInt64 = closedBit - 1
+    private let callbackState = Atomic<UInt64>(closedBit)
+    private let sessionPointer = Atomic<UInt>(0)
+
+    deinit {
+        deactivate()
+    }
+
+    func activate(_ session: AudioCaptureSession) -> Bool {
+        guard sessionPointer.load(ordering: .acquiring) == 0 else { return false }
+        let pointer = UInt(bitPattern: Unmanaged.passRetained(session).toOpaque())
+        sessionPointer.store(pointer, ordering: .releasing)
+        callbackState.store(0, ordering: .releasing)
+        return true
+    }
+
+    func deactivate() {
+        closeAdmission()
+        waitForCallbacks()
+        let pointer = sessionPointer.exchange(0, ordering: .acquiringAndReleasing)
+        guard pointer != 0, let raw = UnsafeMutableRawPointer(bitPattern: pointer) else { return }
+        Unmanaged<AudioCaptureSession>.fromOpaque(raw).release()
+    }
+
+    func render(
+        actionFlags: UnsafeMutablePointer<AudioUnitRenderActionFlags>,
+        timeStamp: UnsafePointer<AudioTimeStamp>,
+        busNumber: UInt32,
+        frames: UInt32
+    ) -> OSStatus {
+        guard enterCallback() else { return noErr }
+        defer { leaveCallback() }
+        let pointer = sessionPointer.load(ordering: .acquiring)
+        guard pointer != 0, let raw = UnsafeMutableRawPointer(bitPattern: pointer) else { return noErr }
+        let session = Unmanaged<AudioCaptureSession>.fromOpaque(raw).takeUnretainedValue()
+        guard session.enterCallback() else { return noErr }
+        defer { session.leaveCallback() }
+        return session.render(actionFlags: actionFlags, timeStamp: timeStamp, busNumber: busNumber, frames: frames)
+    }
+
+    /// Returns a strong control-plane snapshot while router admission prevents
+    /// deactivation from releasing the unmanaged target underneath it. Callers
+    /// must perform cleanup only after releasing any lifecycle control lock.
+    func currentSessionSnapshot() -> AudioCaptureSession? {
+        guard enterCallback() else { return nil }
+        defer { leaveCallback() }
+        let pointer = sessionPointer.load(ordering: .acquiring)
+        guard pointer != 0, let raw = UnsafeMutableRawPointer(bitPattern: pointer) else { return nil }
+        return Unmanaged<AudioCaptureSession>.fromOpaque(raw).takeUnretainedValue()
+    }
+
+    private func enterCallback() -> Bool {
+        while true {
+            let state = callbackState.load(ordering: .acquiring)
+            guard state & Self.closedBit == 0 else { return false }
+            guard state & Self.callbackCountMask < Self.callbackCountMask else { return false }
+            if callbackState.compareExchange(
+                expected: state,
+                desired: state &+ 1,
+                ordering: .acquiringAndReleasing
+            ).exchanged { return true }
+        }
+    }
+
+    private func leaveCallback() {
+        callbackState.wrappingSubtract(1, ordering: .releasing)
+    }
+
+    private func closeAdmission() {
+        while true {
+            let state = callbackState.load(ordering: .acquiring)
+            guard state & Self.closedBit == 0 else { return }
+            if callbackState.compareExchange(
+                expected: state,
+                desired: state | Self.closedBit,
+                ordering: .acquiringAndReleasing
+            ).exchanged { return }
+        }
+    }
+
+    private func waitForCallbacks() {
+        while callbackState.load(ordering: .acquiring) & Self.callbackCountMask != 0 {
+            sched_yield()
+        }
+    }
+}
+
 /// Per-run state retained by the service while the native callback is installed.
 /// The callback never reaches back into `AudioCaptureService`, so stopping one
 /// run cannot expose another run's unit, format, or stream continuation.
@@ -66,6 +159,9 @@ internal final class AudioCaptureSession: @unchecked Sendable {
     private let callbackState = Atomic<UInt64>(0)
     private let cleanupState = Atomic<Bool>(false)
     private let cleanupFinished = Atomic<Bool>(false)
+    // Terminal cleanup disposes the native unit. A later service stop must not
+    // mistake that already-cleaned session for a reusable stopped VPIO graph.
+    private let nativeUnitReleased = Atomic<Bool>(false)
     private let streamTerminated = Atomic<Bool>(false)
     private let publisherStartedState = Atomic<Bool>(false)
     private let firstPCMPublished = Atomic<Bool>(false)
@@ -141,14 +237,23 @@ internal final class AudioCaptureSession: @unchecked Sendable {
         publisherTask = task
     }
 
-    /// Stops the native audio unit before completing the stream. Calls are control-side and
-    /// intentionally idempotent so failed starts and stream cancellation
-    /// cannot double-dispose a unit.
+    /// Stops and releases the native unit before completing the stream. Calls are
+    /// control-side and intentionally idempotent so failed starts and stream
+    /// cancellation cannot double-dispose a unit.
     func cleanup() {
-        cleanup(waitForPublisher: true)
+        cleanup(releaseNativeUnit: true, waitForPublisher: true)
     }
 
-    private func cleanup(waitForPublisher: Bool) {
+    /// Stops one session while retaining an initialized VPIO unit for a later,
+    /// compatible admission. The caller must release the stable callback router
+    /// only after this returns.
+    func stopKeepingInitializedUnit() -> Bool {
+        cleanup(releaseNativeUnit: false, waitForPublisher: true)
+        return !nativeUnitReleased.load(ordering: .acquiring)
+            && lifecycle.cleanupStatus.stop == noErr
+    }
+
+    private func cleanup(releaseNativeUnit: Bool, waitForPublisher: Bool) {
         guard !cleanupState.exchange(true, ordering: .acquiringAndReleasing) else {
             if waitForPublisher {
                 while !cleanupFinished.load(ordering: .acquiring) {
@@ -159,12 +264,18 @@ internal final class AudioCaptureSession: @unchecked Sendable {
         }
         defer { cleanupFinished.store(true, ordering: .releasing) }
 
+        if releaseNativeUnit {
+            nativeUnitReleased.store(true, ordering: .releasing)
+        }
+
         closeCallbackAdmission()
         waitForCallbacks()
         let owner = String(describing: ObjectIdentifier(self))
         AudioPhaseTiming.measure("native_stop", owner: owner) { lifecycle.stop() }
-        AudioPhaseTiming.measure("native_uninitialize", owner: owner) { lifecycle.uninitialize() }
-        AudioPhaseTiming.measure("native_dispose", owner: owner) { lifecycle.dispose() }
+        if releaseNativeUnit {
+            AudioPhaseTiming.measure("native_uninitialize", owner: owner) { lifecycle.uninitialize() }
+            AudioPhaseTiming.measure("native_dispose", owner: owner) { lifecycle.dispose() }
+        }
 
         // No callback can publish after the admission wait. The publisher may
         // still own queued slots, so close first and let it drain before the
@@ -297,13 +408,13 @@ internal final class AudioCaptureSession: @unchecked Sendable {
             publisherCompletion.signal()
             if streamTerminated.load(ordering: .acquiring),
                !cleanupState.load(ordering: .acquiring) {
-                cleanup(waitForPublisher: false)
+                cleanup(releaseNativeUnit: true, waitForPublisher: false)
             }
         }
 
         while true {
             if fatalRenderRequested.load(ordering: .acquiring) {
-                cleanup(waitForPublisher: false)
+                cleanup(releaseNativeUnit: true, waitForPublisher: false)
                 return
             }
             var processedAny = false
@@ -313,7 +424,7 @@ internal final class AudioCaptureSession: @unchecked Sendable {
             }
 
             if fatalRenderRequested.load(ordering: .acquiring) {
-                cleanup(waitForPublisher: false)
+                cleanup(releaseNativeUnit: true, waitForPublisher: false)
                 return
             }
 
@@ -451,6 +562,8 @@ internal final class AudioCaptureSession: @unchecked Sendable {
 /// delivery, so consumers never retain a buffer that the callback may reuse.
 public final class AudioCaptureService: AudioCapturing, @unchecked Sendable {
     private var activeSession: AudioCaptureSession?
+    private var activeBackend: AudioCaptureBackend?
+    private var idleVoiceProcessingBackend: AudioCaptureBackend?
     private let backendFactory: AudioCaptureBackendFactory
     private let inputDeviceOverride: AudioDeviceID?
     private let controlLock = NSRecursiveLock()
@@ -486,7 +599,11 @@ public final class AudioCaptureService: AudioCapturing, @unchecked Sendable {
 
     deinit {
         controlLock.lock()
-        cleanupCaptureLocked()
+        cleanupCaptureLocked(allowStoppedReuse: false)
+        if let idleVoiceProcessingBackend {
+            cleanup(backend: idleVoiceProcessingBackend)
+            self.idleVoiceProcessingBackend = nil
+        }
         controlLock.unlock()
     }
 
@@ -513,30 +630,32 @@ public final class AudioCaptureService: AudioCapturing, @unchecked Sendable {
             let selection = try inputDeviceOverride.map { (id: $0, uid: Optional<String>.none) }
                 ?? chosenInputDevice(configuration: configuration)
             let device = selection.id
-            let backend = try backendFactory.makeBackend(
-                configuration: configuration,
-                inputDevice: device
-            )
-            backendForCleanup = backend
-            // Negotiate native capacity before creating any callback-owned
-            // memory; failures here remain owned by backendForCleanup.
+            let backend: AudioCaptureBackend
+            if let idleVoiceProcessingBackend,
+               idleVoiceProcessingBackend.canReuseStoppedUnit(configuration: configuration, inputDevice: device) {
+                backend = idleVoiceProcessingBackend
+                self.idleVoiceProcessingBackend = nil
+                backendForCleanup = backend
+                let owner = String(describing: ObjectIdentifier(backend.lifecycle))
+                try AudioPhaseTiming.measure("native_prepare", owner: owner) { try backend.prepareForNextSession() }
+            } else {
+                if let idleVoiceProcessingBackend {
+                    cleanup(backend: idleVoiceProcessingBackend)
+                    self.idleVoiceProcessingBackend = nil
+                }
+                backend = try backendFactory.makeBackend(configuration: configuration, inputDevice: device)
+                backendForCleanup = backend
+                let owner = String(describing: ObjectIdentifier(backend.lifecycle))
+                try AudioPhaseTiming.measure("native_prepare", owner: owner) { try backend.prepare() }
+            }
             let owner = String(describing: ObjectIdentifier(backend.lifecycle))
-            try AudioPhaseTiming.measure("native_prepare", owner: owner) { try backend.prepare() }
             activeDiagnostics = backend.diagnostics.with(selectedInputUID: selection.uid)
             lastDiagnostics = activeDiagnostics
             if backend.usesBluetoothInput {
                 NSLog("Nuvi/audio: Bluetooth input selected; applying speech gain while macOS uses hands-free/HFP quality")
             }
 
-            NSLog(
-                "Nuvi/audio: backend=\(backend.kind), input device=\(device), " +
-                "sampleRate=\(backend.captureFormat.sampleRate), channels=\(backend.captureFormat.channelCount)"
-            )
-
             let (stream, continuation) = AsyncStream<AVAudioPCMBuffer>.makeStream(
-                // The ring and stream both use drop-newest semantics. Keeping
-                // the oldest buffered values preserves temporal order when a
-                // consumer falls behind.
                 bufferingPolicy: .bufferingOldest(AudioCaptureSession.streamBufferCapacity)
             )
             let ring = AudioChunkRing(
@@ -554,10 +673,9 @@ public final class AudioCaptureService: AudioCapturing, @unchecked Sendable {
                 ring: ring
             )
             activeSession = session
+            activeBackend = backend
             session.installTerminationHandler()
             session.startPublisher()
-            // From this point on, the session owns all callback state and the
-            // catch path must clean it through `activeSession`.
             backendForCleanup = nil
 
             try backend.installCallbacks(for: session)
@@ -571,15 +689,14 @@ public final class AudioCaptureService: AudioCapturing, @unchecked Sendable {
             }
             activeDiagnostics = backend.diagnostics.with(selectedInputUID: selection.uid)
             lastDiagnostics = activeDiagnostics
-
             NSLog("Nuvi/audio: capture started")
             return stream
         } catch let error as AudioCaptureError {
-            cleanupCaptureLocked()
+            cleanupCaptureLocked(allowStoppedReuse: false)
             cleanup(backend: backendForCleanup)
             throw error
         } catch {
-            cleanupCaptureLocked()
+            cleanupCaptureLocked(allowStoppedReuse: false)
             cleanup(backend: backendForCleanup)
             NSLog("Nuvi/audio: failed to start microphone capture: \(String(describing: error))")
             if configuration.duckOtherAudio {
@@ -603,20 +720,39 @@ public final class AudioCaptureService: AudioCapturing, @unchecked Sendable {
 
     @discardableResult
     private func stopLocked() -> Bool {
-        cleanupCaptureLocked()
+        cleanupCaptureLocked(allowStoppedReuse: true)
     }
 
     @discardableResult
-    private func cleanupCaptureLocked() -> Bool {
-        // Detach first. The local strong reference keeps the callback-owned
-        // session alive through stop/uninitialize/dispose.
+    private func cleanupCaptureLocked(allowStoppedReuse: Bool) -> Bool {
+        // Detach first. The local strong references keep the callback-owned
+        // session and backend alive through ordered stop/publisher drain.
         let session = activeSession
+        let backend = activeBackend
         activeSession = nil
+        activeBackend = nil
         guard let session else {
             activeDiagnostics = nil
             return false
         }
-        session.cleanup()
+        guard let backend else {
+            session.cleanup()
+            lastCleanupStatus = session.lifecycle.cleanupStatus
+            activeDiagnostics = nil
+            return true
+        }
+
+        let retainedForReuse = allowStoppedReuse
+            && backend.supportsStoppedReuse
+            && session.stopKeepingInitializedUnit()
+        backend.releaseSessionCallback()
+        if retainedForReuse {
+            idleVoiceProcessingBackend = backend
+            lastCleanupStatus = session.lifecycle.cleanupStatus
+        } else {
+            session.cleanup()
+            cleanup(backend: backend)
+        }
         let status = session.lifecycle.cleanupStatus
         lastCleanupStatus = status
         if let activeDiagnostics {
@@ -711,10 +847,8 @@ internal func captureRenderCallback(refCon: UnsafeMutableRawPointer,
                                     busNumber: UInt32,
                                     frames: UInt32,
                                     data: UnsafeMutablePointer<AudioBufferList>?) -> OSStatus {
-    let session = Unmanaged<AudioCaptureSession>.fromOpaque(refCon).takeUnretainedValue()
-    guard session.enterCallback() else { return noErr }
-    defer { session.leaveCallback() }
-    return session.render(actionFlags: actionFlags, timeStamp: timeStamp, busNumber: busNumber, frames: frames)
+    let router = Unmanaged<AudioCaptureCallbackRouter>.fromOpaque(refCon).takeUnretainedValue()
+    return router.render(actionFlags: actionFlags, timeStamp: timeStamp, busNumber: busNumber, frames: frames)
 }
 
 /// Supplies the enabled VPIO output bus with real silence. This callback is

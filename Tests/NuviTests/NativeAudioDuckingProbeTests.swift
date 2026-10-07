@@ -46,14 +46,17 @@ final class NativeAudioDuckingProbeTests: XCTestCase {
             let diagnostics = try XCTUnwrap(capture.lastDiagnostics)
             XCTAssertEqual(diagnostics.requestedBackend, .voiceProcessingIO)
             XCTAssertEqual(diagnostics.effectiveBackend, .voiceProcessingIO)
-            XCTAssertTrue(diagnostics.cleanupComplete)
+            XCTAssertEqual(capture.lastCleanupStatus.stop, noErr)
+            XCTAssertNil(capture.lastCleanupStatus.uninitialize)
+            XCTAssertNil(capture.lastCleanupStatus.dispose)
+            XCTAssertFalse(diagnostics.cleanupComplete)
             if let outputBefore, let outputAfter {
                 XCTAssertEqual(outputAfter.deviceID, outputBefore.deviceID)
                 XCTAssertEqual(outputAfter.volume, outputBefore.volume)
                 XCTAssertEqual(outputAfter.muted, outputBefore.muted)
             }
 
-            print("NATIVE_DUCKING_CAPACITY cycle=\(cycle) maximum_frames=\(diagnostics.maximumFramesPerSlice) cleanup=\(diagnostics.cleanupComplete)")
+            print("NATIVE_DUCKING_CAPACITY cycle=\(cycle) maximum_frames=\(diagnostics.maximumFramesPerSlice) stopped=confirmed initialized_reuse=true")
             print(
                 "NATIVE_DUCKING_PROBE cycle=\(cycle) setup=ok frames=\(frames) " +
                 "output_device=\(outputAfter?.deviceID as Any) " +

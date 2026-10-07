@@ -127,6 +127,43 @@ final class AudioCaptureServiceTests: XCTestCase {
         XCTAssertEqual(recorder.events, ["stop", "uninitialize", "dispose"])
     }
 
+    @MainActor
+    func testQueuedStartCancellationBehindSlowStopDoesNotStart() async throws {
+        let capture = SlowStopAudioCapture()
+        let control = SerialAudioCaptureControl(capture: capture)
+        let firstID = UUID()
+        _ = try await control.start(
+            id: firstID,
+            configuration: AudioCaptureConfiguration(),
+            onLevel: { _ in },
+            onSpectrum: { _ in }
+        )
+        control.stop(id: firstID)
+        XCTAssertEqual(capture.stopEntered.wait(timeout: .now() + 1), .success)
+
+        let result = QueuedStartResult()
+        let cancelledStart = Task { @MainActor in
+            do {
+                _ = try await control.start(
+                    id: UUID(),
+                    configuration: AudioCaptureConfiguration(),
+                    onLevel: { _ in },
+                    onSpectrum: { _ in }
+                )
+                result.finish(error: nil)
+            } catch {
+                result.finish(error: error)
+            }
+        }
+        await Task.yield()
+        cancelledStart.cancel()
+        capture.releaseStop.signal()
+        while !result.isFinished { await Task.yield() }
+
+        XCTAssertTrue(result.error is CancellationError)
+        XCTAssertEqual(capture.startCount, 1)
+    }
+
     func testConcurrentStartAndStopSerializeSessionOwnership() async throws {
         let recorder = EventRecorder()
         let lifecycle = RecordingAudioUnitLifecycle(recorder: recorder)
@@ -253,5 +290,45 @@ private final class BlockingAudioCaptureBackendFactory: AudioCaptureBackendFacto
         makeEntered.signal()
         releaseMake.wait()
         return backend
+    }
+}
+
+private final class SlowStopAudioCapture: AudioCapturing, @unchecked Sendable {
+    var onLevel: (@Sendable (Float) -> Void)?
+    var onSpectrum: (@Sendable (AudioSpectrum) -> Void)?
+    let stopEntered = DispatchSemaphore(value: 0)
+    let releaseStop = DispatchSemaphore(value: 0)
+    private(set) var startCount = 0
+    private var stopCount = 0
+
+    func requestPermission() async -> Bool { true }
+
+    func start(configuration: AudioCaptureConfiguration) throws -> AsyncStream<AVAudioPCMBuffer> {
+        _ = configuration
+        startCount += 1
+        return AsyncStream { $0.finish() }
+    }
+
+    func stop() {
+        stopCount += 1
+        guard stopCount == 1 else { return }
+        stopEntered.signal()
+        releaseStop.wait()
+    }
+}
+
+private final class QueuedStartResult: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedError: Error?
+    private var finished = false
+
+    var isFinished: Bool { lock.withLock { finished } }
+    var error: Error? { lock.withLock { storedError } }
+
+    func finish(error: Error?) {
+        lock.withLock {
+            storedError = error
+            finished = true
+        }
     }
 }

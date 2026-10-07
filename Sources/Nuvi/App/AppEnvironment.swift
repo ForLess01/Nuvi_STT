@@ -53,6 +53,26 @@ final class AppEnvironment {
         statusItem = StatusItemController()
     }
 
+    /// Pure presentation policy so state observers never make a pre-admission
+    /// pill visible merely because the controller has begun preparing.
+    static func shouldShowPill(for state: DictationState) -> Bool {
+        switch state {
+        case .listening, .transcribing, .inserted, .copied, .notice, .error:
+            return true
+        case .preparing, .idle:
+            return false
+        }
+    }
+
+    static func shouldEnableCancelHotkey(for state: DictationState) -> Bool {
+        switch state {
+        case .preparing, .listening, .transcribing:
+            return true
+        case .inserted, .copied, .idle, .notice, .error:
+            return false
+        }
+    }
+
     func start() {
         // Ask for Accessibility up front (needed to paste into the focused app).
         TextInjector.ensureAccessibilityPermission()
@@ -127,6 +147,14 @@ final class AppEnvironment {
         }
     }
 
+    private func updatePillPresentation(for state: DictationState) {
+        guard SettingsStore.shared.showPill, Self.shouldShowPill(for: state) else {
+            pill.hide()
+            return
+        }
+        pill.show()
+    }
+
     private func observeState() {
         controller.$state
             .removeDuplicates()
@@ -135,24 +163,16 @@ final class AppEnvironment {
                 self.statusItem.update(state: state, isLiveSession: self.controller.isLiveSession)
                 switch state {
                 case .preparing, .listening, .transcribing:
-                    if SettingsStore.shared.showPill {
-                        self.pill.show()
-                    } else {
-                        self.pill.hide()
-                    }
+                    self.updatePillPresentation(for: state)
                     self.enableCancelHotkey()
                 case .inserted, .copied:
-                    if SettingsStore.shared.showPill {
-                        self.pill.show()
-                    } else {
-                        self.pill.hide()
-                    }
+                    self.updatePillPresentation(for: state)
                     self.disableCancelHotkey()
-                    if SettingsStore.shared.showPill {
+                    if SettingsStore.shared.showPill, Self.shouldShowPill(for: state) {
                         self.pill.resizeToContent()
                     }
                 case .idle:
-                    self.pill.hide()
+                    self.updatePillPresentation(for: state)
                     self.disableCancelHotkey()
                 case .notice:
                     self.showTransient(state, duration: PillTiming.noticeDuration)
@@ -189,11 +209,10 @@ final class AppEnvironment {
                     self.pill.hide()
                     return
                 }
-                switch self.controller.state {
-                case .preparing, .listening, .transcribing, .inserted, .copied, .notice, .error:
+                if Self.shouldShowPill(for: self.controller.state) {
                     self.pill.show()
                     self.pill.resizeToContent()
-                case .idle:
+                } else {
                     self.pill.hide()
                 }
             }

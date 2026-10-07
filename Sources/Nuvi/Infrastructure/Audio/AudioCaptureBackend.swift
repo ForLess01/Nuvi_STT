@@ -212,15 +212,23 @@ internal protocol AudioCaptureBackend: AnyObject {
     var maximumFramesPerSlice: UInt32 { get }
     var usesBluetoothInput: Bool { get }
     var diagnostics: AudioCaptureDiagnostics { get }
+    var supportsStoppedReuse: Bool { get }
 
     func prepare() throws
     func installCallbacks(for session: AudioCaptureSession) throws
     func start() throws
     func cleanup()
+    func canReuseStoppedUnit(configuration: AudioCaptureConfiguration, inputDevice: AudioDeviceID) -> Bool
+    func prepareForNextSession() throws
+    func releaseSessionCallback()
 }
 
 internal extension AudioCaptureBackend {
+    var supportsStoppedReuse: Bool { false }
     func prepare() throws {}
+    func canReuseStoppedUnit(configuration: AudioCaptureConfiguration, inputDevice: AudioDeviceID) -> Bool { false }
+    func prepareForNextSession() throws {}
+    func releaseSessionCallback() {}
 }
 
 internal protocol AudioCaptureBackendFactory: AnyObject {
@@ -559,13 +567,16 @@ internal final class NativeAudioUnitLifecycle: AudioUnitLifecycle, @unchecked Se
     func startIO() -> OSStatus {
         withControlLock {
             switch lifecycleState {
-            case .initialized:
+            case .initialized, .stopped:
                 let status = operations.start(handle)
-                if status == noErr { lifecycleState = .running }
+                if status == noErr {
+                    lifecycleState = .running
+                    stopStatus = nil
+                }
                 return status
             case .running:
                 return noErr
-            case .configured, .stopped, .uninitialized, .disposePending, .disposed:
+            case .configured, .uninitialized, .disposePending, .disposed:
                 return Self.lifecycleClosedStatus
             }
         }
@@ -666,12 +677,17 @@ internal final class NativeAudioUnitLifecycle: AudioUnitLifecycle, @unchecked Se
 
     func installCaptureCallback(for session: AudioCaptureSession) -> OSStatus {
         withControlLock {
-            guard lifecycleState == .configured || lifecycleState == .initialized,
-                  callbackOwner == nil else { return Self.lifecycleClosedStatus }
-            callbackOwner = session
+            guard lifecycleState == .configured || lifecycleState == .initialized || lifecycleState == .stopped else {
+                return Self.lifecycleClosedStatus
+            }
+            if let callbackOwner {
+                return callbackOwner.activate(session) ? noErr : Self.lifecycleClosedStatus
+            }
+
+            let callbackOwner = AudioCaptureCallbackRouter()
             var callback = AURenderCallbackStruct(
                 inputProc: captureRenderCallback,
-                inputProcRefCon: Unmanaged.passUnretained(session).toOpaque()
+                inputProcRefCon: Unmanaged.passUnretained(callbackOwner).toOpaque()
             )
             let status = operations.setProperty(
                 handle,
@@ -681,12 +697,29 @@ internal final class NativeAudioUnitLifecycle: AudioUnitLifecycle, @unchecked Se
                 data: &callback,
                 size: UInt32(MemoryLayout<AURenderCallbackStruct>.size)
             )
-            if status != noErr { callbackOwner = nil }
-            return status
+            guard status == noErr, callbackOwner.activate(session) else { return status == noErr ? Self.lifecycleClosedStatus : status }
+            self.callbackOwner = callbackOwner
+            return noErr
         }
     }
 
-    private var callbackOwner: AudioCaptureSession?
+    func releaseCaptureCallbackSession() {
+        withControlLock { callbackOwner?.deactivate() }
+    }
+
+    func requestCurrentCaptureCleanup() {
+        // A duplicate session cleanup can wait for its winner to finish. Take
+        // a strong router-protected snapshot while holding the lifecycle lock,
+        // then release that lock before any potentially waiting cleanup call.
+        let session = withControlLock { callbackOwner?.currentSessionSnapshot() }
+        session?.cleanup()
+    }
+
+    var isStopped: Bool {
+        withControlLock { lifecycleState == .stopped }
+    }
+
+    private var callbackOwner: AudioCaptureCallbackRouter?
 
     private func stopLocked() -> OSStatus {
         if lifecycleState == .disposed { return noErr }
@@ -699,10 +732,29 @@ internal final class NativeAudioUnitLifecycle: AudioUnitLifecycle, @unchecked Se
         stopStatus = status
         if status == noErr {
             lifecycleState = .stopped
-        } else {
-            NSLog("Nuvi/audio: native stop failed (status \(status))")
+            return verifyStoppedLocked()
         }
+        NSLog("Nuvi/audio: native stop failed (status \(status))")
         return status
+    }
+
+    private func verifyStoppedLocked() -> OSStatus {
+        var running: UInt32 = 1
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        let status = operations.getProperty(
+            handle,
+            property: kAudioOutputUnitProperty_IsRunning,
+            scope: kAudioUnitScope_Global,
+            element: 0,
+            data: &running,
+            size: &size
+        )
+        guard status == noErr, size >= UInt32(MemoryLayout<UInt32>.size), running == 0 else {
+            stopStatus = status == noErr ? Self.lifecycleClosedStatus : status
+            NSLog("Nuvi/audio: native stop did not confirm a non-running graph (status \(status), running \(running))")
+            return stopStatus ?? Self.lifecycleClosedStatus
+        }
+        return noErr
     }
 
     private func uninitializeLocked() -> OSStatus {
@@ -1059,28 +1111,27 @@ private final class NativeAudioCaptureBackend: AudioCaptureBackend, @unchecked S
                     // Keep validation alive after the service releases its
                     // backend local. Native listener removal breaks ownership;
                     // failed removals retain only a deactivated callback.
-                    onRouteChange: { [self, weak session] in
-                        guard let session, !session.cleanupRequested else { return }
+                    onRouteChange: { [self] in
                         let incompatible = nativeLifecycle.withControlLock {
                             // Initial setup may emit notifications before the
                             // unit has a readable effective route. Startup still
                             // verifies after both initialize and start.
-                            guard nativeLifecycle.canValidateRunningRoute,
-                                  !routeInvalidated else { return false }
+                            guard self.nativeLifecycle.canValidateRunningRoute,
+                                  !self.routeInvalidated else { return false }
                             do {
-                                try verifyCurrentDevices(stage: "route notification")
-                                try verifyDeviceAvailability()
-                                try verifyEffectiveFormats(stage: "route notification")
+                                try self.verifyCurrentDevices(stage: "route notification")
+                                try self.verifyDeviceAvailability()
+                                try self.verifyEffectiveFormats(stage: "route notification")
                                 return false
                             } catch {
-                                routeInvalidated = true
+                                self.routeInvalidated = true
                                 NSLog("Nuvi/audio: incompatible capture route: %@", String(describing: error))
                                 return true
                             }
                         }
                         // Session cleanup can wait for another cleanup caller.
                         // Never hold the lifecycle lock across that wait.
-                        if incompatible { session.cleanup() }
+                        if incompatible { nativeLifecycle.requestCurrentCaptureCleanup() }
                     }
                 )
             }
@@ -1092,7 +1143,7 @@ private final class NativeAudioCaptureBackend: AudioCaptureBackend, @unchecked S
             guard !routeInvalidated else {
                 throw setupFailure("The capture route is no longer compatible")
             }
-            let initializationStatus = nativeLifecycle.initializeUnit()
+            let initializationStatus = nativeLifecycle.isStopped ? noErr : nativeLifecycle.initializeUnit()
             guard initializationStatus == noErr else {
                 throw setupFailure("Could not initialize the capture unit (status \(initializationStatus))")
             }
@@ -1126,6 +1177,37 @@ private final class NativeAudioCaptureBackend: AudioCaptureBackend, @unchecked S
         }
     }
 
+    var supportsStoppedReuse: Bool { kind == .voiceProcessingIO }
+
+    func canReuseStoppedUnit(configuration: AudioCaptureConfiguration, inputDevice: AudioDeviceID) -> Bool {
+        guard kind == .voiceProcessingIO,
+              configuration.duckOtherAudio,
+              inputDevice == self.inputDevice,
+              nativeLifecycle.isStopped,
+              let outputDevice,
+              let currentDefaultOutput = devices.defaultOutputDeviceID(),
+              currentDefaultOutput != AudioDeviceID(kAudioObjectUnknown) else {
+            return false
+        }
+        return currentDefaultOutput == outputDevice
+    }
+
+    func prepareForNextSession() throws {
+        try nativeLifecycle.withControlLock {
+            guard nativeLifecycle.isStopped, !routeInvalidated else {
+                throw setupFailure("The stopped VPIO capture unit is not reusable")
+            }
+            try verifyCurrentDefaultOutput(stage: "reused preparation")
+            try verifyCurrentDevices(stage: "reused preparation")
+            try verifyDeviceAvailability()
+            try verifyEffectiveFormats(stage: "reused preparation")
+        }
+    }
+
+    func releaseSessionCallback() {
+        nativeLifecycle.releaseCaptureCallbackSession()
+    }
+
     private func verifyCurrentDevices(stage: String) throws {
         let actualInput = try readCurrentDevice(element: inputDeviceElement)
         guard actualInput == inputDevice else {
@@ -1139,6 +1221,19 @@ private final class NativeAudioCaptureBackend: AudioCaptureBackend, @unchecked S
         guard actualOutput == outputDevice else {
             throw setupFailure(
                 "The output route changed during \(stage) (requested \(outputDevice), got \(actualOutput))"
+            )
+        }
+    }
+
+    private func verifyCurrentDefaultOutput(stage: String) throws {
+        guard let outputDevice,
+              let currentDefaultOutput = devices.defaultOutputDeviceID(),
+              currentDefaultOutput != AudioDeviceID(kAudioObjectUnknown) else {
+            throw setupFailure("No current output device is available during \(stage)")
+        }
+        guard currentDefaultOutput == outputDevice else {
+            throw setupFailure(
+                "The default output changed during \(stage) (requested \(outputDevice), got \(currentDefaultOutput))"
             )
         }
     }

@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import Synchronization
 
 /// Enqueues requests in main-actor order, but runs every blocking native call
 /// on one serial control queue. Cancellation never abandons native ownership.
@@ -21,29 +22,40 @@ internal final class SerialAudioCaptureControl: @unchecked Sendable {
         onSpectrum: @escaping @Sendable (AudioSpectrum) -> Void
     ) async throws -> AsyncStream<AVAudioPCMBuffer> {
         try Task.checkCancellation()
+        let cancellation = QueuedStartCancellation()
         let enqueued = DispatchTime.now().uptimeNanoseconds
-        return try await withCheckedThrowingContinuation { continuation in
-            Self.queue.async { [self] in
-                AudioPhaseTiming.record("start_queue_wait", owner: id.uuidString, since: enqueued)
-                let timing = AudioPhaseTiming("capture_start", owner: id.uuidString)
-                defer { timing.finish() }
-                // A replacement must finish any previous teardown first, even
-                // if a previous task completed without an explicit PTT stop.
-                if activeID != nil { capture.stop() }
-                activeID = id
-                capture.onLevel = onLevel
-                capture.onSpectrum = onSpectrum
-                do {
-                    continuation.resume(returning: try capture.start(configuration: configuration))
-                } catch {
-                    capture.stop()
-                    activeID = nil
-                    capture.onLevel = nil
-                    capture.onSpectrum = nil
-                    continuation.resume(throwing: error)
+        return try await withTaskCancellationHandler(operation: {
+            try await withCheckedThrowingContinuation { continuation in
+                Self.queue.async { [self] in
+                    AudioPhaseTiming.record("start_queue_wait", owner: id.uuidString, since: enqueued)
+                    // A replacement must finish any previous teardown first, even
+                    // if a previous task completed without an explicit PTT stop.
+                    if activeID != nil { capture.stop() }
+                    // Cancellation while queued must never acquire the session,
+                    // bind feedback, or enter the native start call.
+                    guard !cancellation.isCancelled else {
+                        continuation.resume(throwing: CancellationError())
+                        return
+                    }
+                    let timing = AudioPhaseTiming("capture_start", owner: id.uuidString)
+                    defer { timing.finish() }
+                    activeID = id
+                    capture.onLevel = onLevel
+                    capture.onSpectrum = onSpectrum
+                    do {
+                        continuation.resume(returning: try capture.start(configuration: configuration))
+                    } catch {
+                        capture.stop()
+                        activeID = nil
+                        capture.onLevel = nil
+                        capture.onSpectrum = nil
+                        continuation.resume(throwing: error)
+                    }
                 }
             }
-        }
+        }, onCancel: {
+            cancellation.cancel()
+        })
     }
 
     @MainActor
@@ -66,4 +78,11 @@ internal final class SerialAudioCaptureControl: @unchecked Sendable {
         let capture = capture
         Self.queue.async { capture.stop() }
     }
+}
+
+private final class QueuedStartCancellation: @unchecked Sendable {
+    private let cancelled = Atomic<Bool>(false)
+
+    var isCancelled: Bool { cancelled.load(ordering: .acquiring) }
+    func cancel() { cancelled.store(true, ordering: .releasing) }
 }

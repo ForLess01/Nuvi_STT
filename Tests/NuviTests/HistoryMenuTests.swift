@@ -126,11 +126,11 @@ final class HistoryMenuTests: XCTestCase {
         )
     }
 
-    func testPreparationStatusIsLocalizedAndNeverClaimsLiveRecording() {
-        for (language, expected) in [(AppLanguage.english, "Preparing…"), (.spanish, "Preparando…")] {
+    func testPreparationStatusUsesNeutralBrandWhileCancellationRemainsAvailable() {
+        for language in [AppLanguage.english, .spanish] {
             XCTAssertEqual(MenuBarStatusPresentation.label(
                 for: .preparing, language: language, showsStatus: true, isLiveSession: true
-            ), expected)
+            ), "Nuvi")
         }
         XCTAssertNil(MenuBarStatusPresentation.label(
             for: .preparing, language: .english, showsStatus: false, isLiveSession: false

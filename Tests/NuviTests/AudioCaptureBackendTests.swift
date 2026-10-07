@@ -5,6 +5,137 @@ import CoreAudio
 @testable import Nuvi
 
 final class AudioCaptureBackendTests: XCTestCase {
+    func testCompatibleVPIOCyclesReuseOneInitializedCallbackBinding() throws {
+        let operations = RecordingNativeOperations()
+        let devices = TestAudioDeviceProvider(outputDevice: 202)
+        let factory = NativeAudioCaptureBackendFactory(operations: operations, devices: devices)
+        var service: AudioCaptureService? = AudioCaptureService(
+            backendFactory: factory,
+            inputDeviceOverride: 101
+        )
+
+        _ = try service!.start(configuration: AudioCaptureConfiguration(duckOtherAudio: true))
+        service!.stop()
+        let callback = try XCTUnwrap(operations.captureCallback)
+        let context = try XCTUnwrap(callback.inputProcRefCon)
+        var flags = AudioUnitRenderActionFlags(rawValue: 0)
+        var timestamp = AudioTimeStamp()
+        XCTAssertEqual(callback.inputProc?(context, &flags, &timestamp, 1, 64, nil), noErr)
+        XCTAssertEqual(operations.renderCount, 0, "A stopped generation must not render after router unpublish")
+        _ = try service!.start(configuration: AudioCaptureConfiguration(duckOtherAudio: true))
+        service!.stop()
+
+        XCTAssertEqual(operations.createdSubtypes, [UInt32(kAudioUnitSubType_VoiceProcessingIO)])
+        XCTAssertEqual(operations.events.filter { $0 == "initialize" }.count, 1)
+        XCTAssertEqual(operations.events.filter { $0 == "start" }.count, 2)
+        XCTAssertEqual(operations.stopCount, 2)
+        XCTAssertEqual(
+            operations.setCalls.filter { $0.property == kAudioOutputUnitProperty_SetInputCallback }.count,
+            1
+        )
+        XCTAssertEqual(operations.uninitializeCount, 0)
+        XCTAssertEqual(operations.disposeCount, 0)
+
+        service = nil
+        XCTAssertEqual(operations.uninitializeCount, 1)
+        XCTAssertEqual(operations.disposeCount, 1)
+    }
+
+    func testStoppedVPIOReuseRejectsChangedDefaultOutput() throws {
+        let operations = RecordingNativeOperations()
+        let devices = TestAudioDeviceProvider(outputDevice: 202)
+        let service = AudioCaptureService(
+            backendFactory: NativeAudioCaptureBackendFactory(operations: operations, devices: devices),
+            inputDeviceOverride: 101
+        )
+
+        _ = try service.start(configuration: AudioCaptureConfiguration(duckOtherAudio: true))
+        service.stop()
+        devices.outputDevice = 303
+        _ = try service.start(configuration: AudioCaptureConfiguration(duckOtherAudio: true))
+        service.stop()
+
+        XCTAssertEqual(
+            operations.createdSubtypes,
+            [UInt32(kAudioUnitSubType_VoiceProcessingIO), UInt32(kAudioUnitSubType_VoiceProcessingIO)]
+        )
+        XCTAssertEqual(operations.events.filter { $0 == "initialize" }.count, 2)
+        XCTAssertEqual(operations.events.filter { $0 == "start" }.count, 2)
+    }
+
+    func testRouteCleanupReleasesLifecycleControlLockBeforeDuplicateCleanupWaits() throws {
+        let operations = RecordingNativeOperations()
+        let nativeLifecycle = NativeAudioUnitLifecycle(handle: operations.handle, operations: operations)
+        let blockingLifecycle = BlockingStopLifecycle()
+        let (_, continuation) = AsyncStream<AVAudioPCMBuffer>.makeStream()
+        let session = AudioCaptureSession(
+            lifecycle: blockingLifecycle,
+            format: nil,
+            continuation: continuation,
+            levelHandler: nil,
+            usesBluetoothInput: false
+        )
+        XCTAssertEqual(nativeLifecycle.installCaptureCallback(for: session), noErr)
+
+        let firstCleanupFinished = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .utility).async {
+            session.cleanup()
+            firstCleanupFinished.signal()
+        }
+        XCTAssertEqual(blockingLifecycle.stopEntered.wait(timeout: .now() + 2), .success)
+
+        let duplicateStarted = DispatchSemaphore(value: 0)
+        let duplicateFinished = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            duplicateStarted.signal()
+            nativeLifecycle.requestCurrentCaptureCleanup()
+            duplicateFinished.signal()
+        }
+        XCTAssertEqual(duplicateStarted.wait(timeout: .now() + 2), .success)
+
+        let controlProbe = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .utility).async {
+            _ = nativeLifecycle.withControlLock { controlProbe.signal() }
+        }
+        let controlResult = controlProbe.wait(timeout: .now() + 1)
+        XCTAssertEqual(
+            controlResult,
+            .success,
+            "Route cleanup must release lifecycle control before waiting for an existing session cleanup"
+        )
+
+        blockingLifecycle.allowStop.signal()
+        XCTAssertEqual(firstCleanupFinished.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(duplicateFinished.wait(timeout: .now() + 2), .success)
+    }
+
+    func testStopReadbackFailureRequiresTerminalCleanupInsteadOfReuse() {
+        let operations = RecordingNativeOperations()
+        let lifecycle = NativeAudioUnitLifecycle(handle: operations.handle, operations: operations)
+
+        XCTAssertEqual(lifecycle.initializeUnit(), noErr)
+        XCTAssertEqual(lifecycle.startIO(), noErr)
+        operations.isRunningReadStatus = -10879
+        lifecycle.cleanup()
+
+        XCTAssertEqual(lifecycle.cleanupStatus.stop, -10879)
+        XCTAssertEqual(operations.uninitializeCount, 1)
+        XCTAssertEqual(operations.disposeCount, 1)
+    }
+
+    func testStoppedInitializedLifecycleRestartsWithoutReinitializing() {
+        let operations = RecordingNativeOperations()
+        let lifecycle = NativeAudioUnitLifecycle(handle: operations.handle, operations: operations)
+
+        XCTAssertEqual(lifecycle.initializeUnit(), noErr)
+        XCTAssertEqual(lifecycle.startIO(), noErr)
+        lifecycle.stop()
+        XCTAssertEqual(lifecycle.startIO(), noErr)
+
+        XCTAssertEqual(operations.events, ["initialize", "start", "stop", "start"])
+        XCTAssertEqual(operations.uninitializeCount, 0)
+        XCTAssertEqual(operations.disposeCount, 0)
+    }
     func testServiceAllocatesNegotiatedCapacityBeforeBindingAndRendering() async throws {
         let operations = RecordingNativeOperations()
         operations.onInitialize = { [weak operations] in
@@ -33,7 +164,7 @@ final class AudioCaptureBackendTests: XCTestCase {
         let buffer = await iterator.next()
         XCTAssertEqual(buffer?.frameLength, 1200)
         XCTAssertEqual(operations.renderCount, 1)
-        XCTAssertTrue(service.lastDiagnostics?.cleanupComplete == true)
+        XCTAssertFalse(service.lastDiagnostics?.cleanupComplete == true)
     }
 
     func testPreparationFailureCleansUnboundUnitWithoutStartingOrFallback() {
@@ -1011,6 +1142,20 @@ private final class TestAudioDeviceProvider: AudioDeviceProvider, @unchecked Sen
     }
 }
 
+private final class BlockingStopLifecycle: AudioUnitLifecycle, @unchecked Sendable {
+    let unit: AudioUnit? = nil
+    let stopEntered = DispatchSemaphore(value: 0)
+    let allowStop = DispatchSemaphore(value: 0)
+
+    func stop() {
+        stopEntered.signal()
+        _ = allowStop.wait(timeout: .now() + 5)
+    }
+
+    func uninitialize() {}
+    func dispose() {}
+}
+
 private final class RecordingNativeOperations: AudioUnitNativeOperations, @unchecked Sendable {
     struct PropertyCall {
         let property: AudioUnitPropertyID
@@ -1051,6 +1196,7 @@ private final class RecordingNativeOperations: AudioUnitNativeOperations, @unche
     var uninitializeStatus: OSStatus = noErr
     var setStatus: OSStatus = noErr
     var getStatus: OSStatus = noErr
+    var isRunningReadStatus: OSStatus = noErr
     var addListenerStatus: OSStatus = noErr
     var failRouteListenerAddAfter: Int?
     private var addListenerCount = 0
@@ -1073,6 +1219,7 @@ private final class RecordingNativeOperations: AudioUnitNativeOperations, @unche
     private(set) var removedListeners: [ListenerCall] = []
     private var agcValue: UInt32 = 0
     private var bypassValue: UInt32 = 0
+    private var isRunning: UInt32 = 0
     private var formatValues: [FormatKey: AudioStreamBasicDescription] = [:]
 
     private struct FormatKey: Hashable {
@@ -1141,6 +1288,10 @@ private final class RecordingNativeOperations: AudioUnitNativeOperations, @unche
         getCount += 1
         guard getStatus == noErr else { return getStatus }
         switch property {
+        case kAudioOutputUnitProperty_IsRunning:
+            guard isRunningReadStatus == noErr else { return isRunningReadStatus }
+            data.storeBytes(of: isRunning, as: UInt32.self)
+            size = UInt32(MemoryLayout<UInt32>.size)
         case kAudioOutputUnitProperty_CurrentDevice:
             data.storeBytes(
                 of: readbackOverrides[element] ?? currentDeviceWrites[element] ?? AudioDeviceID(kAudioObjectUnknown),
@@ -1180,12 +1331,14 @@ private final class RecordingNativeOperations: AudioUnitNativeOperations, @unche
     func start(_ unit: NativeAudioUnitHandle) -> OSStatus {
         events.append("start")
         onStart?()
+        if startStatus == noErr { isRunning = 1 }
         return startStatus
     }
 
     func stop(_ unit: NativeAudioUnitHandle) -> OSStatus {
         stopCount += 1
         events.append("stop")
+        if stopStatus == noErr { isRunning = 0 }
         return stopStatus
     }
 
