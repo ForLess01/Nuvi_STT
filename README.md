@@ -154,6 +154,8 @@ brew upgrade --cask nuvi
 
 ## Project guide
 
+Release notes: [Nuvi 2.2.2](docs/releases/v2.2.2.md).
+
 | Looking for… | Start here |
 | --- | --- |
 | Building, architecture, tests and engine probes | [Development guide](docs/development.md) |
