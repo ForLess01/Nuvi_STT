@@ -11,11 +11,11 @@ Branch: main (explicit single-branch preference). Strategy: single release; expe
 
 ## Tasks
 
-- T1 [S1,S2] inline: prepare version, notes and README release link — complete; commit pending.
+- T1 [S1,S2] inline: prepare version, notes and README release link — complete; commit `1d675818ac2484636d4e257c7084f22d80ecdc1f`.
 - T2 [S2,S3,S4] delegated verification/build: normal-permission focused/full checks, cleanly assembled signed archive and provenance receipt — complete; trigger: long build/signing action, risk item 5.
 - T3 [S2,S3,S4] independent verifier: inspect candidate from fresh temporary copy and compare metadata/signature/payload/hash — complete; trigger: release risk item 5.
-- T4 [S1,S4] inline: commit/tag/push, publish release and independently download/read back — pending.
-- T5 [S1,S4] inline: fresh tap checkout, change only cask version/hash, validate/commit/push and read back — pending.
+- T4 [S1,S4] inline: commit/tag/push, publish release and independently download/read back — complete; tag `v2.2.2` at `1d67581`, release ID 434714593.
+- T5 [S1,S4] inline: fresh tap checkout, change only cask version/hash, validate/commit/push and read back — complete; tap commit `cc4010be1ce29de5d96d367e48f9227643aad0ae`.
 
 ## Log
 
@@ -28,3 +28,8 @@ Branch: main (explicit single-branch preference). Strategy: single release; expe
 
 - L6: Independent T3 PASS: fresh scratch extraction verified ZIP/executable SHA, exact certificate fingerprint, Team/runtime/entitlement, 106 inputs and full payload. Installed accepted app unchanged. Parent repeated strict signature and ZIP hash PASS under normal permissions; sandbox-only CSSMERR_TP_NOT_TRUSTED was not reproduced with normal keychain access. No trust modification. Independent receipt copied to `build/releases/2.2.2/independent-verification.json`.
 - L7: Native candidate assessment after explicit staging: medium, 84 changed lines, review_due=false/under_budget; no review lifecycle or approval claimed. Initial untracked-scope refusal was resolved by staging the intended files, not by excluding evidence. Risk: item 5 (release/environment); independent verifier completed.
+
+- L8: Release commit `1d675818ac2484636d4e257c7084f22d80ecdc1f` contains version/build, README link, release notes and this log. Its committed native assessment was medium, 87 lines, review_due=false/under_budget. Annotated tag v2.2.2 pushed atomically with main; no older tag/release overwritten.
+- L9: GitHub release ID 434714593 was created as a draft with asset Nuvi.zip ID 711788394; downloaded draft bytes/SHA matched. Published stable/Latest at https://github.com/ForLess01/Nuvi_STT/releases/tag/v2.2.2. Anonymous public-download verification repeated the exact ZIP hash and size. Remote tag dereferences to 1d67581. Public notes link to this log on main; no dependency/audio/runtime changes.
+- L10: Fresh isolated tap worktree based on 77d6f5b; only version/hash changed. Ruby syntax PASS and Homebrew FromContentLoader PASS: version2.2.2, exact SHA and public release URL. `brew info` rejected a standalone file outside an installed tap; validated with Homebrew's content loader instead, without installing a tap/cask or executing postflight. Commit cc4010b pushed to ForLess01/homebrew-tap main; GitHub cask readback byte-identical. Existing postflight/security behavior remains untouched.
+- L11: Publication receipt `build/releases/2.2.2/publication-receipt.json` plus signed package, full logs and independent receipt retained locally. No app installation, launch, microphone, PTT, music, coreaudiod or trust-policy mutation. The accepted installed 2.2.1(6) candidate is deliberately unchanged; release2.2.2(7) is available through GitHub/Homebrew. Full suite remains PARTIAL at the known signal5, despite 109 focused PASS. Risk: item5 (release/environment); independent artifact verification PASS, public bytes/cask readback PASS.
