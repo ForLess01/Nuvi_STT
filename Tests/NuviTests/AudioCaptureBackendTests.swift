@@ -5,43 +5,51 @@ import CoreAudio
 @testable import Nuvi
 
 final class AudioCaptureBackendTests: XCTestCase {
-    func testCompatibleVPIOCyclesReuseOneInitializedCallbackBinding() throws {
+    func testEachPTTReleaseDisposesVPIOAndFinishesItsOwnStream() async throws {
         let operations = RecordingNativeOperations()
-        let devices = TestAudioDeviceProvider(outputDevice: 202)
-        let factory = NativeAudioCaptureBackendFactory(operations: operations, devices: devices)
-        var service: AudioCaptureService? = AudioCaptureService(
-            backendFactory: factory,
+        let service = AudioCaptureService(
+            backendFactory: NativeAudioCaptureBackendFactory(
+                operations: operations, devices: TestAudioDeviceProvider(outputDevice: 202)
+            ),
             inputDeviceOverride: 101
         )
 
-        _ = try service!.start(configuration: AudioCaptureConfiguration(duckOtherAudio: true))
-        service!.stop()
-        let callback = try XCTUnwrap(operations.captureCallback)
-        let context = try XCTUnwrap(callback.inputProcRefCon)
-        var flags = AudioUnitRenderActionFlags(rawValue: 0)
-        var timestamp = AudioTimeStamp()
-        XCTAssertEqual(callback.inputProc?(context, &flags, &timestamp, 1, 64, nil), noErr)
-        XCTAssertEqual(operations.renderCount, 0, "A stopped generation must not render after router unpublish")
-        _ = try service!.start(configuration: AudioCaptureConfiguration(duckOtherAudio: true))
-        service!.stop()
+        for cycle in 1...2 {
+            let stream = try service.start(configuration: AudioCaptureConfiguration(duckOtherAudio: true))
+            let callback = try XCTUnwrap(operations.captureCallback)
+            let context = try XCTUnwrap(callback.inputProcRefCon)
+            var flags = AudioUnitRenderActionFlags(rawValue: 0)
+            var timestamp = AudioTimeStamp()
+            XCTAssertEqual(callback.inputProc?(context, &flags, &timestamp, 1, 64, nil), noErr)
+            service.stop()
 
-        XCTAssertEqual(operations.createdSubtypes, [UInt32(kAudioUnitSubType_VoiceProcessingIO)])
-        XCTAssertEqual(operations.events.filter { $0 == "initialize" }.count, 1)
+            // Stop alone is insufficient: initialized VPIO still owns the
+            // system's voice-processing/output resources between presses.
+            XCTAssertEqual(operations.uninitializeCount, cycle)
+            XCTAssertEqual(operations.disposeCount, cycle)
+            XCTAssertEqual(service.lastDiagnostics?.cleanupComplete, true)
+            XCTAssertEqual(operations.addedListeners.count, operations.removedListeners.count)
+            XCTAssertEqual(
+                operations.events.filter { ["initialize", "start", "stop", "uninitialize", "dispose"].contains($0) },
+                Array(repeating: ["initialize", "start", "stop", "uninitialize", "dispose"], count: cycle).flatMap { $0 }
+            )
+            var iterator = stream.makeAsyncIterator()
+            let buffer = await iterator.next()
+            XCTAssertEqual(buffer?.frameLength, 64)
+            XCTAssertEqual(buffer?.floatChannelData?[0][0], 0.25)
+            let end = await iterator.next()
+            XCTAssertNil(end, "Each press must finish its own PCM stream")
+            service.stop()
+            XCTAssertEqual(operations.disposeCount, cycle, "Repeated stop must be idempotent")
+        }
+        XCTAssertEqual(operations.createdSubtypes, Array(repeating: UInt32(kAudioUnitSubType_VoiceProcessingIO), count: 2))
+        XCTAssertEqual(operations.events.filter { $0 == "initialize" }.count, 2)
         XCTAssertEqual(operations.events.filter { $0 == "start" }.count, 2)
         XCTAssertEqual(operations.stopCount, 2)
-        XCTAssertEqual(
-            operations.setCalls.filter { $0.property == kAudioOutputUnitProperty_SetInputCallback }.count,
-            1
-        )
-        XCTAssertEqual(operations.uninitializeCount, 0)
-        XCTAssertEqual(operations.disposeCount, 0)
-
-        service = nil
-        XCTAssertEqual(operations.uninitializeCount, 1)
-        XCTAssertEqual(operations.disposeCount, 1)
+        XCTAssertEqual(operations.renderCount, 2)
     }
 
-    func testStoppedVPIOReuseRejectsChangedDefaultOutput() throws {
+    func testNextPTTSessionUsesChangedDefaultOutput() throws {
         let operations = RecordingNativeOperations()
         let devices = TestAudioDeviceProvider(outputDevice: 202)
         let service = AudioCaptureService(
@@ -164,7 +172,7 @@ final class AudioCaptureBackendTests: XCTestCase {
         let buffer = await iterator.next()
         XCTAssertEqual(buffer?.frameLength, 1200)
         XCTAssertEqual(operations.renderCount, 1)
-        XCTAssertFalse(service.lastDiagnostics?.cleanupComplete == true)
+        XCTAssertEqual(service.lastDiagnostics?.cleanupComplete, true)
     }
 
     func testPreparationFailureCleansUnboundUnitWithoutStartingOrFallback() {

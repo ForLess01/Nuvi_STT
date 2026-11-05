@@ -42,10 +42,9 @@ public extension AudioCapturing {
     }
 }
 
-/// Stable native callback owner that admits one per-press session at a time.
-/// It retains the active target until admission has closed and every callback
-/// that could have read the target has left, so the VPIO callback property never
-/// needs rebinding between compatible stopped cycles.
+/// Native callback owner that retains its session until admission has closed
+/// and every callback that could have read the target has left. The owner stays
+/// alive through native disposal, including quarantined teardown failures.
 internal final class AudioCaptureCallbackRouter: @unchecked Sendable {
     private static let closedBit: UInt64 = 1 << 63
     private static let callbackCountMask: UInt64 = closedBit - 1
@@ -159,9 +158,6 @@ internal final class AudioCaptureSession: @unchecked Sendable {
     private let callbackState = Atomic<UInt64>(0)
     private let cleanupState = Atomic<Bool>(false)
     private let cleanupFinished = Atomic<Bool>(false)
-    // Terminal cleanup disposes the native unit. A later service stop must not
-    // mistake that already-cleaned session for a reusable stopped VPIO graph.
-    private let nativeUnitReleased = Atomic<Bool>(false)
     private let streamTerminated = Atomic<Bool>(false)
     private let publisherStartedState = Atomic<Bool>(false)
     private let firstPCMPublished = Atomic<Bool>(false)
@@ -241,19 +237,10 @@ internal final class AudioCaptureSession: @unchecked Sendable {
     /// control-side and intentionally idempotent so failed starts and stream
     /// cancellation cannot double-dispose a unit.
     func cleanup() {
-        cleanup(releaseNativeUnit: true, waitForPublisher: true)
+        cleanup(waitForPublisher: true)
     }
 
-    /// Stops one session while retaining an initialized VPIO unit for a later,
-    /// compatible admission. The caller must release the stable callback router
-    /// only after this returns.
-    func stopKeepingInitializedUnit() -> Bool {
-        cleanup(releaseNativeUnit: false, waitForPublisher: true)
-        return !nativeUnitReleased.load(ordering: .acquiring)
-            && lifecycle.cleanupStatus.stop == noErr
-    }
-
-    private func cleanup(releaseNativeUnit: Bool, waitForPublisher: Bool) {
+    private func cleanup(waitForPublisher: Bool) {
         guard !cleanupState.exchange(true, ordering: .acquiringAndReleasing) else {
             if waitForPublisher {
                 while !cleanupFinished.load(ordering: .acquiring) {
@@ -264,18 +251,15 @@ internal final class AudioCaptureSession: @unchecked Sendable {
         }
         defer { cleanupFinished.store(true, ordering: .releasing) }
 
-        if releaseNativeUnit {
-            nativeUnitReleased.store(true, ordering: .releasing)
-        }
-
         closeCallbackAdmission()
         waitForCallbacks()
         let owner = String(describing: ObjectIdentifier(self))
         AudioPhaseTiming.measure("native_stop", owner: owner) { lifecycle.stop() }
-        if releaseNativeUnit {
-            AudioPhaseTiming.measure("native_uninitialize", owner: owner) { lifecycle.uninitialize() }
-            AudioPhaseTiming.measure("native_dispose", owner: owner) { lifecycle.dispose() }
-        }
+        // A stopped but initialized VPIO can retain voice-processing/output
+        // resources. Release the entire graph on every stop, including the
+        // first PTT release, before completing the stream.
+        AudioPhaseTiming.measure("native_uninitialize", owner: owner) { lifecycle.uninitialize() }
+        AudioPhaseTiming.measure("native_dispose", owner: owner) { lifecycle.dispose() }
 
         // No callback can publish after the admission wait. The publisher may
         // still own queued slots, so close first and let it drain before the
@@ -408,13 +392,13 @@ internal final class AudioCaptureSession: @unchecked Sendable {
             publisherCompletion.signal()
             if streamTerminated.load(ordering: .acquiring),
                !cleanupState.load(ordering: .acquiring) {
-                cleanup(releaseNativeUnit: true, waitForPublisher: false)
+                cleanup(waitForPublisher: false)
             }
         }
 
         while true {
             if fatalRenderRequested.load(ordering: .acquiring) {
-                cleanup(releaseNativeUnit: true, waitForPublisher: false)
+                cleanup(waitForPublisher: false)
                 return
             }
             var processedAny = false
@@ -424,7 +408,7 @@ internal final class AudioCaptureSession: @unchecked Sendable {
             }
 
             if fatalRenderRequested.load(ordering: .acquiring) {
-                cleanup(releaseNativeUnit: true, waitForPublisher: false)
+                cleanup(waitForPublisher: false)
                 return
             }
 
@@ -563,7 +547,6 @@ internal final class AudioCaptureSession: @unchecked Sendable {
 public final class AudioCaptureService: AudioCapturing, @unchecked Sendable {
     private var activeSession: AudioCaptureSession?
     private var activeBackend: AudioCaptureBackend?
-    private var idleVoiceProcessingBackend: AudioCaptureBackend?
     private let backendFactory: AudioCaptureBackendFactory
     private let inputDeviceOverride: AudioDeviceID?
     private let controlLock = NSRecursiveLock()
@@ -599,11 +582,7 @@ public final class AudioCaptureService: AudioCapturing, @unchecked Sendable {
 
     deinit {
         controlLock.lock()
-        cleanupCaptureLocked(allowStoppedReuse: false)
-        if let idleVoiceProcessingBackend {
-            cleanup(backend: idleVoiceProcessingBackend)
-            self.idleVoiceProcessingBackend = nil
-        }
+        cleanupCaptureLocked()
         controlLock.unlock()
     }
 
@@ -630,25 +609,10 @@ public final class AudioCaptureService: AudioCapturing, @unchecked Sendable {
             let selection = try inputDeviceOverride.map { (id: $0, uid: Optional<String>.none) }
                 ?? chosenInputDevice(configuration: configuration)
             let device = selection.id
-            let backend: AudioCaptureBackend
-            if let idleVoiceProcessingBackend,
-               idleVoiceProcessingBackend.canReuseStoppedUnit(configuration: configuration, inputDevice: device) {
-                backend = idleVoiceProcessingBackend
-                self.idleVoiceProcessingBackend = nil
-                backendForCleanup = backend
-                let owner = String(describing: ObjectIdentifier(backend.lifecycle))
-                try AudioPhaseTiming.measure("native_prepare", owner: owner) { try backend.prepareForNextSession() }
-            } else {
-                if let idleVoiceProcessingBackend {
-                    cleanup(backend: idleVoiceProcessingBackend)
-                    self.idleVoiceProcessingBackend = nil
-                }
-                backend = try backendFactory.makeBackend(configuration: configuration, inputDevice: device)
-                backendForCleanup = backend
-                let owner = String(describing: ObjectIdentifier(backend.lifecycle))
-                try AudioPhaseTiming.measure("native_prepare", owner: owner) { try backend.prepare() }
-            }
+            let backend = try backendFactory.makeBackend(configuration: configuration, inputDevice: device)
+            backendForCleanup = backend
             let owner = String(describing: ObjectIdentifier(backend.lifecycle))
+            try AudioPhaseTiming.measure("native_prepare", owner: owner) { try backend.prepare() }
             activeDiagnostics = backend.diagnostics.with(selectedInputUID: selection.uid)
             lastDiagnostics = activeDiagnostics
             if backend.usesBluetoothInput {
@@ -692,11 +656,11 @@ public final class AudioCaptureService: AudioCapturing, @unchecked Sendable {
             NSLog("Nuvi/audio: capture started")
             return stream
         } catch let error as AudioCaptureError {
-            cleanupCaptureLocked(allowStoppedReuse: false)
+            cleanupCaptureLocked()
             cleanup(backend: backendForCleanup)
             throw error
         } catch {
-            cleanupCaptureLocked(allowStoppedReuse: false)
+            cleanupCaptureLocked()
             cleanup(backend: backendForCleanup)
             NSLog("Nuvi/audio: failed to start microphone capture: \(String(describing: error))")
             if configuration.duckOtherAudio {
@@ -720,11 +684,11 @@ public final class AudioCaptureService: AudioCapturing, @unchecked Sendable {
 
     @discardableResult
     private func stopLocked() -> Bool {
-        cleanupCaptureLocked(allowStoppedReuse: true)
+        cleanupCaptureLocked()
     }
 
     @discardableResult
-    private func cleanupCaptureLocked(allowStoppedReuse: Bool) -> Bool {
+    private func cleanupCaptureLocked() -> Bool {
         // Detach first. The local strong references keep the callback-owned
         // session and backend alive through ordered stop/publisher drain.
         let session = activeSession
@@ -742,23 +706,18 @@ public final class AudioCaptureService: AudioCapturing, @unchecked Sendable {
             return true
         }
 
-        let retainedForReuse = allowStoppedReuse
-            && backend.supportsStoppedReuse
-            && session.stopKeepingInitializedUnit()
+        let diagnostics = activeDiagnostics
+        session.cleanup()
         backend.releaseSessionCallback()
-        if retainedForReuse {
-            idleVoiceProcessingBackend = backend
-            lastCleanupStatus = session.lifecycle.cleanupStatus
-        } else {
-            session.cleanup()
-            cleanup(backend: backend)
-        }
+        // Retry incomplete native teardown through the existing quarantine
+        // policy; never keep an initialized unit as an idle optimization.
+        cleanup(backend: backend)
         let status = session.lifecycle.cleanupStatus
         lastCleanupStatus = status
-        if let activeDiagnostics {
-            lastDiagnostics = activeDiagnostics.with(cleanupComplete: status.isComplete)
+        if let diagnostics {
+            lastDiagnostics = diagnostics.with(cleanupComplete: status.isComplete)
         }
-        self.activeDiagnostics = nil
+        activeDiagnostics = nil
         return true
     }
 

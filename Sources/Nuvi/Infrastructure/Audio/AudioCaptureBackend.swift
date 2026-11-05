@@ -212,22 +212,16 @@ internal protocol AudioCaptureBackend: AnyObject {
     var maximumFramesPerSlice: UInt32 { get }
     var usesBluetoothInput: Bool { get }
     var diagnostics: AudioCaptureDiagnostics { get }
-    var supportsStoppedReuse: Bool { get }
 
     func prepare() throws
     func installCallbacks(for session: AudioCaptureSession) throws
     func start() throws
     func cleanup()
-    func canReuseStoppedUnit(configuration: AudioCaptureConfiguration, inputDevice: AudioDeviceID) -> Bool
-    func prepareForNextSession() throws
     func releaseSessionCallback()
 }
 
 internal extension AudioCaptureBackend {
-    var supportsStoppedReuse: Bool { false }
     func prepare() throws {}
-    func canReuseStoppedUnit(configuration: AudioCaptureConfiguration, inputDevice: AudioDeviceID) -> Bool { false }
-    func prepareForNextSession() throws {}
     func releaseSessionCallback() {}
 }
 
@@ -1177,33 +1171,6 @@ private final class NativeAudioCaptureBackend: AudioCaptureBackend, @unchecked S
         }
     }
 
-    var supportsStoppedReuse: Bool { kind == .voiceProcessingIO }
-
-    func canReuseStoppedUnit(configuration: AudioCaptureConfiguration, inputDevice: AudioDeviceID) -> Bool {
-        guard kind == .voiceProcessingIO,
-              configuration.duckOtherAudio,
-              inputDevice == self.inputDevice,
-              nativeLifecycle.isStopped,
-              let outputDevice,
-              let currentDefaultOutput = devices.defaultOutputDeviceID(),
-              currentDefaultOutput != AudioDeviceID(kAudioObjectUnknown) else {
-            return false
-        }
-        return currentDefaultOutput == outputDevice
-    }
-
-    func prepareForNextSession() throws {
-        try nativeLifecycle.withControlLock {
-            guard nativeLifecycle.isStopped, !routeInvalidated else {
-                throw setupFailure("The stopped VPIO capture unit is not reusable")
-            }
-            try verifyCurrentDefaultOutput(stage: "reused preparation")
-            try verifyCurrentDevices(stage: "reused preparation")
-            try verifyDeviceAvailability()
-            try verifyEffectiveFormats(stage: "reused preparation")
-        }
-    }
-
     func releaseSessionCallback() {
         nativeLifecycle.releaseCaptureCallbackSession()
     }
@@ -1221,19 +1188,6 @@ private final class NativeAudioCaptureBackend: AudioCaptureBackend, @unchecked S
         guard actualOutput == outputDevice else {
             throw setupFailure(
                 "The output route changed during \(stage) (requested \(outputDevice), got \(actualOutput))"
-            )
-        }
-    }
-
-    private func verifyCurrentDefaultOutput(stage: String) throws {
-        guard let outputDevice,
-              let currentDefaultOutput = devices.defaultOutputDeviceID(),
-              currentDefaultOutput != AudioDeviceID(kAudioObjectUnknown) else {
-            throw setupFailure("No current output device is available during \(stage)")
-        }
-        guard currentDefaultOutput == outputDevice else {
-            throw setupFailure(
-                "The default output changed during \(stage) (requested \(outputDevice), got \(currentDefaultOutput))"
             )
         }
     }
