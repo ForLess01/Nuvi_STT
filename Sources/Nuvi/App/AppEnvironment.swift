@@ -23,6 +23,7 @@ final class AppEnvironment {
     private var hotkeyManager: HotkeyManager?
     private var escHotkey: GlobalHotkey?
     private var cancellables = Set<AnyCancellable>()
+    private let noticeLifetime = TransientNoticeLifetime()
 
     init() {
         let notifications = AppUpdateNotificationAdapter()
@@ -119,7 +120,11 @@ final class AppEnvironment {
         guard escHotkey == nil else { return }
         let esc = GlobalHotkey(id: HotkeyID.cancel,
                                onPress: { [weak self] in self?.controller.cancel() })
-        esc.register(keyCode: 53, modifiers: 0) // 53 = Escape
+        let status = esc.register(keyCode: 53, modifiers: 0) // 53 = Escape
+        guard status == noErr else {
+            ShortcutsStore.shared.reportRegistrationIssue(.registrationFailed)
+            return
+        }
         escHotkey = esc
     }
 
@@ -139,12 +144,9 @@ final class AppEnvironment {
         DispatchQueue.main.async { [weak self] in
             self?.pill.resizeToContent()
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + duration) { [weak self] in
-            guard let self else { return }
-            if self.controller.state == expected {
-                self.pill.hide()
-            }
-        }
+        noticeLifetime.schedule(after: duration, isCurrent: { [weak self] in
+            self?.controller.state == expected
+        }, hide: { [weak self] in self?.pill.hide() })
     }
 
     private func updatePillPresentation(for state: DictationState) {
@@ -160,6 +162,7 @@ final class AppEnvironment {
             .removeDuplicates()
             .sink { [weak self] state in
                 guard let self else { return }
+                self.noticeLifetime.invalidate()
                 self.statusItem.update(state: state, isLiveSession: self.controller.isLiveSession)
                 switch state {
                 case .preparing, .listening, .transcribing:
@@ -217,5 +220,33 @@ final class AppEnvironment {
                 }
             }
             .store(in: &cancellables)
+    }
+}
+
+/// Owns notice expiry without requiring the application composition root in tests.
+@MainActor
+final class TransientNoticeLifetime {
+    typealias Scheduler = (TimeInterval, @escaping @MainActor @Sendable () -> Void) -> Void
+    private let scheduler: Scheduler
+    private var generation = UUID()
+
+    init(scheduler: @escaping Scheduler = { delay, action in
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: action)
+    }) {
+        self.scheduler = scheduler
+    }
+
+    func invalidate() { generation = UUID() }
+
+    func schedule(after duration: TimeInterval,
+                  isCurrent: @escaping () -> Bool,
+                  hide: @escaping () -> Void) {
+        invalidate()
+        let token = generation
+        scheduler(duration) { [weak self] in
+            guard self?.generation == token, isCurrent() else { return }
+            self?.invalidate()
+            hide()
+        }
     }
 }

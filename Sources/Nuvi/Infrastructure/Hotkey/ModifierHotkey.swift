@@ -8,6 +8,10 @@ import AppKit
 /// held ALONE (no other key) for a short delay before push-to-talk activates.
 /// Pressing any other key while the modifier is down cancels activation.
 public final class ModifierHotkey {
+    public typealias MonitorInstaller = (NSEvent.EventTypeMask, @escaping (NSEvent) -> Void) -> Any?
+    private let installGlobal: MonitorInstaller
+    private let installLocal: MonitorInstaller
+    private let removeMonitor: (Any) -> Void
     private let mask: NSEvent.ModifierFlags
     private let onPress: () -> Void
     private let onRelease: (() -> Void)?
@@ -28,9 +32,19 @@ public final class ModifierHotkey {
         activationDelay: TimeInterval = 0.28,
         watchdogInterval: TimeInterval = 0.04,
         currentModifierFlags: @escaping () -> NSEvent.ModifierFlags = { NSEvent.modifierFlags },
+        installGlobal: @escaping MonitorInstaller = { mask, handler in
+            NSEvent.addGlobalMonitorForEvents(matching: mask, handler: handler)
+        },
+        installLocal: @escaping MonitorInstaller = { mask, handler in
+            NSEvent.addLocalMonitorForEvents(matching: mask) { event in handler(event); return event }
+        },
+        removeMonitor: @escaping (Any) -> Void = { NSEvent.removeMonitor($0) },
         onPress: @escaping () -> Void,
         onRelease: (() -> Void)? = nil
     ) {
+        self.installGlobal = installGlobal
+        self.installLocal = installLocal
+        self.removeMonitor = removeMonitor
         self.mask = mask.intersection(KeyCombo.relevantMask)
         self.activationDelay = activationDelay
         self.watchdogInterval = watchdogInterval
@@ -43,8 +57,10 @@ public final class ModifierHotkey {
         unregister()
     }
 
-    public func register() {
-        guard !mask.isEmpty else { return }
+    @discardableResult
+    public func register() -> Bool {
+        unregister()
+        guard !mask.isEmpty else { return false }
         add(.flagsChanged) { [weak self] in self?.handleFlags($0) }
         add(.keyDown) { [weak self] _ in
             self?.cancelPending()
@@ -54,19 +70,24 @@ public final class ModifierHotkey {
             self?.cancelPending()
             if self?.isDown == true { self?.handleRelease() }
         }
+        guard monitors.count == 6 else {
+            unregister()
+            return false
+        }
+        return true
     }
 
     public func unregister() {
-        monitors.forEach { NSEvent.removeMonitor($0) }
+        monitors.forEach(removeMonitor)
         monitors.removeAll()
         handleRelease()
     }
 
     private func add(_ mask: NSEvent.EventTypeMask, _ handler: @escaping (NSEvent) -> Void) {
-        if let global = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: { handler($0) }) {
+        if let global = installGlobal(mask, handler) {
             monitors.append(global)
         }
-        if let local = NSEvent.addLocalMonitorForEvents(matching: mask, handler: { handler($0); return $0 }) {
+        if let local = installLocal(mask, handler) {
             monitors.append(local)
         }
     }

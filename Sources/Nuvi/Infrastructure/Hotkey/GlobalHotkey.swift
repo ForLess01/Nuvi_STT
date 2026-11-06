@@ -26,7 +26,9 @@ public final class GlobalHotkey {
 
     @discardableResult
     public func register(keyCode: UInt32, modifiers: UInt32) -> OSStatus {
-        GlobalHotkey.installHandlerIfNeeded()
+        unregister()
+        let handlerStatus = GlobalHotkey.installHandlerIfNeeded()
+        guard handlerStatus == noErr else { return handlerStatus }
         GlobalHotkey.handlers[id] = self
         let hotKeyID = EventHotKeyID(signature: GlobalHotkey.signature, id: id)
         let status = RegisterEventHotKey(keyCode, modifiers, hotKeyID,
@@ -41,19 +43,18 @@ public final class GlobalHotkey {
     public func unregister() {
         if let ref { UnregisterEventHotKey(ref) }
         ref = nil
-        GlobalHotkey.handlers[id] = nil
+        if GlobalHotkey.handlers[id] === self { GlobalHotkey.handlers[id] = nil }
     }
 
-    private static func installHandlerIfNeeded() {
-        guard !installed else { return }
-        installed = true
+    private static func installHandlerIfNeeded() -> OSStatus {
+        guard !installed else { return noErr }
 
         var types = [
             EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed)),
             EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyReleased))
         ]
 
-        InstallEventHandler(GetApplicationEventTarget(), { _, event, _ in
+        let status = InstallEventHandler(GetApplicationEventTarget(), { _, event, _ in
             guard let event else { return noErr }
             var hotKeyID = EventHotKeyID()
             GetEventParameter(event,
@@ -72,6 +73,8 @@ public final class GlobalHotkey {
             }
             return noErr
         }, 2, &types, nil, nil)
+        installed = status == noErr
+        return status
     }
 }
 

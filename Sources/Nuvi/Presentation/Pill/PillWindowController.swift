@@ -37,6 +37,7 @@ final class PillWindowController {
     private let nebulaView = NebulaGlowView()
     private let hosting: NSHostingView<PillView>
     private let screenProvider: () -> ScreenGeometry?
+    private let layoutScheduler = PillLayoutScheduler()
     private var animationToken = 0
     private var isProgrammaticMove = false
 
@@ -327,14 +328,13 @@ final class PillWindowController {
     /// Keep the panel hugging the SwiftUI content as the transcript grows or a
     /// notification widens the pill.
     ///
-    /// Runs once now and once on the next runloop. SwiftUI commits content
+    /// Coalesces each burst into one immediate and one next-runloop pass. SwiftUI commits content
     /// changes asynchronously, so an immediate measure can read a stale (wider)
     /// layout — sizing to that and letting the hosting view center the real
     /// content is what made the pill drift right after a notification. The
     /// deferred pass measures the committed content and re-anchors top-left.
     func resizeToContent() {
-        applyContentSize()
-        DispatchQueue.main.async { [weak self] in self?.applyContentSize() }
+        layoutScheduler.request { [weak self] in self?.applyContentSize() }
     }
 
     private func applyContentSize() {
@@ -356,16 +356,26 @@ final class PillWindowController {
             screenInset: Layout.screenInset
         )
 
+        let frame = NSRect(origin: origin, size: panelSize)
+        let containerFrame = NSRect(origin: .zero, size: panelSize)
+        let hostingFrame = NSRect(x: padding, y: padding, width: contentSize.width, height: contentSize.height)
+        let nebulaFrame = hostingFrame.insetBy(dx: -Layout.nebulaHorizontalBleed,
+                                               dy: -Layout.nebulaVerticalBleed)
+        guard Self.needsGeometryUpdate(current: panel.frame, proposed: frame)
+                || container.frame != containerFrame || hosting.frame != hostingFrame
+                || nebulaView.frame != nebulaFrame else { return }
         isProgrammaticMove = true
-        panel.setFrame(NSRect(origin: origin, size: panelSize), display: true)
+        panel.setFrame(frame, display: true)
         isProgrammaticMove = false
 
-        container.frame = NSRect(origin: .zero, size: panelSize)
-        hosting.frame = NSRect(x: padding, y: padding,
-                               width: contentSize.width, height: contentSize.height)
-        nebulaView.frame = hosting.frame.insetBy(dx: -Layout.nebulaHorizontalBleed,
-                                                 dy: -Layout.nebulaVerticalBleed)
+        container.frame = containerFrame
+        hosting.frame = hostingFrame
+        nebulaView.frame = nebulaFrame
         nebulaView.needsDisplay = true
+    }
+
+    static func needsGeometryUpdate(current: NSRect, proposed: NSRect) -> Bool {
+        current != proposed
     }
 
     private func currentSafeContentSize() -> NSSize {
@@ -581,5 +591,28 @@ private final class NebulaGlowView: NSView {
                                    endRadius: 1,
                                    options: [.drawsAfterEndLocation])
         context.restoreGState()
+    }
+}
+
+/// Keeps SwiftUI's deferred layout measurement independently testable.
+@MainActor
+final class PillLayoutScheduler {
+    private let schedule: (@escaping @MainActor @Sendable () -> Void) -> Void
+    private var pending = false
+
+    init(schedule: @escaping (@escaping @MainActor @Sendable () -> Void) -> Void = { action in
+        DispatchQueue.main.async(execute: action)
+    }) {
+        self.schedule = schedule
+    }
+
+    func request(measure: @escaping @MainActor @Sendable () -> Void) {
+        guard !pending else { return }
+        pending = true
+        measure()
+        schedule { [weak self] in
+            self?.pending = false
+            measure()
+        }
     }
 }

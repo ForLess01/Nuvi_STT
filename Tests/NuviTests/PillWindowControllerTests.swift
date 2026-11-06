@@ -5,6 +5,29 @@ import XCTest
 
 @MainActor
 final class PillWindowControllerTests: XCTestCase {
+    func testResizeBurstCoalescesButRetainsDeferredMeasurement() {
+        var callbacks: [@MainActor () -> Void] = []
+        var measurements = 0
+        let scheduler = PillLayoutScheduler(schedule: { callbacks.append($0) })
+        for _ in 0..<10 { scheduler.request { measurements += 1 } }
+        XCTAssertEqual(measurements, 1)
+        XCTAssertEqual(callbacks.count, 1)
+        callbacks.forEach { $0() }
+        XCTAssertEqual(measurements, 2)
+        scheduler.request { measurements += 1 }
+        XCTAssertEqual(measurements, 3)
+    }
+
+    func testIdenticalGeometrySkipsMutationButGrowthShrinkAndMovementDoNot() {
+        let original = NSRect(x: 10, y: 20, width: 100, height: 30)
+        XCTAssertFalse(PillWindowController.needsGeometryUpdate(current: original, proposed: original))
+        for frame in [NSRect(x: 10, y: 20, width: 120, height: 30),
+                      NSRect(x: 10, y: 20, width: 80, height: 30),
+                      NSRect(x: 50, y: 20, width: 100, height: 30)] {
+            XCTAssertTrue(PillWindowController.needsGeometryUpdate(current: original, proposed: frame))
+        }
+    }
+
     func testPlacementPrefersFrontmostWindowScreen() {
         let frontmost = geometry(x: 0)
         let pointer = geometry(x: 1_440)

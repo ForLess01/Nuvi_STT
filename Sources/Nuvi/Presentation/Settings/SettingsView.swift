@@ -412,6 +412,15 @@ private struct ConfigurationPanel: View {
                 SettingRow(title: tr("Cancel Recording", "Cancelar grabación"), subtitle: tr("Discards the active recording", "Descarta la grabación activa")) {
                     Shortcut(keys: ["esc"])
                 }
+                if let issue = shortcuts.issue {
+                    RowDivider()
+                    Text(issue == .conflict
+                         ? tr("This shortcut is already assigned to another action. Your previous shortcut was kept.", "Este atajo ya está asignado a otra acción. Se conservó el atajo anterior.")
+                         : tr("A shortcut could not be activated. Check Accessibility permission or choose a different shortcut.", "No se pudo activar un atajo. Revisa el permiso de Accesibilidad o elige otro atajo."))
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .padding(12)
+                }
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .nuviOutputPreferencesDidChange)) { _ in
@@ -1119,10 +1128,25 @@ private struct HistoryPanel: View {
                 TextField(tr("Search history", "Buscar en el historial"), text: $query).textFieldStyle(.plain)
                 Spacer()
                 Button(tr("Clear all", "Borrar todo"), role: .destructive) { store.clear() }
-                    .disabled(store.entries.isEmpty)
+                    .disabled(store.entries.isEmpty && store.lastPersistenceError == nil)
             }
             .padding(10)
             .background(NuviTheme.card, in: RoundedRectangle(cornerRadius: 10))
+
+            if let error = store.lastPersistenceError {
+                VStack(alignment: .leading, spacing: 6) {
+                    Label(tr("History could not be saved or fully removed", "No se pudo guardar o eliminar completamente el historial"),
+                          systemImage: "exclamationmark.triangle")
+                        .font(.callout.weight(.semibold))
+                    Text(error).font(.caption).foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                    Text(tr("Use Clear all to retry removing stored history.", "Usa Borrar todo para volver a intentar eliminar el historial guardado."))
+                        .font(.caption)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(12)
+                .background(NuviTheme.card, in: RoundedRectangle(cornerRadius: 10))
+            }
 
             if filtered.isEmpty {
                 ContentUnavailableView(tr("No transcriptions yet", "Aún no hay transcripciones"), systemImage: "clock")
