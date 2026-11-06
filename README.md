@@ -154,7 +154,7 @@ brew upgrade --cask nuvi
 
 ## Project guide
 
-Release notes: [Nuvi 2.2.2](docs/releases/v2.2.2.md).
+Release notes: [Nuvi 2.2.3](docs/releases/v2.2.3.md).
 
 | Looking for… | Start here |
 | --- | --- |
