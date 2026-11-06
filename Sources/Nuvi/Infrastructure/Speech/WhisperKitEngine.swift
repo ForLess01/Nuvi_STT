@@ -94,68 +94,51 @@ public final class WhisperKitEngine: TranscriptionEngine, @unchecked Sendable {
 
 #if canImport(WhisperKit)
     private var pipe: WhisperKit?
+    private var modelSnapshot: ModelReadSnapshot?
+    private var preparedModelID: String?
     private var languageCode: String = "es"
 
     public func prepare(locale: Locale) async throws {
         languageCode = locale.language.languageCode?.identifier ?? "es"
+        let modelID = modelName
+        if pipe != nil, modelSnapshot != nil, preparedModelID == modelID { return }
         do {
-            pipe = try await makePipeline()
-        } catch {
-            if Self.isRecoverableMetadataError(error) {
-                try? Self.resetModelCache(for: modelName)
-                do {
-                    pipe = try await makePipeline()
-                    return
-                } catch {
-                    throw TranscriptionError.underlying("WhisperKit init failed after cache reset: \(error.localizedDescription)")
-                }
+            let snapshot = try await ModelDownloadService.shared.prepareModelSnapshot(modelId: modelID)
+            guard let tokenizer = snapshot.whisperTokenizer else {
+                throw TranscriptionError.engineUnavailable("Whisper tokenizer was not prepared")
             }
-            throw TranscriptionError.underlying("WhisperKit init failed: \(error.localizedDescription)")
+            let pipeline = try await WhisperKit(Self.localConfiguration(directory: snapshot.directory))
+            // Pinned WhisperKit.loadTokenizerIfNeeded otherwise performs a Hub
+            // fallback even with download:false. The coordinator already owns
+            // that acquisition; inject its in-memory tokenizer before loading.
+            pipeline.tokenizer = tokenizer
+            try await pipeline.loadModels()
+            pipe = pipeline
+            modelSnapshot = snapshot
+            preparedModelID = modelID
+        } catch is CancellationError { throw CancellationError() }
+        catch {
+            throw TranscriptionError.underlying("WhisperKit could not load the local model. Delete and download it again in Settings. \(error.localizedDescription)")
         }
     }
 
-    private func makePipeline() async throws -> WhisperKit {
-        try await WhisperKit(
-            WhisperKitConfig(
-                model: modelName,
-                downloadBase: ModelStorage.whisperKitBase(),
-                verbose: false,
-                logLevel: .error
-            )
-        )
+    static func localConfiguration(directory: URL) -> WhisperKitConfig {
+        WhisperKitConfig(modelFolder: directory.path, tokenizerFolder: directory,
+                         verbose: false, logLevel: .error, load: false, download: false)
     }
 
-    private static func resetModelCache(for modelName: String) throws {
-        let downloadBase = try ModelStorage.whisperKitBase()
-        guard FileManager.default.fileExists(atPath: downloadBase.path) else { return }
-        if let enumerator = FileManager.default.enumerator(at: downloadBase, includingPropertiesForKeys: nil) {
-            var toRemove: [URL] = []
-            for case let fileURL as URL in enumerator where fileURL.lastPathComponent == "config.json" {
-                let dir = fileURL.deletingLastPathComponent()
-                if dir.lastPathComponent == modelName {
-                    toRemove.append(dir)
-                }
-            }
-            for dir in toRemove {
-                try? FileManager.default.removeItem(at: dir)
-            }
-        }
-    }
-
-    private static func isRecoverableMetadataError(_ error: Error) -> Bool {
-        let description = String(describing: error).lowercased()
-        let localized = error.localizedDescription.lowercased()
-        return description.contains("invalidmetadataerror")
-            || localized.contains("invalid metadata")
-            || description.contains("metadata")
-            || localized.contains("metadata")
+    deinit {
+        pipe = nil
+        modelSnapshot = nil
     }
 
     public func transcribe(
         _ audio: AsyncStream<AVAudioPCMBuffer>
     ) -> AsyncThrowingStream<TranscriptionEvent, Error> {
         AsyncThrowingStream { continuation in
+            let snapshot = modelSnapshot
             let task = Task {
+                defer { withExtendedLifetime(snapshot) {} }
                 do {
                     try Task.checkCancellation()
                     guard let pipe else {
@@ -215,79 +198,16 @@ public final class WhisperKitEngine: TranscriptionEngine, @unchecked Sendable {
     ) -> AsyncThrowingStream<TranscriptionEvent, Error> {
         guard reportingPartials else { return transcribe(audio) }
 
-        return AsyncThrowingStream { continuation in
-            let task = Task {
-                do {
-                    try Task.checkCancellation()
-                    guard let pipe else {
-                        throw TranscriptionError.engineUnavailable("WhisperKit not prepared")
-                    }
-                    guard let target = AVAudioFormat(
-                        commonFormat: .pcmFormatFloat32,
-                        sampleRate: 16_000,
-                        channels: 1,
-                        interleaved: false
-                    ) else {
-                        throw TranscriptionError.underlying("Could not build 16kHz format")
-                    }
-
-                    let converter = BufferConverter(targetFormat: target)
-                    let options = DecodingOptions(language: languageCode)
-                    let cadence = Self.liveCadenceSamples(for: modelName)
-                    let minimumHypothesisSamples = 16_000 * 2
-                    let maxSamples = 16_000 * 10 * 60
-                    var nextHypothesisAt = minimumHypothesisSamples
-                    // The full session is retained for the settled final pass;
-                    // provisional decodes use only the bounded rolling window.
-                    var samples: [Float] = []
-                    var liveWindow = RollingAudioWindow(capacity: Self.liveWindowSamples)
-                    var lastPartial = ""
-
-                    for await buffer in audio {
-                        guard !Task.isCancelled else { throw CancellationError() }
-                        guard let converted = converter.convert(buffer),
-                              let channel = converted.floatChannelData else { continue }
-                        let count = Int(converted.frameLength)
-                        if samples.count + count > maxSamples {
-                            throw TranscriptionError.underlying(
-                                "WhisperKit input exceeded 10 minute limit"
-                            )
-                        }
-                        let source = UnsafeBufferPointer(start: channel[0], count: count)
-                        samples.append(
-                            contentsOf: source
-                        )
-                        liveWindow.append(contentsOf: source)
-
-                        guard samples.count >= nextHypothesisAt else { continue }
-                        let results = try await pipe.transcribe(
-                            audioArray: liveWindow.snapshot(),
-                            decodeOptions: options
-                        )
-                        let hypothesis = Self.joinedText(results)
-                        // The controller's LiveTranscriptAssembler keeps the
-                        // prior provisional text and de-duplicates overlap when
-                        // this rolling window advances.
-                        if !hypothesis.isEmpty, hypothesis != lastPartial {
-                            lastPartial = hypothesis
-                            continuation.yield(.partial(hypothesis))
-                        }
-                        nextHypothesisAt = samples.count + cadence
-                    }
-
-                    try Task.checkCancellation()
-                    guard !samples.isEmpty else { throw NuviError.noAudioReceived }
-                    let results = try await pipe.transcribe(
-                        audioArray: samples,
-                        decodeOptions: options
-                    )
-                    continuation.yield(.final(Self.joinedText(results)))
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: Self.normalizedTranscriptionError(error))
-                }
-            }
-            continuation.onTermination = { _ in task.cancel() }
+        guard let pipe else {
+            return AsyncThrowingStream { $0.finish(throwing:
+                TranscriptionError.engineUnavailable("WhisperKit not prepared")) }
+        }
+        let snapshot = modelSnapshot
+        let options = DecodingOptions(language: languageCode)
+        return SpeechStreamSessions.whisper(audio: audio, cadence: Self.liveCadenceSamples(for: modelName)) {
+            samples in
+            defer { withExtendedLifetime(snapshot) {} }
+            return Self.joinedText(try await pipe.transcribe(audioArray: samples, decodeOptions: options))
         }
     }
 

@@ -238,9 +238,9 @@ public final class SpeechAnalyzerEngine: TranscriptionEngine, @unchecked Sendabl
         }
     }
 
-    internal static func yieldAnalyzerInput(
-        _ input: AnalyzerInput,
-        into continuation: AsyncStream<AnalyzerInput>.Continuation,
+    internal static func yieldAnalyzerInput<Input>(
+        _ input: Input,
+        into continuation: AsyncStream<Input>.Continuation,
         droppedCount: inout Int
     ) -> AnalyzerInputYieldResult {
         switch continuation.yield(input) {

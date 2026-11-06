@@ -24,7 +24,7 @@ final class WhisperKitLiveRuntimeProbeTests: XCTestCase {
                 ".build/checkouts/argmax-oss-swift/Tests/WhisperKitTests/Resources/jfk.wav"
             )
         let file = try AVAudioFile(forReading: url)
-        let (audio, continuation) = AsyncStream<AVAudioPCMBuffer>.makeStream()
+        let (audio, continuation) = AsyncStream<AVAudioPCMBuffer>.makeStream(bufferingPolicy: .bufferingOldest(8))
         let feeder = Task {
             while file.framePosition < file.length {
                 guard let buffer = AVAudioPCMBuffer(

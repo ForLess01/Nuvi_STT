@@ -11,14 +11,14 @@ final class SpeechAnalyzerEngineTests: XCTestCase {
             channels: 1,
             interleaved: false
         ))
-        let (stream, continuation) = AsyncStream<AnalyzerInput>.makeStream(
+        let (stream, continuation) = AsyncStream<AVAudioPCMBuffer>.makeStream(
             bufferingPolicy: .bufferingOldest(2)
         )
         var droppedCount = 0
 
         XCTAssertEqual(
             SpeechAnalyzerEngine.yieldAnalyzerInput(
-                AnalyzerInput(buffer: makeBuffer(format: format, value: 1)),
+                makeBuffer(format: format, value: 1),
                 into: continuation,
                 droppedCount: &droppedCount
             ),
@@ -26,7 +26,7 @@ final class SpeechAnalyzerEngineTests: XCTestCase {
         )
         XCTAssertEqual(
             SpeechAnalyzerEngine.yieldAnalyzerInput(
-                AnalyzerInput(buffer: makeBuffer(format: format, value: 2)),
+                makeBuffer(format: format, value: 2),
                 into: continuation,
                 droppedCount: &droppedCount
             ),
@@ -34,7 +34,7 @@ final class SpeechAnalyzerEngineTests: XCTestCase {
         )
         XCTAssertEqual(
             SpeechAnalyzerEngine.yieldAnalyzerInput(
-                AnalyzerInput(buffer: makeBuffer(format: format, value: 3)),
+                makeBuffer(format: format, value: 3),
                 into: continuation,
                 droppedCount: &droppedCount
             ),
@@ -47,8 +47,8 @@ final class SpeechAnalyzerEngineTests: XCTestCase {
         let secondValue = await iterator.next()
         let first = try XCTUnwrap(firstValue)
         let second = try XCTUnwrap(secondValue)
-        XCTAssertEqual(first.buffer.floatChannelData![0][0], 1)
-        XCTAssertEqual(second.buffer.floatChannelData![0][0], 2)
+        XCTAssertEqual(first.floatChannelData![0][0], 1)
+        XCTAssertEqual(second.floatChannelData![0][0], 2)
         continuation.finish()
     }
 
@@ -59,7 +59,7 @@ final class SpeechAnalyzerEngineTests: XCTestCase {
             channels: 1,
             interleaved: false
         ))
-        let (_, continuation) = AsyncStream<AnalyzerInput>.makeStream(
+        let (_, continuation) = AsyncStream<AVAudioPCMBuffer>.makeStream(
             bufferingPolicy: .bufferingOldest(1)
         )
         continuation.finish()
@@ -67,13 +67,31 @@ final class SpeechAnalyzerEngineTests: XCTestCase {
 
         XCTAssertEqual(
             SpeechAnalyzerEngine.yieldAnalyzerInput(
-                AnalyzerInput(buffer: makeBuffer(format: format, value: 1)),
+                makeBuffer(format: format, value: 1),
                 into: continuation,
                 droppedCount: &droppedCount
             ),
             .terminated
         )
         XCTAssertEqual(droppedCount, 0)
+    }
+
+    func testAnalyzerBridgeAcceptsIntegerPCMWithoutDeprecatedBufferReadback() throws {
+        // AnalyzerInput.data(from:) traps on the old Float32 fixture on macOS 27.
+        // Queue policy is tested above with the original PCM buffers; this covers
+        // the framework boundary without its deprecated buffer reconstruction.
+        let format = try XCTUnwrap(AVAudioFormat(commonFormat: .pcmFormatInt16,
+            sampleRate: 16_000, channels: 1, interleaved: false))
+        let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 160))
+        buffer.frameLength = 160
+        buffer.int16ChannelData![0].initialize(repeating: 0, count: 160)
+        let input = AnalyzerInput(buffer: buffer)
+        let (stream, continuation) = AsyncStream<AnalyzerInput>.makeStream(bufferingPolicy: .bufferingOldest(1))
+        var drops = 0
+        XCTAssertEqual(SpeechAnalyzerEngine.yieldAnalyzerInput(input, into: continuation, droppedCount: &drops), .enqueued)
+        XCTAssertEqual(drops, 0)
+        continuation.finish()
+        withExtendedLifetime(stream) {}
     }
 
     func testPrepareFailsWhenMissingAssetHasNoInstalledPostcondition() async {

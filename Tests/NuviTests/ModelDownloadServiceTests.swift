@@ -1,6 +1,7 @@
 import XCTest
 @testable import Nuvi
 
+@MainActor
 final class ModelDownloadServiceTests: XCTestCase {
     func testCancelThenRestartKeepsNewAttemptOwnedByNewGeneration() async {
         let model = makeWhisperModel()
@@ -17,14 +18,16 @@ final class ModelDownloadServiceTests: XCTestCase {
         XCTAssertFalse(service.isDownloadActive(modelId: model.id))
 
         service.startDownload(modelId: model.id)
-        await gate.secondStarted.wait()
-        XCTAssertTrue(service.isDownloadActive(modelId: model.id))
+        for _ in 0..<100 { await Task.yield() }
+        XCTAssertEqual(gate.numberOfCalls, 1, "Cancelled provider still owns the cache")
 
         // The first operation deliberately succeeds even after cancellation.
         // Its completion must not remove or complete the second attempt.
         gate.firstRelease.signal()
         await gate.firstFinished.wait()
-        await Task.yield()
+        await gate.secondStarted.wait()
+        await waitUntil { service.downloadProgress[model.id] == 0.84 }
+        XCTAssertEqual(service.downloadProgress[model.id], 0.84)
         XCTAssertTrue(service.isDownloadActive(modelId: model.id))
         XCTAssertNil(service.lastError)
 
@@ -124,7 +127,7 @@ final class ModelDownloadServiceTests: XCTestCase {
             modelDownloadBase: base
         )
         service.refreshDownloadedModels()
-        await waitUntil { service.downloadedModels.isEmpty }
+        await waitUntil { !service.isRefreshingModels }
         XCTAssertFalse(service.downloadedModels.contains(model.id))
         XCTAssertFalse(service.downloadedModels.contains("unknown-variant"))
 
@@ -132,7 +135,7 @@ final class ModelDownloadServiceTests: XCTestCase {
         try addCoreMLBundle(named: "three", to: partial)
         try Data().write(to: partial.appendingPathComponent("config.json"))
         service.refreshDownloadedModels()
-        await waitUntil { service.downloadedModels.isEmpty }
+        await waitUntil { !service.isRefreshingModels }
         XCTAssertFalse(service.downloadedModels.contains(model.id))
 
         try Data("{}".utf8).write(to: partial.appendingPathComponent("config.json"))
@@ -140,6 +143,122 @@ final class ModelDownloadServiceTests: XCTestCase {
         await waitUntil { service.downloadedModels.contains(model.id) }
         XCTAssertTrue(service.downloadedModels.contains(model.id))
         XCTAssertFalse(service.downloadedModels.contains("unknown-variant"))
+    }
+
+    func testDeleteWaitsForProviderAndRestartWaitsForDelete() async {
+        let model = makeWhisperModel()
+        let gate = DownloadGate()
+        let deletionStarted = AsyncGate()
+        let deletionRelease = AsyncGate()
+        let service = ModelDownloadService(
+            testingCatalog: [model], whisperDownloadOperation: gate.operation,
+            deletionOperation: { _ in
+                deletionStarted.signal()
+                await deletionRelease.wait()
+            })
+        service.startDownload(modelId: model.id)
+        await gate.firstStarted.wait()
+        service.deleteModel(modelId: model.id)
+        service.startDownload(modelId: model.id)
+        for _ in 0..<100 { await Task.yield() }
+        XCTAssertEqual(gate.numberOfCalls, 1)
+        gate.firstRelease.signal()
+        await deletionStarted.wait()
+        for _ in 0..<100 { await Task.yield() }
+        XCTAssertEqual(gate.numberOfCalls, 1, "Deletion still owns the model cache")
+        deletionRelease.signal()
+        await gate.secondStarted.wait()
+        XCTAssertEqual(gate.numberOfCalls, 2)
+        gate.secondRelease.signal()
+        await gate.secondFinished.wait()
+        await waitUntil { !service.isDownloadActive(modelId: model.id) }
+        XCTAssertFalse(service.isDownloadActive(modelId: model.id))
+    }
+
+    func testCancelQueuedRestartDoesNotStartAnotherProvider() async {
+        let model = makeWhisperModel()
+        let gate = DownloadGate()
+        let service = ModelDownloadService(testingCatalog: [model], whisperDownloadOperation: gate.operation)
+        service.startDownload(modelId: model.id)
+        await gate.firstStarted.wait()
+        service.cancelDownload(modelId: model.id)
+        service.startDownload(modelId: model.id)
+        service.cancelDownload(modelId: model.id)
+        gate.firstRelease.signal()
+        await gate.firstFinished.wait()
+        for _ in 0..<100 { await Task.yield() }
+        XCTAssertEqual(gate.numberOfCalls, 1)
+        XCTAssertFalse(service.isDownloadActive(modelId: model.id))
+        XCTAssertNil(service.downloadProgress[model.id])
+    }
+
+    func testDeletionFailureIsReported() async {
+        let model = makeWhisperModel()
+        let service = ModelDownloadService(testingCatalog: [model], deletionOperation: { _ in
+            throw CocoaError(.fileWriteNoPermission)
+        })
+        service.deleteModel(modelId: model.id)
+        await waitUntil { service.lastError != nil }
+        XCTAssertNotNil(service.lastError)
+    }
+
+    func testDeleteRemovesPartialVariantWithoutMetadataButPreservesSibling() async throws {
+        let model = makeWhisperModel()
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("NuviTests-ModelDeletion-\(UUID().uuidString)")
+        let partial = root.appendingPathComponent(model.id)
+        let sibling = root.appendingPathComponent(model.id + "-other")
+        try FileManager.default.createDirectory(at: partial, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: sibling, withIntermediateDirectories: true)
+        try Data([1]).write(to: partial.appendingPathComponent("partial.bin"))
+        try Data([2]).write(to: sibling.appendingPathComponent("keep.bin"))
+        let service = ModelDownloadService(testingCatalog: [model], modelDownloadBase: root)
+        service.deleteModel(modelId: model.id)
+        await waitUntil { !FileManager.default.fileExists(atPath: partial.path) }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: partial.path))
+        XCTAssertEqual(try Data(contentsOf: sibling.appendingPathComponent("keep.bin")), Data([2]))
+    }
+
+    func testLateSDKWriterCannotCorruptRestartedOrDeletedCanonicalModel() async throws {
+        let model = makeWhisperModel()
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("NuviTests-Staging-\(UUID().uuidString)")
+        let firstStarted = AsyncGate()
+        let firstRelease = AsyncGate()
+        var providerRoots: [URL] = []
+        let service = ModelDownloadService(testingCatalog: [model], modelDownloadBase: root,
+            stagedDownloadOperation: { [self] model, base, _ in
+                providerRoots.append(base)
+                let directory = ModelStorage.whisperModelDirectory(modelID: model.id, base: base)
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                try Data("{}".utf8).write(to: directory.appendingPathComponent("config.json"))
+                for name in ["one", "two", "three"] { try addCoreMLBundle(named: name, to: directory) }
+                try Data("fresh".utf8).write(to: directory.appendingPathComponent("marker"))
+                if providerRoots.count == 1 {
+                    firstStarted.signal()
+                    await firstRelease.wait()
+                }
+                return directory
+            })
+        service.startDownload(modelId: model.id)
+        await firstStarted.wait()
+        service.cancelDownload(modelId: model.id)
+        service.startDownload(modelId: model.id)
+        firstRelease.signal()
+        await waitUntil { providerRoots.count == 2 && !service.isDownloadActive(modelId: model.id) }
+        XCTAssertEqual(providerRoots.count, 2)
+        guard providerRoots.count == 2 else { return }
+        XCTAssertNotEqual(providerRoots[0], providerRoots[1], "SDK generations must never share writable roots")
+        let canonical = ModelStorage.whisperModelDirectory(modelID: model.id, base: root)
+        let oldWriter = ModelStorage.whisperModelDirectory(modelID: model.id, base: providerRoots[0])
+        let currentWriter = ModelStorage.whisperModelDirectory(modelID: model.id, base: providerRoots[1])
+        // Simulate SDK child I/O continuing AFTER both wrapper calls returned.
+        try Data("stale".utf8).write(to: oldWriter.appendingPathComponent("marker"))
+        try Data("late-success".utf8).write(to: currentWriter.appendingPathComponent("marker"))
+        XCTAssertEqual(try String(contentsOf: canonical.appendingPathComponent("marker"), encoding: .utf8), "fresh")
+        service.deleteModel(modelId: model.id)
+        await waitUntil { !FileManager.default.fileExists(atPath: canonical.path) }
+        try FileManager.default.createDirectory(at: oldWriter, withIntermediateDirectories: true)
+        try Data("resurrected".utf8).write(to: oldWriter.appendingPathComponent("marker"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: canonical.path))
     }
 
     private func addCoreMLBundle(named name: String, to modelDirectory: URL) throws {
@@ -204,6 +323,7 @@ private final class DownloadGate: @unchecked Sendable {
                 if Task.isCancelled {
                     firstCancellationObserved.signal()
                 }
+                reportProgress(0.99) // Deliberately late callback from the cancelled provider.
                 firstFinished.signal()
             case 2:
                 secondStarted.signal()

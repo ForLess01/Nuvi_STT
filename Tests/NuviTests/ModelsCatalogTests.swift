@@ -1,9 +1,10 @@
 import XCTest
 @testable import Nuvi
 
+@MainActor
 final class ModelsCatalogTests: XCTestCase {
     func testCatalogParsing() {
-        let downloadService = ModelDownloadService.shared
+        let downloadService = ModelDownloadService(testingCatalog: [])
         downloadService.loadCatalog()
 
         XCTAssertFalse(downloadService.catalog.isEmpty, "El catálogo de modelos no debería estar vacío")

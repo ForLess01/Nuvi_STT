@@ -79,6 +79,7 @@ public struct AppModel: Identifiable, Codable, Equatable {
     }
 }
 
+@MainActor
 public final class ModelDownloadService: NSObject, ObservableObject {
     /// Determinate download progress (0...1) for WhisperKit models.
     @Published public var downloadProgress: [String: Double] = [:]
@@ -93,11 +94,16 @@ public final class ModelDownloadService: NSObject, ObservableObject {
     /// Last user-facing error from a download/unzip failure, or nil.
     @Published public var lastError: String?
 
+    @Published public private(set) var isRefreshingModels = false
+
     public var catalog: [AppModel] = []
     /// In-flight download tasks, keyed by model id (both engines).
     private final class DownloadAttempt {
         let token: UUID
         var task: Task<Void, Never>?
+#if canImport(WhisperKit)
+        var whisperTokenizer: (any WhisperTokenizer)?
+#endif
 
         init(token: UUID) {
             self.token = token
@@ -142,6 +148,32 @@ public final class ModelDownloadService: NSObject, ObservableObject {
     private let whisperDownloadOperation: WhisperDownloadOperation?
     private let parakeetDownloadOperation: ParakeetDownloadOperation?
     private let modelDownloadBaseOverride: URL?
+    private var endingDownloads: Set<String> = []
+    private var queuedStarts: Set<String> = []
+    private var deletionTasks: [String: Task<Void, Never>] = [:]
+    private var readCopyTasks: [String: (token: UUID, task: Task<ModelReadSnapshot, Error>)] = [:]
+    private final class WeakSnapshot {
+        weak var value: ModelReadSnapshot?
+        init(_ value: ModelReadSnapshot) { self.value = value }
+    }
+    private var readSnapshots: [String: WeakSnapshot] = [:]
+    private var modelRevisions: [String: Int] = [:]
+    /// Retained because SDK cancellation does not expose joinable child I/O.
+    /// These roots are never re-used, published, scanned, or auto-deleted.
+    private(set) var retainedSDKRoots: [URL] = []
+#if canImport(WhisperKit)
+    private var whisperTokenizers: [String: any WhisperTokenizer] = [:]
+    internal var whisperAssetAcquisitionOverride: StagedDownloadOperation?
+    internal var whisperTokenizerPreparationOverride: ((ModelVariant, URL, [URL]) async throws -> any WhisperTokenizer)?
+#endif
+    private var inventoryGeneration = 0
+    private var inventoryTask: Task<Void, Never>?
+    private let parakeetModelBaseOverride: URL?
+    internal typealias StagedDownloadOperation = (AppModel, URL, (Double) -> Void) async throws -> URL
+    private let snapshotCopyOperation: (@Sendable (URL, URL) throws -> Void)?
+    private let stagedDownloadOperation: StagedDownloadOperation?
+    private let deletionOperation: ((String) async throws -> Void)?
+    private let inventoryOperation: (@Sendable () -> Set<String>)?
 
     public static let shared = ModelDownloadService()
 
@@ -149,6 +181,11 @@ public final class ModelDownloadService: NSObject, ObservableObject {
         whisperDownloadOperation = nil
         parakeetDownloadOperation = nil
         modelDownloadBaseOverride = nil
+        inventoryOperation = nil
+        parakeetModelBaseOverride = nil
+        deletionOperation = nil
+        stagedDownloadOperation = nil
+        snapshotCopyOperation = nil
         super.init()
         loadCatalog()
         refreshDownloadedModels()
@@ -160,11 +197,21 @@ public final class ModelDownloadService: NSObject, ObservableObject {
         testingCatalog: [AppModel],
         whisperDownloadOperation: WhisperDownloadOperation? = nil,
         parakeetDownloadOperation: ParakeetDownloadOperation? = nil,
-        modelDownloadBase: URL? = nil
+        modelDownloadBase: URL? = nil,
+        inventoryOperation: (@Sendable () -> Set<String>)? = nil,
+        parakeetModelBase: URL? = nil,
+        deletionOperation: ((String) async throws -> Void)? = nil,
+        stagedDownloadOperation: StagedDownloadOperation? = nil,
+        snapshotCopyOperation: (@Sendable (URL, URL) throws -> Void)? = nil
     ) {
         self.whisperDownloadOperation = whisperDownloadOperation
         self.parakeetDownloadOperation = parakeetDownloadOperation
-        self.modelDownloadBaseOverride = modelDownloadBase
+        self.modelDownloadBaseOverride = modelDownloadBase ?? FileManager.default.temporaryDirectory.appendingPathComponent("nuvi-test-models-\(UUID().uuidString)")
+        self.parakeetModelBaseOverride = parakeetModelBase ?? self.modelDownloadBaseOverride
+        self.deletionOperation = deletionOperation
+        self.stagedDownloadOperation = stagedDownloadOperation
+        self.snapshotCopyOperation = snapshotCopyOperation
+        self.inventoryOperation = inventoryOperation
         super.init()
         catalog = testingCatalog
     }
@@ -214,31 +261,65 @@ public final class ModelDownloadService: NSObject, ObservableObject {
     }
     
     public func refreshDownloadedModels() {
-        // WhisperKit stores models nested, e.g.
-        // .../WhisperKit/models/argmaxinc/whisperkit-coreml/openai_whisper-tiny/config.json
-        // so we recurse and inspect each candidate variant folder (its folder
-        // name is the model id) instead of treating config.json as completion.
-        var downloaded = downloadedWhisperVariants()
-
-        // Parakeet models: FluidAudio owns its cache, so we trust our persisted flag.
-        downloaded.formUnion(SettingsStore.shared.downloadedParakeetModels)
-
-        DispatchQueue.main.async {
-            self.downloadedModels = downloaded
+        inventoryGeneration += 1
+        let generation = inventoryGeneration
+        inventoryTask?.cancel()
+        isRefreshingModels = true
+        let catalog = catalog
+        let base = modelDownloadBaseOverride
+        let parakeetBase = parakeetModelBaseOverride
+        let operation = inventoryOperation
+        inventoryTask = Task.detached(priority: .utility) { [weak self] in
+            let downloaded: Set<String>
+            if let operation { downloaded = operation() }
+            else {
+                let whisperBase = base ?? (try? ModelStorage.whisperKitBase(create: false))
+                var available = Self.downloadedWhisperVariants(
+                    base: whisperBase,
+                    knownVariants: Set(catalog.filter { $0.engine == .whisperKit }.map(\.id)))
+                for model in catalog where model.engine == .parakeet && !Task.isCancelled {
+                    if Self.isCompleteParakeetModel(version: model.parakeetVersion ?? "v3", root: parakeetBase) {
+                        available.insert(model.id)
+                    }
+                }
+                downloaded = available
+            }
+            guard !Task.isCancelled else { return }
+            await self?.publishInventory(downloaded, generation: generation)
         }
     }
 
-    private func downloadedWhisperVariants() -> Set<String> {
+    private func publishInventory(_ downloaded: Set<String>, generation: Int) {
+        guard generation == inventoryGeneration else { return }
+        // An active writer may have produced a temporarily complete-looking
+        // directory. Only publish cache state once ownership is released.
+        downloadedModels = downloaded.subtracting(downloadTasks.keys).subtracting(deletionTasks.keys)
+        isRefreshingModels = false
+        inventoryTask = nil
+    }
+
+    private func invalidateInventory() {
+        inventoryGeneration += 1
+        inventoryTask?.cancel()
+        inventoryTask = nil
+        isRefreshingModels = false
+    }
+
+    private nonisolated static func isCompleteParakeetModel(version: String, root: URL?) -> Bool {
+        guard let directory = ModelStorage.parakeetDirectory(version: version, root: root),
+              let required = ModelStorage.parakeetRequiredFiles(version: version),
+              required.bundles.allSatisfy({ containsNonEmptyRegularFile(in: directory.appendingPathComponent($0)) }),
+              let data = try? Data(contentsOf: directory.appendingPathComponent(required.vocabulary)),
+              let vocabulary = try? JSONSerialization.jsonObject(with: data) else { return false }
+        return (vocabulary as? [String: Any])?.isEmpty == false || (vocabulary as? [Any])?.isEmpty == false
+    }
+
+    private nonisolated static func downloadedWhisperVariants(base: URL?, knownVariants: Set<String>) -> Set<String> {
         var variants = Set<String>()
-        let knownVariants = Set(catalog.compactMap { model in
-            model.engine == .whisperKit ? model.id : nil
-        })
-        guard let baseDir = try? modelDownloadBase(),
-              let enumerator = FileManager.default.enumerator(
-                at: baseDir, includingPropertiesForKeys: nil) else {
-            return variants
-        }
+        guard let base, let enumerator = FileManager.default.enumerator(
+            at: base, includingPropertiesForKeys: nil) else { return variants }
         for case let fileURL as URL in enumerator where fileURL.lastPathComponent == "config.json" {
+            if Task.isCancelled { break }
             let modelDirectory = fileURL.deletingLastPathComponent()
             let variant = modelDirectory.lastPathComponent
             guard knownVariants.contains(variant), isCompleteWhisperModel(at: modelDirectory) else {
@@ -255,7 +336,7 @@ public final class ModelDownloadService: NSObject, ObservableObject {
     /// itself. Bundle names are intentionally not hardcoded here: the current
     /// WhisperKit layout contains three `.mlmodelc` bundles, while future
     /// releases may use `.mlpackage` bundles instead.
-    private func isCompleteWhisperModel(at directory: URL) -> Bool {
+    private nonisolated static func isCompleteWhisperModel(at directory: URL) -> Bool {
         let configURL = directory.appendingPathComponent("config.json")
         guard hasNonEmptyRegularFile(at: configURL),
               let configData = try? Data(contentsOf: configURL),
@@ -280,7 +361,7 @@ public final class ModelDownloadService: NSObject, ObservableObject {
         return coreMLBundles.allSatisfy { containsNonEmptyRegularFile(in: $0) }
     }
 
-    private func hasNonEmptyRegularFile(at url: URL) -> Bool {
+    private nonisolated static func hasNonEmptyRegularFile(at url: URL) -> Bool {
         guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
               values.isRegularFile == true else {
             return false
@@ -288,7 +369,7 @@ public final class ModelDownloadService: NSObject, ObservableObject {
         return (values.fileSize ?? 0) > 0
     }
 
-    private func containsNonEmptyRegularFile(in directory: URL) -> Bool {
+    private nonisolated static func containsNonEmptyRegularFile(in directory: URL) -> Bool {
         guard let enumerator = FileManager.default.enumerator(
             at: directory,
             includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
@@ -307,6 +388,12 @@ public final class ModelDownloadService: NSObject, ObservableObject {
 
     public func startDownload(modelId: String) {
         guard let model = catalog.first(where: { $0.id == modelId }) else { return }
+        if endingDownloads.contains(modelId) || deletionTasks[modelId] != nil {
+            queuedStarts.insert(modelId)
+            downloadProgress[modelId] = 0.01
+            return
+        }
+        invalidateInventory()
         switch model.engine {
         case .whisperKit:
             startWhisperDownload(model)
@@ -324,7 +411,8 @@ public final class ModelDownloadService: NSObject, ObservableObject {
 
         DispatchQueue.main.async {
             guard self.isCurrentAttempt(modelId: modelId, token: token),
-                  !self.pausedDownloads.contains(modelId) else { return }
+                  !self.pausedDownloads.contains(modelId),
+                  !self.endingDownloads.contains(modelId) else { return }
             if self.downloadProgress[modelId] == nil {
                 self.downloadProgress[modelId] = 0.01 // Mark start
             }
@@ -336,7 +424,11 @@ public final class ModelDownloadService: NSObject, ObservableObject {
         let task = Task {
             do {
                 try Task.checkCancellation()
-                try await self.runWhisperDownload(modelId: modelId, progress: progressReporter.report)
+                if let operation = self.whisperDownloadOperation {
+                    try await operation(modelId, progressReporter.report)
+                } else {
+                    try await self.downloadAndPublish(model: model, token: token, progress: progressReporter.report)
+                }
                 // A provider may ignore cancellation and return normally. The
                 // token guard below prevents that stale attempt from completing
                 // a restarted download.
@@ -374,14 +466,19 @@ public final class ModelDownloadService: NSObject, ObservableObject {
 
         DispatchQueue.main.async {
             guard self.isCurrentAttempt(modelId: modelId, token: token),
-                  !self.pausedDownloads.contains(modelId) else { return }
+                  !self.pausedDownloads.contains(modelId),
+                  !self.endingDownloads.contains(modelId) else { return }
             self.indeterminateDownloads.insert(modelId)
         }
 
         let task = Task {
             do {
                 try Task.checkCancellation()
-                try await self.runParakeetDownload(version: model.parakeetVersion == "v2" ? "v2" : "v3")
+                if let operation = self.parakeetDownloadOperation {
+                    try await operation(model.parakeetVersion == "v2" ? "v2" : "v3")
+                } else {
+                    try await self.downloadAndPublish(model: model, token: token, progress: { _ in })
+                }
                 await MainActor.run {
                     self.completeParakeetDownload(modelId: modelId, token: token)
                 }
@@ -407,48 +504,237 @@ public final class ModelDownloadService: NSObject, ObservableObject {
         attempt.task = task
     }
 
-    private func runWhisperDownload(
-        modelId: String,
-        progress reportProgress: @escaping (Double) -> Void
-    ) async throws {
-        if let operation = whisperDownloadOperation {
-            try await operation(modelId, reportProgress)
-            return
+    private func canonicalDirectory(for model: AppModel) throws -> URL {
+        switch model.engine {
+        case .whisperKit:
+            return ModelStorage.whisperModelDirectory(modelID: model.id, base: try modelDownloadBase())
+        case .parakeet:
+            guard let directory = ModelStorage.parakeetDirectory(version: model.parakeetVersion ?? "v3", root: parakeetModelBaseOverride) else {
+                throw DownloadServiceError.fluidAudioUnavailable
+            }
+            return directory
+        }
+    }
+
+    private nonisolated static func isComplete(_ model: AppModel, directory: URL) -> Bool {
+        switch model.engine {
+        case .whisperKit: return isCompleteWhisperModel(at: directory)
+        case .parakeet:
+            return isCompleteParakeetModel(version: model.parakeetVersion ?? "v3", root: directory.deletingLastPathComponent())
+        }
+    }
+
+    private func downloadAndPublish(model: AppModel, token: UUID, progress: @escaping (Double) -> Void) async throws {
+        let workspace = try ModelStorage.downloadWorkspace(whisperBase: modelDownloadBaseOverride)
+        let providerRoot = workspace.appendingPathComponent("SDKAttempts/\(token.uuidString)")
+        let publicationRoot = workspace.appendingPathComponent("Publications/\(token.uuidString)")
+        let canonical = try canonicalDirectory(for: model)
+        let tokenizerCache = workspace.appendingPathComponent("Tokenizers/\(model.id)")
+        let tokenizerPublication = publicationRoot.appendingPathComponent("tokenizer-cache")
+        let whisperBase = modelDownloadBaseOverride
+        retainedSDKRoots.append(providerRoot)
+        // Seed only a COPY. Reusing a cancelled generation's root or moving its
+        // files would allow late file handles to mutate a new published model.
+        try await Task.detached(priority: .utility) {
+            try FileManager.default.createDirectory(at: providerRoot, withIntermediateDirectories: true)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: providerRoot.path)
+            if Self.isComplete(model, directory: canonical) {
+                let seed = model.engine == .whisperKit
+                    ? ModelStorage.whisperModelDirectory(modelID: model.id, base: providerRoot)
+                    : ModelStorage.parakeetDirectory(version: model.parakeetVersion ?? "v3", root: providerRoot)!
+                try FileManager.default.createDirectory(at: seed.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try FileManager.default.copyItem(at: canonical, to: seed)
+            }
+#if canImport(WhisperKit)
+            if model.engine == .whisperKit, let variant = Self.whisperVariant(for: model.id) {
+                let relative = "models/" + ("openai/whisper-" + variant.description)
+                let legacy = (try whisperBase ?? ModelStorage.whisperKitBase(create: false)).appendingPathComponent(relative)
+                let source = FileManager.default.fileExists(atPath: tokenizerCache.appendingPathComponent("tokenizer.json").path) ? tokenizerCache : legacy
+                if FileManager.default.fileExists(atPath: source.path) {
+                    let target = providerRoot.appendingPathComponent(relative)
+                    try FileManager.default.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    try FileManager.default.copyItem(at: source, to: target)
+                }
+            }
+#endif
+        }.value
+        try Task.checkCancellation()
+        let downloaded: URL
+        if let stagedDownloadOperation {
+            downloaded = try await stagedDownloadOperation(model, providerRoot, progress)
+        } else {
+            switch model.engine {
+            case .whisperKit:
+#if canImport(WhisperKit)
+                let seed = ModelStorage.whisperModelDirectory(modelID: model.id, base: providerRoot)
+                let hasSeed = await Task.detached(priority: .utility) { Self.isCompleteWhisperModel(at: seed) }.value
+                if hasSeed { downloaded = seed }
+                else if let operation = whisperAssetAcquisitionOverride { downloaded = try await operation(model, providerRoot, progress) }
+                else {
+                    downloaded = try await WhisperKit.download(variant: model.id, downloadBase: providerRoot,
+                        progressCallback: { progress($0.fractionCompleted) })
+                }
+                // download:false does not disable tokenizer fallback. Acquire
+                // here, using copied local assets first; any SDK writes remain
+                // in this generation's root, never canonical/read snapshots.
+                guard let variant = Self.whisperVariant(for: model.id) else { throw DownloadServiceError.invalidModel }
+                let tokenizer: any WhisperTokenizer
+                if let operation = whisperTokenizerPreparationOverride {
+                    tokenizer = try await operation(variant, providerRoot, [downloaded])
+                } else {
+                    tokenizer = try await ModelUtilities.loadTokenizer(for: variant, tokenizerFolder: providerRoot,
+                        additionalSearchPaths: [downloaded])
+                }
+                downloadTasks[model.id]?.whisperTokenizer = tokenizer
+#else
+                throw DownloadServiceError.whisperKitUnavailable
+#endif
+            case .parakeet:
+#if canImport(FluidAudio)
+                downloaded = ModelStorage.parakeetDirectory(version: model.parakeetVersion ?? "v3", root: providerRoot)!
+                _ = try await AsrModels.downloadAndLoad(to: downloaded, version: model.parakeetVersion == "v2" ? .v2 : .v3)
+#else
+                throw DownloadServiceError.fluidAudioUnavailable
+#endif
+            }
+        }
+        try Task.checkCancellation()
+        guard isCurrentAttempt(modelId: model.id, token: token), !pausedDownloads.contains(model.id), !endingDownloads.contains(model.id) else {
+            throw CancellationError()
+        }
+        let snapshot = publicationRoot.appendingPathComponent(canonical.lastPathComponent)
+        defer {
+            // This is our private copy, not the SDK's unjoinable writable root.
+            Task.detached(priority: .utility) {
+                if FileManager.default.fileExists(atPath: publicationRoot.path) {
+                    try? FileManager.default.removeItem(at: publicationRoot)
+                }
+            }
+        }
+        let keepExisting = try await Task.detached(priority: .utility) {
+            let prefix = providerRoot.resolvingSymlinksInPath().standardizedFileURL.path + "/"
+            guard downloaded.resolvingSymlinksInPath().standardizedFileURL.path.hasPrefix(prefix) else {
+                throw DownloadServiceError.invalidModel
+            }
+            try FileManager.default.createDirectory(at: publicationRoot, withIntermediateDirectories: true)
+            try FileManager.default.copyItem(at: downloaded, to: snapshot)
+#if canImport(WhisperKit)
+            if model.engine == .whisperKit, let variant = Self.whisperVariant(for: model.id) {
+                let hub = providerRoot.appendingPathComponent("models/" + ("openai/whisper-" + variant.description))
+                let source = FileManager.default.fileExists(atPath: hub.appendingPathComponent("tokenizer.json").path) ? hub : downloaded
+                if FileManager.default.fileExists(atPath: source.appendingPathComponent("tokenizer.json").path) {
+                    try FileManager.default.createDirectory(at: tokenizerPublication, withIntermediateDirectories: true)
+                    for name in ["tokenizer.json", "tokenizer_config.json", "config.json", "special_tokens_map.json", "added_tokens.json"] {
+                        let file = source.appendingPathComponent(name)
+                        if FileManager.default.fileExists(atPath: file.path) {
+                            try FileManager.default.copyItem(at: file, to: tokenizerPublication.appendingPathComponent(name))
+                        }
+                    }
+                }
+            }
+#endif
+            guard Self.isComplete(model, directory: snapshot) else { throw DownloadServiceError.invalidModel }
+            return Self.isComplete(model, directory: canonical)
+        }.value
+        try Task.checkCancellation()
+        guard isCurrentAttempt(modelId: model.id, token: token), !pausedDownloads.contains(model.id), !endingDownloads.contains(model.id) else {
+            throw CancellationError()
+        }
+        // No await between the generation check and commit. Keep an existing
+        // complete cache rather than overwriting it during a redundant download.
+        if !keepExisting { try ModelStorage.publishSnapshot(snapshot, to: canonical) }
+        if FileManager.default.fileExists(atPath: tokenizerPublication.path) {
+            try ModelStorage.publishSnapshot(tokenizerPublication, to: tokenizerCache)
         }
 #if canImport(WhisperKit)
-        let base = try ModelStorage.whisperKitBase()
-        // WhisperKit resolves the variant against argmaxinc/whisperkit-coreml
-        // and downloads the CoreML model folder (with real progress) — no
-        // direct .zip URL involved.
-        _ = try await WhisperKit.download(
-            variant: modelId,
-            downloadBase: base,
-            progressCallback: { progress in reportProgress(progress.fractionCompleted) }
-        )
-#else
-        throw DownloadServiceError.whisperKitUnavailable
+        if let tokenizer = downloadTasks[model.id]?.whisperTokenizer { whisperTokenizers[model.id] = tokenizer }
 #endif
     }
 
-    private func runParakeetDownload(version: String) async throws {
-        if let operation = parakeetDownloadOperation {
-            try await operation(version)
-            return
-        }
-#if canImport(FluidAudio)
-        let version: AsrModelVersion = version == "v2" ? .v2 : .v3
-        _ = try await AsrModels.downloadAndLoad(version: version)
-#else
-        throw DownloadServiceError.fluidAudioUnavailable
+#if canImport(WhisperKit)
+    private nonisolated static func whisperVariant(for modelID: String) -> ModelVariant? {
+        let name = modelID.replacingOccurrences(of: "openai_whisper-", with: "")
+            .replacingOccurrences(of: "_turbo", with: "")
+        return ModelVariant.allCases.first { $0.description == name }
+    }
 #endif
+
+    /// Automatic engine acquisition uses exactly the UI download coordinator.
+    /// Readers receive an owned copy, so deleting canonical files cannot break
+    /// an already-loaded CoreML pipeline or race its lazy file reads.
+    func prepareModelSnapshot(modelId: String) async throws -> ModelReadSnapshot {
+        guard let model = catalog.first(where: { $0.id == modelId }) else { throw DownloadServiceError.invalidModel }
+        let revision = modelRevisions[modelId, default: 0]
+        guard deletionTasks[modelId] == nil else { throw CancellationError() }
+        if let cached = readSnapshots[modelId]?.value { return cached }
+        let canonical = try canonicalDirectory(for: model)
+        var ready = await Task.detached(priority: .utility) { Self.isComplete(model, directory: canonical) }.value
+#if canImport(WhisperKit)
+        if model.engine == .whisperKit && stagedDownloadOperation == nil && whisperTokenizers[modelId] == nil { ready = false }
+#endif
+        try Task.checkCancellation()
+        guard modelRevisions[modelId, default: 0] == revision else { throw CancellationError() }
+        if !ready {
+            guard !pausedDownloads.contains(modelId) else { throw DownloadServiceError.pausedModel }
+            startDownload(modelId: modelId)
+            // At most one queued restart exists per model; wait for whichever
+            // generation currently owns acquisition rather than bypassing it.
+            while let task = downloadTasks[modelId]?.task {
+                await task.value
+                try Task.checkCancellation()
+                guard !pausedDownloads.contains(modelId) else { throw DownloadServiceError.pausedModel }
+                guard modelRevisions[modelId, default: 0] == revision else { throw CancellationError() }
+                if endingDownloads.contains(modelId) { await Task.yield() }
+            }
+        }
+        guard modelRevisions[modelId, default: 0] == revision, deletionTasks[modelId] == nil else { throw CancellationError() }
+        if let cached = readSnapshots[modelId]?.value { return cached }
+        let read: (token: UUID, task: Task<ModelReadSnapshot, Error>)
+        if let existing = readCopyTasks[modelId] { read = existing }
+        else {
+            let root = try ModelStorage.downloadWorkspace(whisperBase: modelDownloadBaseOverride)
+                .appendingPathComponent("Readers/\(UUID().uuidString)")
+            let copy = snapshotCopyOperation
+            let task = Task.detached(priority: .utility) {
+                let directory = root.appendingPathComponent(canonical.lastPathComponent)
+                let snapshot = ModelReadSnapshot(directory: directory, ownedRoot: root)
+                try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+                if let copy { try copy(canonical, directory) }
+                else { try FileManager.default.copyItem(at: canonical, to: directory) }
+                guard Self.isComplete(model, directory: directory) else { throw DownloadServiceError.invalidModel }
+                return snapshot
+            }
+            read = (UUID(), task)
+            readCopyTasks[modelId] = read
+        }
+        do {
+            let snapshot = try await read.task.value
+            if readCopyTasks[modelId]?.token == read.token { readCopyTasks.removeValue(forKey: modelId) }
+            try Task.checkCancellation()
+            guard modelRevisions[modelId, default: 0] == revision else { throw CancellationError() }
+#if canImport(WhisperKit)
+            snapshot.whisperTokenizer = whisperTokenizers[modelId]
+#endif
+            readSnapshots[modelId] = WeakSnapshot(snapshot)
+            return snapshot
+        } catch {
+            if readCopyTasks[modelId]?.token == read.token { readCopyTasks.removeValue(forKey: modelId) }
+            throw error
+        }
     }
 
     private enum DownloadServiceError: LocalizedError {
         case whisperKitUnavailable
         case fluidAudioUnavailable
+        case invalidModel
+        case pausedModel
 
         var errorDescription: String? {
             switch self {
+            case .invalidModel:
+                return "Model files are missing or invalid. Delete and download this model again in Settings."
+            case .pausedModel:
+                return "Model download is paused. Resume it in Settings before dictating."
             case .whisperKitUnavailable:
                 return "WhisperKit no está disponible en este build."
             case .fluidAudioUnavailable:
@@ -464,7 +750,7 @@ public final class ModelDownloadService: NSObject, ObservableObject {
     /// Exposes only the current-attempt bit to deterministic unit tests; the
     /// UI continues to derive its state from the published collections.
     internal func isDownloadActive(modelId: String) -> Bool {
-        downloadTasks[modelId] != nil && !pausedDownloads.contains(modelId)
+        queuedStarts.contains(modelId) || (downloadTasks[modelId] != nil && !pausedDownloads.contains(modelId) && !endingDownloads.contains(modelId))
     }
 
     /// Returns whether the model has a paused download that can be resumed.
@@ -474,29 +760,26 @@ public final class ModelDownloadService: NSObject, ObservableObject {
 
     private func updateProgress(modelId: String, token: UUID, fraction: Double) {
         guard isCurrentAttempt(modelId: modelId, token: token),
-              !pausedDownloads.contains(modelId) else { return }
+              !pausedDownloads.contains(modelId), !endingDownloads.contains(modelId) else { return }
         downloadProgress[modelId] = fraction
     }
 
     private func completeDownload(modelId: String, token: UUID) {
-        guard !pausedDownloads.contains(modelId) else { return }
+        guard !pausedDownloads.contains(modelId), !endingDownloads.contains(modelId) else { return }
         guard finishDownload(modelId: modelId, token: token) else { return }
         refreshDownloadedModels()
     }
 
     private func completeParakeetDownload(modelId: String, token: UUID) {
         guard isCurrentAttempt(modelId: modelId, token: token),
-              !pausedDownloads.contains(modelId) else { return }
-        var set = SettingsStore.shared.downloadedParakeetModels
-        set.insert(modelId)
-        SettingsStore.shared.downloadedParakeetModels = set
+              !pausedDownloads.contains(modelId), !endingDownloads.contains(modelId) else { return }
         guard finishDownload(modelId: modelId, token: token) else { return }
         refreshDownloadedModels()
     }
 
     private func failDownload(modelId: String, token: UUID, message: String) {
         guard isCurrentAttempt(modelId: modelId, token: token),
-              !pausedDownloads.contains(modelId) else { return }
+              !pausedDownloads.contains(modelId), !endingDownloads.contains(modelId) else { return }
         lastError = message
         finishDownload(modelId: modelId, token: token)
     }
@@ -505,7 +788,7 @@ public final class ModelDownloadService: NSObject, ObservableObject {
         // Cancellation is an expected user action, not a user-facing error.
         // A paused attempt remains owned by the service so a resume can create
         // a fresh generation without losing the provider's partial cache.
-        guard !pausedDownloads.contains(modelId) else { return }
+        guard !pausedDownloads.contains(modelId), !endingDownloads.contains(modelId) else { return }
         _ = finishDownload(modelId: modelId, token: token)
     }
 
@@ -526,6 +809,7 @@ public final class ModelDownloadService: NSObject, ObservableObject {
     public func pauseDownload(modelId: String) {
         guard let attempt = downloadTasks[modelId],
               !pausedDownloads.contains(modelId),
+              !endingDownloads.contains(modelId),
               attempt.task != nil else { return }
 
         pausedDownloads.insert(modelId)
@@ -547,9 +831,8 @@ public final class ModelDownloadService: NSObject, ObservableObject {
         let cancelledTask = attempt.task
         cancelledTask?.cancel()
 
-        // WhisperKit's cancellation handler schedules downloader.cancel() in a
-        // child task. Waiting for the owning attempt to finish ensures that
-        // child has quiesced before a new generation touches the same cache.
+        // Retain ownership until the provider call returns. Cancellation is a
+        // request, not proof that its file-writing operation has completed.
         Task { @MainActor [weak self] in
             if let cancelledTask {
                 await cancelledTask.value
@@ -575,65 +858,90 @@ public final class ModelDownloadService: NSObject, ObservableObject {
     }
 
     public func cancelDownload(modelId: String) {
-        guard let attempt = downloadTasks[modelId] else { return }
+        queuedStarts.remove(modelId)
+        downloadProgress.removeValue(forKey: modelId)
+        indeterminateDownloads.remove(modelId)
+        pendingResumes.remove(modelId)
+        pausedDownloads.remove(modelId)
+        guard let attempt = downloadTasks[modelId], endingDownloads.insert(modelId).inserted else { return }
+        invalidateInventory()
         attempt.task?.cancel()
-        _ = finishDownload(modelId: modelId, token: attempt.token)
+        Task { [weak self] in
+            await attempt.task?.value
+            guard let self, self.isCurrentAttempt(modelId: modelId, token: attempt.token) else { return }
+            self.endingDownloads.remove(modelId)
+            self.downloadTasks.removeValue(forKey: modelId)
+            self.restartIfQueued(modelId: modelId)
+            self.refreshDownloadedModels()
+        }
     }
-    
+
+    private func restartIfQueued(modelId: String) {
+        guard deletionTasks[modelId] == nil, !endingDownloads.contains(modelId),
+              queuedStarts.remove(modelId) != nil else { return }
+        startDownload(modelId: modelId)
+    }
+
     public func deleteModel(modelId: String) {
-        guard let model = catalog.first(where: { $0.id == modelId }) else { return }
+        guard let model = catalog.first(where: { $0.id == modelId }), deletionTasks[modelId] == nil else { return }
+        modelRevisions[modelId, default: 0] += 1
+        readSnapshots.removeValue(forKey: modelId)
+#if canImport(WhisperKit)
+        whisperTokenizers.removeValue(forKey: modelId)
+#endif
+        let readCopy = readCopyTasks[modelId]
+        let provider = downloadTasks[modelId]?.task
+        cancelDownload(modelId: modelId)
+        invalidateInventory()
         downloadedModels.remove(modelId)
-
-        switch model.engine {
-        case .whisperKit:
-            guard let baseDir = try? modelDownloadBase() else { break }
-            DispatchQueue.global(qos: .utility).async {
-                Self.removeWhisperModelFiles(baseDir: baseDir, modelId: modelId)
-                DispatchQueue.main.async { [weak self] in
-                    self?.refreshDownloadedModels()
+        let operation = deletionOperation
+        let whisperBase = modelDownloadBaseOverride
+        let parakeetBase = parakeetModelBaseOverride
+        deletionTasks[modelId] = Task { [weak self] in
+            await provider?.value
+            _ = try? await readCopy?.task.value
+            do {
+                if let operation { try await operation(modelId) }
+                else {
+                    try await Task.detached(priority: .utility) {
+                        switch model.engine {
+                        case .whisperKit:
+                            let base = try whisperBase ?? ModelStorage.whisperKitBase(create: false)
+                            try Self.removeWhisperModelFiles(baseDir: base, modelId: modelId)
+                            let tokens = try ModelStorage.downloadWorkspace(whisperBase: whisperBase)
+                                .appendingPathComponent("Tokenizers/\(modelId)")
+                            if FileManager.default.fileExists(atPath: tokens.path) { try FileManager.default.removeItem(at: tokens) }
+                        case .parakeet:
+                            if let directory = ModelStorage.parakeetDirectory(version: model.parakeetVersion ?? "v3", root: parakeetBase),
+                               FileManager.default.fileExists(atPath: directory.path) {
+                                try FileManager.default.removeItem(at: directory)
+                            }
+                        }
+                    }.value
                 }
-            }
-        case .parakeet:
-            var set = SettingsStore.shared.downloadedParakeetModels
-            set.remove(modelId)
-            SettingsStore.shared.downloadedParakeetModels = set
-
-            DispatchQueue.global(qos: .utility).async {
-                Self.removeParakeetModelFiles(modelId: modelId)
-                DispatchQueue.main.async { [weak self] in
-                    self?.refreshDownloadedModels()
-                }
-            }
+            } catch { self?.lastError = "No se pudo borrar \(model.name): \(error.localizedDescription)" }
+            guard let self else { return }
+            self.deletionTasks.removeValue(forKey: modelId)
+            self.restartIfQueued(modelId: modelId)
+            self.refreshDownloadedModels()
         }
     }
 
-    private nonisolated static func removeWhisperModelFiles(baseDir: URL, modelId: String) {
-        guard let enumerator = FileManager.default.enumerator(at: baseDir, includingPropertiesForKeys: nil) else { return }
+    private nonisolated static func removeWhisperModelFiles(baseDir: URL, modelId: String) throws {
+        guard FileManager.default.fileExists(atPath: baseDir.path) else { return }
+        var traversalError: Error?
+        guard let enumerator = FileManager.default.enumerator(
+            at: baseDir, includingPropertiesForKeys: nil,
+            errorHandler: { _, error in traversalError = error; return false }) else {
+            throw CocoaError(.fileReadUnknown)
+        }
         var toRemove: [URL] = []
-        for case let fileURL as URL in enumerator where fileURL.lastPathComponent == "config.json" {
-            let dir = fileURL.deletingLastPathComponent()
-            if dir.lastPathComponent == modelId {
-                toRemove.append(dir)
-            }
+        for case let directory as URL in enumerator where directory.lastPathComponent == modelId {
+            toRemove.append(directory)
+            enumerator.skipDescendants()
         }
-        for dir in toRemove {
-            try? FileManager.default.removeItem(at: dir)
-        }
-    }
-
-    private nonisolated static func removeParakeetModelFiles(modelId: String) {
-        guard let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return }
-        let fluidAudioModels = appSupport
-            .appendingPathComponent("FluidAudio", isDirectory: true)
-            .appendingPathComponent("Models", isDirectory: true)
-        guard let contents = try? FileManager.default.contentsOfDirectory(at: fluidAudioModels, includingPropertiesForKeys: nil) else { return }
-        for dir in contents {
-            let name = dir.lastPathComponent.lowercased()
-            let target = modelId.lowercased()
-            if name == target || name.contains(target) || target.contains(name) {
-                try? FileManager.default.removeItem(at: dir)
-            }
-        }
+        if let traversalError { throw traversalError }
+        for directory in toRemove { try FileManager.default.removeItem(at: directory) }
     }
 
     /// WhisperKit download/load directory. Delegates to the shared `ModelStorage`
