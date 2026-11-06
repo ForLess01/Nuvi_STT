@@ -160,6 +160,10 @@ final class AudioChunkRingTests: XCTestCase {
         }
 
         XCTAssertEqual(session.droppedStreamCount, 2)
+        XCTAssertEqual(session.lossDiagnostics.streamDrops, 2)
+        XCTAssertEqual(session.lossDiagnostics.ringDrops, 0)
+        XCTAssertEqual(session.lossDiagnostics.allocationFailures, 0)
+        XCTAssertTrue(session.lossDiagnostics.hasLoss)
         let firstValue = await iterator.next()
         let first = try XCTUnwrap(firstValue)
         XCTAssertEqual(read(first, channel: 0), [1], "bufferingOldest keeps the earliest queued audio")
@@ -271,6 +275,65 @@ final class AudioChunkRingTests: XCTestCase {
         XCTAssertEqual(lifecycle.events, ["stop", "uninitialize", "dispose"])
     }
 
+    func testPublisherBacksOffEmptyWaitsWithinBoundedLatency() async throws {
+        let ring = AudioChunkRing(maxFrames: 512, channelCount: 1, capacity: 8)
+        XCTAssertTrue(isReserved(ring.enqueue(planarSamples: [[Float](repeating: 0.1, count: 512)])))
+        let format = try XCTUnwrap(AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 1))
+        let (stream, continuation) = AsyncStream<AVAudioPCMBuffer>.makeStream(bufferingPolicy: .bufferingOldest(8))
+        let clock = PublisherTestClock()
+        let finished = expectation(description: "bounded empty waits complete")
+        let session = AudioCaptureSession(
+            lifecycle: TestAudioUnitLifecycle(), format: format, continuation: continuation,
+            levelHandler: nil, usesBluetoothInput: false, ring: ring,
+            publisherSleep: { delay in
+                if clock.advance(delay) >= 50_000_000 {
+                    ring.close()
+                    finished.fulfill()
+                }
+                await Task.yield()
+            }
+        )
+        session.startPublisher()
+        await fulfillment(of: [finished], timeout: 2)
+        session.cleanup()
+        XCTAssertLessThanOrEqual(clock.delays.count, 15, "Avoid 50 empty wakeups in a simulated 50 ms gap")
+        XCTAssertTrue(clock.delays.allSatisfy { $0 <= 4_000_000 }, "Bound both delivery and shutdown polling latency")
+        var iterator = stream.makeAsyncIterator()
+        let first = await iterator.next()
+        XCTAssertEqual(first?.frameLength, 512)
+        let end = await iterator.next()
+        XCTAssertNil(end)
+    }
+
+    func testPublisherKeepsSmallSliceLatencyAndResetsAfterNewAudio() async throws {
+        let ring = AudioChunkRing(maxFrames: 512, channelCount: 1, capacity: 8)
+        _ = ring.enqueue(planarSamples: [[Float](repeating: 0.1, count: 512)])
+        let format = try XCTUnwrap(AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 1))
+        let (stream, continuation) = AsyncStream<AVAudioPCMBuffer>.makeStream(bufferingPolicy: .bufferingOldest(8))
+        let clock = PublisherTestClock()
+        let finished = expectation(description: "small slice resets idle delay")
+        let session = AudioCaptureSession(
+            lifecycle: TestAudioUnitLifecycle(), format: format, continuation: continuation,
+            levelHandler: nil, usesBluetoothInput: false, ring: ring,
+            publisherSleep: { delay in
+                _ = clock.advance(delay)
+                if clock.delays.count == 3 {
+                    _ = ring.enqueue(planarSamples: [[Float](repeating: 0.2, count: 64)])
+                }
+                if clock.delays.count == 8 { ring.close(); finished.fulfill() }
+                await Task.yield()
+            }
+        )
+        session.startPublisher()
+        await fulfillment(of: [finished], timeout: 2)
+        session.cleanup()
+        XCTAssertEqual(Array(clock.delays.prefix(3)), [1_000_000, 2_000_000, 4_000_000])
+        XCTAssertTrue(clock.delays.dropFirst(3).allSatisfy { $0 == 1_000_000 })
+        var lengths: [AVAudioFrameCount] = []
+        for await buffer in stream { lengths.append(buffer.frameLength) }
+        XCTAssertEqual(lengths, [512, 64])
+    }
+
     private func isReserved(_ result: AudioChunkWriteResult) -> Bool {
         if case .reserved = result { return true }
         return false
@@ -322,5 +385,23 @@ private final class LockedValues<Value>: @unchecked Sendable {
         lock.lock()
         storage.append(value)
         lock.unlock()
+    }
+}
+
+private final class PublisherTestClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var elapsed: UInt64 = 0
+    private var values: [UInt64] = []
+    var delays: [UInt64] {
+        lock.lock()
+        defer { lock.unlock() }
+        return values
+    }
+    func advance(_ delay: UInt64) -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        values.append(delay)
+        elapsed += delay
+        return elapsed
     }
 }

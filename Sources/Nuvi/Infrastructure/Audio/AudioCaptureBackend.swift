@@ -39,6 +39,16 @@ internal struct AudioFormatSnapshot: Equatable, Sendable {
     }
 }
 
+internal struct AudioCaptureLoss: Equatable, Sendable {
+    var ringDrops: UInt64 = 0
+    var oversizedSlices: UInt64 = 0
+    var streamDrops: UInt64 = 0
+    var allocationFailures: UInt64 = 0
+    var hasLoss: Bool {
+        ringDrops > 0 || oversizedSlices > 0 || streamDrops > 0 || allocationFailures > 0
+    }
+}
+
 internal struct AudioCaptureDiagnostics: Equatable, Sendable {
     let requestedBackend: AudioCaptureBackendKind
     let effectiveBackend: AudioCaptureBackendKind?
@@ -50,11 +60,13 @@ internal struct AudioCaptureDiagnostics: Equatable, Sendable {
     let outputClientFormat: AudioFormatSnapshot?
     let maximumFramesPerSlice: UInt32
     let cleanupComplete: Bool
+    var loss: AudioCaptureLoss = AudioCaptureLoss()
 
     func with(
         selectedInputUID: String? = nil,
         effectiveBackend: AudioCaptureBackendKind? = nil,
-        cleanupComplete: Bool? = nil
+        cleanupComplete: Bool? = nil,
+        loss: AudioCaptureLoss? = nil
     ) -> AudioCaptureDiagnostics {
         AudioCaptureDiagnostics(
             requestedBackend: requestedBackend,
@@ -66,7 +78,8 @@ internal struct AudioCaptureDiagnostics: Equatable, Sendable {
             inputClientFormat: inputClientFormat,
             outputClientFormat: outputClientFormat,
             maximumFramesPerSlice: maximumFramesPerSlice,
-            cleanupComplete: cleanupComplete ?? self.cleanupComplete
+            cleanupComplete: cleanupComplete ?? self.cleanupComplete,
+            loss: loss ?? self.loss
         )
     }
 
@@ -85,7 +98,8 @@ internal struct AudioCaptureDiagnostics: Equatable, Sendable {
             inputClientFormat: inputClientFormat,
             outputClientFormat: outputClientFormat,
             maximumFramesPerSlice: maximumFramesPerSlice,
-            cleanupComplete: cleanupComplete
+            cleanupComplete: cleanupComplete,
+            loss: loss
         )
     }
 }

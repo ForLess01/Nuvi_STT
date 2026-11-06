@@ -166,6 +166,7 @@ internal final class AudioCaptureSession: @unchecked Sendable {
     private let allocationFailures = Atomic<UInt64>(0)
     private let publisherCompletion = DispatchSemaphore(value: 0)
     private let fatalRenderRequested = Atomic<Bool>(false)
+    private let publisherSleep: @Sendable (UInt64) async -> Void
 
     private var captureGain: AdaptiveCaptureGain
     private var lastLevelEmissionNanos: UInt64 = 0
@@ -183,13 +184,17 @@ internal final class AudioCaptureSession: @unchecked Sendable {
          spectrumHandler: (@Sendable (AudioSpectrum) -> Void)? = nil,
          usesBluetoothInput: Bool,
          ring: AudioChunkRing? = nil,
-         levelEmissionIntervalNanos: UInt64 = 16_000_000) {
+         levelEmissionIntervalNanos: UInt64 = 16_000_000,
+         publisherSleep: @escaping @Sendable (UInt64) async -> Void = { delay in
+             try? await Task.sleep(nanoseconds: delay)
+         }) {
         self.lifecycle = lifecycle
         self.format = format
         self.continuation = continuation
         self.levelHandler = levelHandler
         self.spectrumHandler = spectrumHandler
         self.levelEmissionIntervalNanos = levelEmissionIntervalNanos
+        self.publisherSleep = publisherSleep
         self.captureGain = usesBluetoothInput ? .bluetoothSpeechBoost : .disabled
         self.ring = ring ?? AudioChunkRing(maxFrames: 1, channelCount: 1, capacity: 1)
     }
@@ -200,6 +205,13 @@ internal final class AudioCaptureSession: @unchecked Sendable {
 
     internal var bufferAllocationFailureCount: UInt64 {
         allocationFailures.load(ordering: .acquiring)
+    }
+
+    internal var lossDiagnostics: AudioCaptureLoss {
+        AudioCaptureLoss(ringDrops: ring.droppedNewestCount,
+                         oversizedSlices: ring.oversizedSliceCount,
+                         streamDrops: droppedStreamCount,
+                         allocationFailures: bufferAllocationFailureCount)
     }
 
     /// Installs stream cancellation handling before the stream is returned to
@@ -396,6 +408,9 @@ internal final class AudioCaptureSession: @unchecked Sendable {
             }
         }
 
+        var idleDelay: UInt64 = 1_000_000
+        var maximumIdleDelay: UInt64 = 1_000_000
+        var smallestFrameCount = Int.max
         while true {
             if fatalRenderRequested.load(ordering: .acquiring) {
                 cleanup(waitForPublisher: false)
@@ -404,6 +419,14 @@ internal final class AudioCaptureSession: @unchecked Sendable {
             var processedAny = false
             while let chunk = ring.pop() {
                 processedAny = true
+                smallestFrameCount = min(smallestFrameCount, chunk.frameCount)
+                if let rate = format?.sampleRate, rate.isFinite, rate > 0 {
+                    // Never wait longer than half the smallest observed slice
+                    // (with the original 1 ms floor and a 4 ms absolute cap).
+                    let nanos = Double(smallestFrameCount) / rate * 500_000_000
+                    maximumIdleDelay = UInt64(min(4_000_000, max(1_000_000, nanos)))
+                }
+                idleDelay = 1_000_000
                 publish(chunk)
             }
 
@@ -426,7 +449,8 @@ internal final class AudioCaptureSession: @unchecked Sendable {
                 // The callback has no wake-up primitive on its realtime path;
                 // short publisher-side sleeps avoid a hot spin while retaining
                 // bounded shutdown once `ring.close()` is observed.
-                try? await Task.sleep(nanoseconds: 1_000_000)
+                await publisherSleep(idleDelay)
+                idleDelay = min(maximumIdleDelay, idleDelay * 2)
             }
         }
     }
@@ -699,6 +723,13 @@ public final class AudioCaptureService: AudioCapturing, @unchecked Sendable {
             activeDiagnostics = nil
             return false
         }
+        defer {
+            let loss = session.lossDiagnostics
+            if loss.hasLoss {
+                NSLog("Nuvi/audio: capture loss ring=%llu oversized=%llu stream=%llu allocation=%llu",
+                      loss.ringDrops, loss.oversizedSlices, loss.streamDrops, loss.allocationFailures)
+            }
+        }
         guard let backend else {
             session.cleanup()
             lastCleanupStatus = session.lifecycle.cleanupStatus
@@ -715,7 +746,8 @@ public final class AudioCaptureService: AudioCapturing, @unchecked Sendable {
         let status = session.lifecycle.cleanupStatus
         lastCleanupStatus = status
         if let diagnostics {
-            lastDiagnostics = diagnostics.with(cleanupComplete: status.isComplete)
+            lastDiagnostics = diagnostics.with(cleanupComplete: status.isComplete,
+                                               loss: session.lossDiagnostics)
         }
         activeDiagnostics = nil
         return true

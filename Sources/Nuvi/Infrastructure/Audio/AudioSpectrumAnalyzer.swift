@@ -24,7 +24,12 @@ public final class AudioSpectrumAnalyzer: @unchecked Sendable {
     private var split: DSPSplitComplex
     private let lock = NSLock()
 
+    internal static func isSupportedFFTSize(_ size: Int) -> Bool {
+        size >= 2 && (size & (size - 1)) == 0
+    }
+
     public init(fftSize: Int = defaultFFTSize) {
+        precondition(Self.isSupportedFFTSize(fftSize), "FFT size must be a positive power of two, at least 2")
         self.fftSize = fftSize
         self.halfSize = fftSize / 2
         self.log2n = vDSP_Length(round(log2(Double(fftSize))))
@@ -76,7 +81,7 @@ public final class AudioSpectrumAnalyzer: @unchecked Sendable {
 
     /// Analyzes raw pointer samples with SIMD vectorization and continuous sliding STFT.
     public func analyze(samples: UnsafePointer<Float>, count: Int, sampleRate: Float) -> AudioSpectrum {
-        guard count > 0, sampleRate > 0 else { return .zero }
+        guard count > 0, sampleRate.isFinite, sampleRate > 0 else { return .zero }
 
         lock.lock()
         defer { lock.unlock() }
@@ -119,29 +124,33 @@ public final class AudioSpectrumAnalyzer: @unchecked Sendable {
         // Bass: 40 - 280 Hz (male/female fundamental pitch resonance)
         // Mid: 280 - 2800 Hz (vowel formants F1 and F2, core speech power)
         // Treble: 2800 - 8000 Hz (sibilants, fricatives, consonants)
-        let df = sampleRate / Float(fftSize)
-        let kb1 = max(1, Int(round(40.0 / df)))
-        let kb2 = max(kb1, Int(round(280.0 / df)) - 1)
+        // Clamp before converting to Int: very small finite sample rates can
+        // otherwise overflow the ratio as well as the available FFT bins.
+        func bin(_ frequency: Float) -> Int {
+            let position = (frequency / sampleRate * Float(fftSize)).rounded()
+            guard position.isFinite, position < Float(halfSize) else { return halfSize }
+            return max(0, Int(position))
+        }
+        let kb1 = max(1, bin(40))
+        let kb2 = max(kb1, bin(280) - 1)
         let km1 = kb2 + 1
-        let km2 = max(km1, Int(round(2800.0 / df)) - 1)
+        let km2 = max(km1, bin(2800) - 1)
         let kt1 = km2 + 1
-        let kt2 = min(halfSize - 1, max(kt1, Int(round(8000.0 / df))))
+        let kt2 = max(kt1, bin(8000))
 
-        var bassPeak: Float = 0
-        var midPeak: Float = 0
-        var treblePeak: Float = 0
-
-        vDSP_maxv(magnitudes + kb1, 1, &bassPeak, vDSP_Length(kb2 - kb1 + 1))
-        vDSP_maxv(magnitudes + km1, 1, &midPeak, vDSP_Length(km2 - km1 + 1))
-        vDSP_maxv(magnitudes + kt1, 1, &treblePeak, vDSP_Length(kt2 - kt1 + 1))
-
-        var bassRms: Float = 0
-        var midRms: Float = 0
-        var trebleRms: Float = 0
-
-        vDSP_rmsqv(magnitudes + kb1, 1, &bassRms, vDSP_Length(kb2 - kb1 + 1))
-        vDSP_rmsqv(magnitudes + km1, 1, &midRms, vDSP_Length(km2 - km1 + 1))
-        vDSP_rmsqv(magnitudes + kt1, 1, &trebleRms, vDSP_Length(kt2 - kt1 + 1))
+        func energy(from start: Int, through end: Int) -> (peak: Float, rms: Float) {
+            let last = min(halfSize - 1, end)
+            guard start >= 1, start <= last else { return (0, 0) }
+            let count = vDSP_Length(last - start + 1)
+            var peak: Float = 0
+            var rms: Float = 0
+            vDSP_maxv(magnitudes + start, 1, &peak, count)
+            vDSP_rmsqv(magnitudes + start, 1, &rms, count)
+            return (peak, rms)
+        }
+        let (bassPeak, bassRms) = energy(from: kb1, through: kb2)
+        let (midPeak, midRms) = energy(from: km1, through: km2)
+        let (treblePeak, trebleRms) = energy(from: kt1, through: kt2)
 
         // 6. Normalization, peak/RMS blend, and noise floor rejection
         // Full-scale sine magnitude in vDSP_fft_zrip is N/2 = 256.0.

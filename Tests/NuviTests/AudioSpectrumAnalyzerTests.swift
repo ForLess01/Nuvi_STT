@@ -13,6 +13,39 @@ final class AudioSpectrumAnalyzerTests: XCTestCase {
         }
     }
 
+    func testLowSampleRatesKeepBandsWithinAvailableBins() {
+        for rate: Float in [4000, 1000, 80, 1] {
+            let analyzer = AudioSpectrumAnalyzer()
+            let samples = makeSineWave(frequency: rate / 8, sampleRate: rate)
+            let spectrum = analyzer.analyze(samples: samples, sampleRate: rate)
+            XCTAssertTrue(spectrum.level.isFinite)
+            XCTAssertTrue(spectrum.bass.isFinite)
+            XCTAssertTrue(spectrum.mid.isFinite)
+            XCTAssertEqual(spectrum.treble, 0, "There are no treble bins below the Nyquist limit")
+        }
+    }
+
+    func testNonfiniteSampleRatesProduceZero() {
+        let samples = makeSineWave(frequency: 100)
+        for rate: Float in [0, -1, .nan, .infinity] {
+            XCTAssertEqual(AudioSpectrumAnalyzer().analyze(samples: samples, sampleRate: rate), .zero)
+        }
+    }
+
+    func testFFTSizeValidationAndSupportedSizes() {
+        for size in [0, -1, 1, 3, 511, 513] {
+            XCTAssertFalse(AudioSpectrumAnalyzer.isSupportedFFTSize(size))
+        }
+        for size in [64, 256, 512, 1024] {
+            XCTAssertTrue(AudioSpectrumAnalyzer.isSupportedFFTSize(size))
+            let result = AudioSpectrumAnalyzer(fftSize: size).analyze(
+                samples: makeSineWave(frequency: 1000, count: size), sampleRate: sampleRate
+            )
+            XCTAssertTrue(result.mid.isFinite)
+            XCTAssertGreaterThan(result.level, 0)
+        }
+    }
+
     func testSilenceProducesZero() {
         let silence = [Float](repeating: 0, count: frameCount)
         let spectrum = analyzer.analyze(samples: silence, sampleRate: sampleRate)

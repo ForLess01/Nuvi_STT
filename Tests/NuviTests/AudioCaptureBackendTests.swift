@@ -28,6 +28,7 @@ final class AudioCaptureBackendTests: XCTestCase {
             XCTAssertEqual(operations.uninitializeCount, cycle)
             XCTAssertEqual(operations.disposeCount, cycle)
             XCTAssertEqual(service.lastDiagnostics?.cleanupComplete, true)
+            XCTAssertEqual(service.lastDiagnostics?.loss, AudioCaptureLoss())
             XCTAssertEqual(operations.addedListeners.count, operations.removedListeners.count)
             XCTAssertEqual(
                 operations.events.filter { ["initialize", "start", "stop", "uninitialize", "dispose"].contains($0) },
@@ -47,6 +48,26 @@ final class AudioCaptureBackendTests: XCTestCase {
         XCTAssertEqual(operations.events.filter { $0 == "start" }.count, 2)
         XCTAssertEqual(operations.stopCount, 2)
         XCTAssertEqual(operations.renderCount, 2)
+    }
+
+    func testLossDiagnosticsSurviveMetadataUpdates() throws {
+        let operations = RecordingNativeOperations()
+        let service = AudioCaptureService(
+            backendFactory: NativeAudioCaptureBackendFactory(
+                operations: operations, devices: TestAudioDeviceProvider(outputDevice: 202)
+            ), inputDeviceOverride: 101
+        )
+        _ = try service.start(configuration: AudioCaptureConfiguration(duckOtherAudio: true))
+        service.stop()
+        let diagnostics = try XCTUnwrap(service.lastDiagnostics)
+        let loss = AudioCaptureLoss(ringDrops: 1, oversizedSlices: 2, streamDrops: 3, allocationFailures: 4)
+        let updated = diagnostics.with(loss: loss).with(cleanupComplete: false)
+        XCTAssertEqual(updated.loss, loss)
+        XCTAssertEqual(updated.withEffectiveFormats(
+            inputClientFormat: try XCTUnwrap(diagnostics.inputClientFormat),
+            outputClientFormat: diagnostics.outputClientFormat,
+            maximumFramesPerSlice: 256
+        ).loss, loss)
     }
 
     func testNextPTTSessionUsesChangedDefaultOutput() throws {
