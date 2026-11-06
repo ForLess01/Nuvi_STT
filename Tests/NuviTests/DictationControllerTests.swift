@@ -382,6 +382,42 @@ final class DictationControllerTests: XCTestCase {
         XCTAssertEqual(engine.reportingPartialsRequests, [true])
     }
 
+    func testStandardFinalReplacesDisjointUncommittedHypotheses() async {
+        let engine = FakeEngine()
+        engine.events = [.partial("Wrong initial guess"), .partial("Correct hypothesis"), .final("Correct result.")]
+        let injector = FakeTextInjector()
+        let controller = DictationController(
+            audio: FakeAudioCapture(), engine: engine, history: HistoryStore(),
+            vocabulary: VocabularyStore(), modes: ModesStore(), textInjector: injector,
+            deliveryMode: { .standard }
+        )
+        controller.start()
+        await yieldUntil { controller.state == .inserted }
+        XCTAssertEqual(injector.insertedTexts, ["Correct result."])
+    }
+
+    func testStandardPreservesSegmentFinalsAndDeduplicatesCumulativeFinals() async {
+        for events: [TranscriptionEvent] in [
+            [.partial("First phrase"), .final("First phrase."),
+             .partial("Second phrase"), .final("Second phrase.")],
+            [.final("First phrase."), .partial("First phrase. Second phrase"),
+             .final("First phrase. Second phrase.")]
+        ] {
+            let engine = FakeEngine()
+            engine.events = events
+            let injector = FakeTextInjector()
+            let controller = DictationController(
+                audio: FakeAudioCapture(), engine: engine, history: HistoryStore(),
+                vocabulary: VocabularyStore(), modes: ModesStore(), textInjector: injector,
+                deliveryMode: { .standard }
+            )
+            controller.start()
+            await yieldUntil { controller.state == .inserted }
+            XCTAssertEqual(injector.insertedTexts, ["First phrase. Second phrase."])
+            XCTAssertEqual(engine.reportingPartialsRequests, [false])
+        }
+    }
+
     func testLiveModePreservesCommittedTextWhenEngineRestartsAfterPause() async {
         let audio = FakeAudioCapture()
         let engine = FakeEngine()
@@ -908,6 +944,50 @@ final class DictationControllerTests: XCTestCase {
         XCTAssertEqual(audio.stopCount, 2)
     }
 
+    func testCancelledLiveUpdateCannotCancelReplacementSession() async {
+        let engine = FakeEngine()
+        let live = SuspendedLiveInjector()
+        let controller = DictationController(
+            audio: FakeAudioCapture(), engine: engine, history: HistoryStore(),
+            vocabulary: VocabularyStore(), modes: ModesStore(), textInjector: FakeTextInjector(),
+            liveTextInjector: live, deliveryMode: { .live }
+        )
+        controller.start()
+        await waitUntil { controller.state == .listening }
+        engine.emit(.partial("old provisional text"))
+        await waitUntil { live.waiter != nil }
+        controller.cancel()
+        controller.start()
+        await waitUntil { controller.state == .listening && live.beginCount == 2 }
+        live.release()
+        for _ in 0..<10 { await Task.yield() }
+        XCTAssertEqual(controller.state, .listening)
+        XCTAssertEqual(live.cancelCount, 1)
+        controller.cancel()
+    }
+
+    func testCancelledStandardInsertionCannotFinishReplacementSession() async {
+        let engine = FakeEngine()
+        let injector = SuspendedInsertion()
+        let controller = DictationController(
+            audio: FakeAudioCapture(), engine: engine, history: HistoryStore(),
+            vocabulary: VocabularyStore(), modes: ModesStore(), textInjector: injector,
+            deliveryMode: { .standard }
+        )
+        controller.start()
+        await waitUntil { controller.state == .listening }
+        engine.emit(.final("old final"))
+        engine.finish()
+        await waitUntil { injector.waiter != nil }
+        controller.cancel()
+        controller.start()
+        await waitUntil { controller.state == .listening }
+        injector.release()
+        for _ in 0..<10 { await Task.yield() }
+        XCTAssertEqual(controller.state, .listening)
+        controller.cancel()
+    }
+
     private func hasArmedSilenceTimer(_ controller: DictationController) -> Bool {
         // Read the existing private handle without adding production test API.
         guard let timer = Mirror(reflecting: controller).children.first(where: {
@@ -1395,4 +1475,29 @@ private final class PreparationGate: @unchecked Sendable {
         }
         pending?.resume()
     }
+}
+
+@MainActor
+private final class SuspendedInsertion: TextInserting {
+    var waiter: CheckedContinuation<Void, Never>?
+    func insert(_ text: String, restoreClipboard: Bool) async -> InjectionResult {
+        await withCheckedContinuation { waiter = $0 }
+        return .inserted
+    }
+    func release() { waiter?.resume(); waiter = nil }
+}
+
+@MainActor
+private final class SuspendedLiveInjector: LiveTextInserting {
+    var waiter: CheckedContinuation<Void, Never>?
+    var beginCount = 0
+    var cancelCount = 0
+    func begin() -> Bool { beginCount += 1; return true }
+    func update(_ text: String) async -> Bool {
+        await withCheckedContinuation { waiter = $0 }
+        return false
+    }
+    func finish(_ text: String, restoreClipboard: Bool) -> InjectionResult { .inserted }
+    func cancel() { cancelCount += 1 }
+    func release() { waiter?.resume(); waiter = nil }
 }

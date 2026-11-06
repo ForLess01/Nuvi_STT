@@ -10,7 +10,7 @@ import Combine
 /// so it can be unit-tested with fakes. It knows nothing about pills or Metal.
 public protocol TextInserting: Sendable {
     @MainActor
-    func insert(_ text: String, restoreClipboard: Bool) -> InjectionResult
+    func insert(_ text: String, restoreClipboard: Bool) async -> InjectionResult
 }
 
 @MainActor
@@ -18,9 +18,9 @@ public protocol LiveTextInserting: AnyObject {
     /// Captures the currently focused, non-secure editable target.
     func begin() -> Bool
     /// Reconciles the previous provisional text with the latest hypothesis.
-    func update(_ text: String) -> Bool
+    func update(_ text: String) async -> Bool
     /// Replaces the provisional hypothesis with the settled output.
-    func finish(_ text: String, restoreClipboard: Bool) -> InjectionResult
+    func finish(_ text: String, restoreClipboard: Bool) async -> InjectionResult
     /// Removes provisional text when the session is cancelled or fails.
     func cancel()
 }
@@ -29,8 +29,8 @@ public struct SystemTextInjector: TextInserting {
     public init() {}
 
     @MainActor
-    public func insert(_ text: String, restoreClipboard: Bool) -> InjectionResult {
-        TextInjector.insert(text, restoreClipboard: restoreClipboard)
+    public func insert(_ text: String, restoreClipboard: Bool) async -> InjectionResult {
+        await TextInjector.insert(text, restoreClipboard: restoreClipboard)
     }
 }
 
@@ -56,6 +56,7 @@ public struct PassthroughTextTranslator: TextTranslating {
 /// provisional text separate prevents a restarted hypothesis from deleting
 /// everything that was already inserted into the target editor.
 struct LiveTranscriptAssembler: Equatable {
+    var protectsUnfinalizedSegments = true
     private(set) var committed = ""
     private(set) var provisional = ""
 
@@ -132,6 +133,10 @@ struct LiveTranscriptAssembler: Equatable {
     }
 
     private mutating func reconcilePartial(with incoming: String) {
+        if !protectsUnfinalizedSegments {
+            provisional = incoming
+            return
+        }
         guard !provisional.isEmpty else {
             provisional = incoming
             return
@@ -620,24 +625,15 @@ public final class DictationController: ObservableObject {
                 performStop()
             }
 
-            var liveTranscript = LiveTranscriptAssembler()
+            var liveTranscript = LiveTranscriptAssembler(protectsUnfinalizedSegments: isLive)
             for try await event in engine.transcribe(buffers, reportingPartials: isLive) {
                 guard ownsSession(id), !Task.isCancelled else { return }
                 hasSpokenInCurrentSession = true
                 cancelSilenceTimer()
+                guard let assembled = liveTranscript.consume(event) else { continue }
+                transcript = assembled
                 if isLive {
-                    guard let assembled = liveTranscript.consume(event) else { continue }
-                    transcript = assembled
-                    try updateLiveInsertion(with: assembled)
-                    continue
-                }
-                switch event {
-                case .partial(let text):
-                    transcript = text
-                case .final(let text) where !text.isEmpty:
-                    transcript = text
-                case .final:
-                    break
+                    try await updateLiveInsertion(with: assembled, ownedBy: id)
                 }
             }
 
@@ -671,11 +667,13 @@ public final class DictationController: ObservableObject {
         let restoreClipboard = SettingsStore.shared.restoreClipboard
         let result: InjectionResult
         if liveInsertionStarted {
-            result = liveTextInjector.finish(output, restoreClipboard: restoreClipboard)
+            result = await liveTextInjector.finish(output, restoreClipboard: restoreClipboard)
+            guard ownsSession(id), !Task.isCancelled else { throw CancellationError() }
             liveInsertionStarted = false
         } else {
-            result = textInjector.insert(output, restoreClipboard: restoreClipboard)
+            result = await textInjector.insert(output, restoreClipboard: restoreClipboard)
         }
+        guard ownsSession(id), !Task.isCancelled else { throw CancellationError() }
         switch result {
         case .inserted:
             NuviSound.pasted()
@@ -800,9 +798,11 @@ public final class DictationController: ObservableObject {
         applyPendingEngineIfNeeded()
     }
 
-    private func updateLiveInsertion(with text: String) throws {
+    private func updateLiveInsertion(with text: String, ownedBy id: UUID) async throws {
         guard liveInsertionStarted, !text.isEmpty else { return }
-        if !liveTextInjector.update(text) {
+        let updated = await liveTextInjector.update(text)
+        guard ownsSession(id), !Task.isCancelled else { throw CancellationError() }
+        if !updated {
             // Live is target-bound by design. Continuing after focus changes
             // could insert the next revision into the wrong field, so stop the
             // session instead of silently degrading to standard delivery.

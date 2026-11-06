@@ -68,6 +68,20 @@ final class TextInjectorTests: XCTestCase {
         }
     }
 
+    func testClipboardRestoreDoesNotOverwriteNewOwnershipWithIdenticalText() {
+        let pasteboard = NSPasteboard(name: .init("NuviTests.TextInjector.\(UUID().uuidString)"))
+        pasteboard.clearContents()
+        pasteboard.setString("original", forType: .string)
+        let snapshot = PasteboardSnapshot.capture(from: pasteboard)
+        pasteboard.clearContents()
+        pasteboard.setString("dictated", forType: .string)
+        let writeCount = pasteboard.changeCount
+        pasteboard.clearContents()
+        pasteboard.setString("dictated", forType: .string)
+        snapshot.restore(to: pasteboard, ifCurrentStringIs: "dictated", changeCount: writeCount)
+        XCTAssertEqual(pasteboard.string(forType: .string), "dictated")
+    }
+
     func testSecureFieldWinsOverAIEditorAndBrowserRoutes() {
         XCTAssertEqual(
             TextInjector.route(

@@ -30,8 +30,11 @@ public enum TextInjector {
     @MainActor
     final class LiveSession {
         let processIdentifier: pid_t
-        let editableElement: AXUIElement
-        let clipboardSnapshot: PasteboardSnapshot
+        let editableElement: AXUIElement?
+        var clipboardSnapshot: PasteboardSnapshot?
+        let hooks: LiveHooks?
+        var hasCapturedClipboard = false
+        var lastClipboardChangeCount: Int?
         var text = ""
         var isValid = true
         var lastClipboardWrite: String?
@@ -40,12 +43,31 @@ public enum TextInjector {
         init(
             processIdentifier: pid_t,
             editableElement: AXUIElement,
-            clipboardSnapshot: PasteboardSnapshot
+            clipboardSnapshot: PasteboardSnapshot? = nil
         ) {
+            hooks = nil
             self.processIdentifier = processIdentifier
             self.editableElement = editableElement
             self.clipboardSnapshot = clipboardSnapshot
         }
+        init(hooks: LiveHooks) {
+            self.hooks = hooks
+            processIdentifier = 0
+            editableElement = nil
+            clipboardSnapshot = nil
+        }
+
+    }
+
+    @MainActor
+    struct LiveHooks {
+        var validate: () -> Bool
+        var backspace: () -> Bool
+        var paste: (String) -> Bool
+        var readback: (String) -> Bool
+        var restore: () -> Void
+        var sleep: (UInt64) async throws -> Void
+        var capture: (() -> Void)? = nil
     }
 
     enum PreflightPolicy: Equatable {
@@ -144,44 +166,78 @@ public enum TextInjector {
 
         return LiveSession(
             processIdentifier: targetProcessIdentifier,
-            editableElement: editable,
-            clipboardSnapshot: PasteboardSnapshot.capture(from: .general)
+            editableElement: editable
         )
     }
 
     @MainActor
-    static func updateLiveSession(_ session: LiveSession, with text: String) -> Bool {
-        guard session.isValid, liveTargetIsStillFocused(session) else {
-            session.isValid = false
-            return false
+    static func updateLiveSession(_ session: LiveSession, with text: String) async -> Bool {
+        (try? await TextInsertionQueue.shared.run {
+            await reviseLiveSession(session, with: text)
+        }) ?? false
+    }
+
+    @MainActor
+    fileprivate static func reviseLiveSession(_ session: LiveSession, with text: String,
+                                          removingCancelledText: Bool = false) async -> Bool {
+        func valid() -> Bool {
+            !Task.isCancelled && (session.isValid || removingCancelledText) && liveTargetIsStillFocused(session)
+        }
+        guard valid() else { session.isValid = false; return false }
+        // Capture only after acquiring the output queue: a previous session's
+        // queued rollback may still own the temporary clipboard at begin().
+        if !session.hasCapturedClipboard {
+            if let hooks = session.hooks { hooks.capture?() }
+            else { session.clipboardSnapshot = PasteboardSnapshot.capture(from: .general) }
+            session.hasCapturedClipboard = true
         }
         let revision = liveRevision(from: session.text, to: text)
-        guard postBackspaces(revision.backspaceCount) else {
-            session.isValid = false
-            return false
+        for _ in 0..<revision.backspaceCount {
+            guard valid(), session.hooks?.backspace() ?? postBackspaces(1) else { return false }
+            // Record each posted mutation before suspending so cancellation can
+            // remove only what this session actually sent.
+            session.text.removeLast()
+            guard await livePause(session, nanoseconds: 4_000_000, valid: valid) else { return false }
         }
         if revision.backspaceCount > 0, !revision.suffix.isEmpty {
-            usleep(20_000)
+            guard await livePause(session, nanoseconds: 20_000_000, valid: valid) else { return false }
         }
         if !revision.suffix.isEmpty {
-            guard pasteViaClipboard(revision.suffix, restoreClipboard: false) else {
-                session.isValid = false
-                return false
-            }
+            guard valid(), session.hooks?.paste(revision.suffix)
+                ?? pasteViaClipboard(revision.suffix, restoreClipboard: false) else { return false }
             session.lastClipboardWrite = revision.suffix
+            if session.hooks == nil { session.lastClipboardChangeCount = NSPasteboard.general.changeCount }
+            session.text += revision.suffix
         }
-        usleep(100_000)
-        session.text = text
+        guard await livePause(session, nanoseconds: 100_000_000, valid: valid) else { return false }
         session.lastUpdateWasVerified = liveReadbackContains(session, text: text) == true
         return true
     }
 
     @MainActor
+    private static func livePause(_ session: LiveSession, nanoseconds: UInt64,
+                                  valid: () -> Bool) async -> Bool {
+        await waitForTarget(nanoseconds: nanoseconds, valid: valid, sleep: session.hooks?.sleep ?? { nanos in
+            try await Task.sleep(nanoseconds: nanos)
+        })
+    }
+
+    @MainActor
+    static func waitForTarget(nanoseconds: UInt64, valid: () -> Bool,
+                              sleep: (UInt64) async throws -> Void = { try await Task.sleep(nanoseconds: $0) }) async -> Bool {
+        do { try await sleep(nanoseconds) }
+        catch { return false }
+        return !Task.isCancelled && valid()
+    }
+
+    @MainActor
     static func cancelLiveSession(_ session: LiveSession) {
-        if session.isValid {
-            _ = updateLiveSession(session, with: "")
+        session.isValid = false
+        // Enqueue synchronously: a replacement session cannot overtake rollback.
+        _ = TextInsertionQueue.shared.enqueue {
+            _ = await reviseLiveSession(session, with: "", removingCancelledText: true)
+            restoreLiveClipboard(session)
         }
-        restoreLiveClipboard(session)
     }
 
     static func liveRevision(from previous: String, to next: String) -> LiveRevision {
@@ -207,7 +263,40 @@ public enum TextInjector {
     }
 
     @MainActor
-    public static func insert(_ text: String, restoreClipboard: Bool) -> InjectionResult {
+    public static func insert(_ text: String, restoreClipboard: Bool) async -> InjectionResult {
+        let process = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        if !AXIsProcessTrusted() {
+            let valid = { !Task.isCancelled && NSWorkspace.shared.frontmostApplication?.processIdentifier == process }
+            return (try? await TextInsertionQueue.shared.run {
+                untrustedAttemptResult(didPostEvent: await typeUnicode(text, valid: valid))
+            }) ?? untrustedAttemptResult(didPostEvent: false)
+        }
+        guard let original = focusedElement() else {
+            return .manualFallback("Focused target could not be classified — nothing was copied")
+        }
+        let initialSecurity = securityOfFocusedTarget(original)
+        let valid = {
+            !Task.isCancelled && NSWorkspace.shared.frontmostApplication?.processIdentifier == process
+                && focusedElement().map { CFEqual($0, original) && securityOfFocusedTarget($0) == initialSecurity } == true
+        }
+        return (try? await TextInsertionQueue.shared.run {
+            guard valid() else { return .manualFallback("Focused target changed — nothing was copied or typed") }
+            return await insertUnserialized(text, restoreClipboard: restoreClipboard, valid: valid)
+        }) ?? .manualFallback("Insertion cancelled — no further text was sent")
+    }
+
+    @MainActor
+    private static func securityOfFocusedTarget(_ element: AXUIElement) -> TargetSecurityClassification {
+        let editable = editableElement(startingAt: element)
+        return classifyTargetSecurity(focusedRole: stringAttributeRead(element, kAXRoleAttribute as String),
+            focusedSubrole: stringAttributeRead(element, kAXSubroleAttribute as String),
+            editableRole: editable.map { stringAttributeRead($0, kAXRoleAttribute as String) },
+            editableSubrole: editable.map { stringAttributeRead($0, kAXSubroleAttribute as String) })
+    }
+
+    @MainActor
+    private static func insertUnserialized(_ text: String, restoreClipboard: Bool,
+                                           valid: () -> Bool) async -> InjectionResult {
         let trusted = AXIsProcessTrusted()
         let frontmost = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "?"
         NSLog("Nuvi/inject: trusted=\(trusted), frontmost=\(frontmost), characters=\(text.count)")
@@ -217,7 +306,7 @@ public enum TextInjector {
             // Without AX trust Nuvi cannot determine whether the focused field
             // is secure. Never put unknown text on NSPasteboard preemptively.
             NSLog("Nuvi/inject: Accessibility NOT trusted → direct typing without clipboard")
-            return untrustedAttemptResult(didPostEvent: typeUnicode(text))
+            return untrustedAttemptResult(didPostEvent: false)
         case .classifyFocusedTarget:
             break
         }
@@ -262,7 +351,7 @@ public enum TextInjector {
             // This MUST precede every route that touches NSPasteboard. AI editors
             // and browsers can both expose secure descendants.
             NSLog("Nuvi/inject: secure field → direct typing")
-            return typeUnicode(text)
+            return await typeUnicode(text, valid: valid)
                 ? .inserted
                 : .manualFallback("Could not type into the secure field — nothing was copied")
 
@@ -271,7 +360,7 @@ public enum TextInjector {
                 return .manualFallback("Focused target could not be classified — nothing was copied")
             }
             let target = editable ?? element
-            let outcome = axValueInsertVerified(target, text, insertion: .appendToEnd)
+            let outcome = await axValueInsertVerified(target, text, insertion: .appendToEnd, valid: valid)
             switch continuation(after: outcome, whenUnavailable: .clipboardPaste) {
             case .inserted:
                 return .inserted
@@ -281,7 +370,7 @@ public enum TextInjector {
                 )
             case .continueWith(.clipboardPaste):
                 return pasteAttemptResult(
-                    didPaste: pasteViaClipboard(text, restoreClipboard: restoreClipboard),
+                    didPaste: valid() && pasteViaClipboard(text, restoreClipboard: restoreClipboard),
                     targetName: "editor"
                 )
             case .continueWith:
@@ -291,7 +380,7 @@ public enum TextInjector {
         case .webClipboardPaste:
             NSLog("Nuvi/inject: web target → clipboard paste")
             return pasteAttemptResult(
-                didPaste: pasteViaClipboard(text, restoreClipboard: restoreClipboard),
+                didPaste: valid() && pasteViaClipboard(text, restoreClipboard: restoreClipboard),
                 targetName: "web field"
             )
 
@@ -301,7 +390,7 @@ public enum TextInjector {
 
         // Native apps: direct Accessibility insertion where supported.
         if let element {
-            let outcome = axSelectedTextInsertVerified(element, text)
+            let outcome = await axSelectedTextInsertVerified(element, text, valid: valid)
             switch continuation(after: outcome, whenUnavailable: .nextAXTarget) {
             case .inserted:
                 NSLog("Nuvi/inject: verified direct AX insert")
@@ -318,7 +407,7 @@ public enum TextInjector {
         }
 
         if let editable {
-            let outcome = axSelectedTextInsertVerified(editable, text)
+            let outcome = await axSelectedTextInsertVerified(editable, text, valid: valid)
             switch continuation(after: outcome, whenUnavailable: .directTyping) {
             case .inserted:
                 NSLog("Nuvi/inject: verified direct AX insert via editable ancestor")
@@ -333,11 +422,12 @@ public enum TextInjector {
                 return .manualFallback("Editable-field insertion stopped before an unsafe fallback — nothing was copied or typed")
             }
             NSLog("Nuvi/inject: direct Unicode typing")
-            return typeUnicode(text)
+            return await typeUnicode(text, valid: valid)
                 ? .inserted
                 : .manualFallback("Could not type into the focused field — nothing was copied")
         }
 
+        guard valid() else { return .manualFallback("Focused target changed — nothing was copied") }
         writeClipboardOnly(text)
         NSLog("Nuvi/inject: no editable target → clipboard")
         return .clipboardOnly("Copied to clipboard — no text field focused")
@@ -379,21 +469,30 @@ public enum TextInjector {
     }
 
     @MainActor
-    private static func liveTargetIsStillFocused(_ session: LiveSession) -> Bool {
-        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == session.processIdentifier,
+    fileprivate static func liveTargetIsStillFocused(_ session: LiveSession) -> Bool {
+        if let hooks = session.hooks { return hooks.validate() }
+        guard let original = session.editableElement,
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == session.processIdentifier,
               let current = focusedElement(),
               let currentEditable = editableElement(startingAt: current) else { return false }
-        return CFEqual(currentEditable, session.editableElement)
+        return CFEqual(currentEditable, original) && classifyTargetSecurity(
+            focusedRole: stringAttributeRead(current, kAXRoleAttribute as String),
+            focusedSubrole: stringAttributeRead(current, kAXSubroleAttribute as String),
+            editableRole: stringAttributeRead(currentEditable, kAXRoleAttribute as String),
+            editableSubrole: stringAttributeRead(currentEditable, kAXSubroleAttribute as String)
+        ) == .nonSecure
     }
 
     @MainActor
     private static func liveReadbackContains(_ session: LiveSession, text: String) -> Bool? {
+        if let hooks = session.hooks { return hooks.readback(text) }
         guard !text.isEmpty else { return true }
+        guard let element = session.editableElement else { return nil }
         guard case .value(let rawValue) = stringAttributeRead(
-            session.editableElement,
+            element,
             kAXValueAttribute as String
         ) else { return nil }
-        let metadata = editorTextMetadata(startingAt: session.editableElement)
+        let metadata = editorTextMetadata(startingAt: element)
         let value = sanitizedEditableValue(
             rawValue,
             semanticPlaceholder: metadata.semanticPlaceholder,
@@ -405,8 +504,10 @@ public enum TextInjector {
 
     @MainActor
     static func restoreLiveClipboard(_ session: LiveSession) {
-        guard let expected = session.lastClipboardWrite else { return }
-        session.clipboardSnapshot.restore(to: .general, ifCurrentStringIs: expected)
+        if let hooks = session.hooks { hooks.restore(); return }
+        guard let expected = session.lastClipboardWrite,
+              NSPasteboard.general.changeCount == session.lastClipboardChangeCount else { return }
+        session.clipboardSnapshot?.restore(to: .general, ifCurrentStringIs: expected)
         session.lastClipboardWrite = nil
     }
 
@@ -434,7 +535,9 @@ public enum TextInjector {
     /// Inserts through AX only when the resulting value can be calculated and
     /// read back. Once a write was attempted, callers must not retry via another
     /// route because that could duplicate text that the target accepted slowly.
-    private static func axSelectedTextInsertVerified(_ element: AXUIElement, _ text: String) -> AXWriteOutcome {
+    @MainActor
+    private static func axSelectedTextInsertVerified(_ element: AXUIElement, _ text: String, valid: () -> Bool) async -> AXWriteOutcome {
+        guard valid() else { return .unsafePrewrite }
         var settable: DarwinBoolean = false
         guard AXUIElementIsAttributeSettable(element, kAXSelectedTextAttribute as CFString, &settable) == .success,
               settable.boolValue else {
@@ -464,7 +567,7 @@ public enum TextInjector {
             return writeOutcome(didAttempt: true, setSucceeded: false, readbackMatches: nil)
         }
 
-        usleep(80_000)
+        guard await waitForTarget(nanoseconds: 80_000_000, valid: valid) else { return .attemptedUnverified }
         guard let rawAfter = stringAttribute(element, kAXValueAttribute as String) else {
             return writeOutcome(didAttempt: true, setSucceeded: true, readbackMatches: nil)
         }
@@ -478,11 +581,14 @@ public enum TextInjector {
         case appendToEnd
     }
 
+    @MainActor
     private static func axValueInsertVerified(
         _ element: AXUIElement,
         _ text: String,
-        insertion: AXValueInsertion = .selectedRange
-    ) -> AXWriteOutcome {
+        insertion: AXValueInsertion = .selectedRange,
+        valid: () -> Bool
+    ) async -> AXWriteOutcome {
+        guard valid() else { return .unsafePrewrite }
         var settable = DarwinBoolean(false)
         guard AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &settable) == .success,
               settable.boolValue else {
@@ -522,7 +628,7 @@ public enum TextInjector {
             return writeOutcome(didAttempt: true, setSucceeded: false, readbackMatches: nil)
         }
 
-        usleep(80_000)
+        guard await waitForTarget(nanoseconds: 80_000_000, valid: valid) else { return .attemptedUnverified }
         guard let rawAfter = stringAttribute(element, kAXValueAttribute as String) else {
             return writeOutcome(didAttempt: true, setSucceeded: true, readbackMatches: nil)
         }
@@ -879,9 +985,12 @@ public enum TextInjector {
     ]
 
     @discardableResult
-    private static func typeUnicode(_ text: String) -> Bool {
+    @MainActor
+    static func typeUnicode(_ text: String, valid: () -> Bool,
+                            post: (([UniChar]) -> Bool)? = nil,
+                            sleep: (UInt64) async throws -> Void = { try await Task.sleep(nanoseconds: $0) }) async -> Bool {
         if text.isEmpty { return true }
-        let source = CGEventSource(stateID: .hidSystemState)
+        let source = post == nil ? CGEventSource(stateID: .hidSystemState) : nil
         source?.localEventsSuppressionInterval = 0
 
         let units = Array(text.utf16)
@@ -890,14 +999,18 @@ public enum TextInjector {
         var postedEvent = false
 
         while offset < units.count {
+            guard valid() else { return false }
             let end = min(offset + chunkSize, units.count)
             var chunk = Array(units[offset..<end])
-            if let event = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true) {
+            if let post {
+                guard post(chunk) else { return false }
+                postedEvent = true
+            } else if let event = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true) {
                 event.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: &chunk)
                 event.post(tap: .cghidEventTap)
                 postedEvent = true
             }
-            usleep(12_000)
+            guard await waitForTarget(nanoseconds: 12_000_000, valid: valid, sleep: sleep) else { return false }
             offset = end
         }
         return postedEvent
@@ -920,7 +1033,6 @@ public enum TextInjector {
             ) else { return false }
             keyDown.post(tap: .cghidEventTap)
             keyUp.post(tap: .cghidEventTap)
-            usleep(4_000)
         }
         return true
     }
@@ -937,13 +1049,15 @@ public enum TextInjector {
             snapshot.restore(to: pasteboard, ifCurrentStringIs: text)
             return false
         }
+        let writeCount = pasteboard.changeCount
         guard sendPaste() else {
-            snapshot.restore(to: pasteboard, ifCurrentStringIs: text)
+            snapshot.restore(to: pasteboard, ifCurrentStringIs: text, changeCount: writeCount)
             return false
         }
 
         guard restoreClipboard else { return true }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+            guard pasteboard.changeCount == writeCount else { return }
             snapshot.restore(to: pasteboard, ifCurrentStringIs: text)
         }
         return true
@@ -983,43 +1097,52 @@ final class SystemLiveTextInjector: LiveTextInserting {
         return session != nil
     }
 
-    func update(_ text: String) -> Bool {
+    func update(_ text: String) async -> Bool {
         guard let session else { return false }
-        return TextInjector.updateLiveSession(session, with: text)
+        return await TextInjector.updateLiveSession(session, with: text)
     }
 
-    func finish(_ text: String, restoreClipboard: Bool) -> InjectionResult {
+    func finish(_ text: String, restoreClipboard: Bool) async -> InjectionResult {
         guard let active = session else {
-            return TextInjector.insert(text, restoreClipboard: restoreClipboard)
+            return await TextInjector.insert(text, restoreClipboard: restoreClipboard)
         }
-        defer { session = nil }
-        let updateSucceeded = TextInjector.updateLiveSession(active, with: text)
-        guard TextInjector.liveDeliveryConfirmation(
-            updateSucceeded: updateSucceeded,
-            readbackVerified: active.lastUpdateWasVerified
-        ) == .inserted else {
-            let pasteboard = NSPasteboard.general
-            pasteboard.clearContents()
-            pasteboard.setString(text, forType: .string)
-            let reason = updateSucceeded
-                ? "Live text was sent, but the target did not confirm insertion"
-                : "Live target changed — final text copied to clipboard"
-            return .clipboardOnly(reason)
-        }
-        if restoreClipboard {
-            TextInjector.restoreLiveClipboard(active)
-        } else {
-            let pasteboard = NSPasteboard.general
-            pasteboard.clearContents()
-            pasteboard.setString(text, forType: .string)
-        }
-        return .inserted
+        defer { if session === active { session = nil } }
+        return (try? await TextInsertionQueue.shared.run { [self] in
+            let updateSucceeded = await TextInjector.reviseLiveSession(active, with: text)
+            guard session === active, !Task.isCancelled,
+                  active.isValid, TextInjector.liveTargetIsStillFocused(active) else {
+                TextInjector.restoreLiveClipboard(active)
+                return .manualFallback("Live insertion stopped because its target changed")
+            }
+            guard TextInjector.liveDeliveryConfirmation(
+                updateSucceeded: updateSucceeded,
+                readbackVerified: active.lastUpdateWasVerified
+            ) == .inserted else {
+                let pasteboard = NSPasteboard.general
+                if let expected = active.lastClipboardChangeCount, pasteboard.changeCount != expected {
+                    return .manualFallback("Clipboard changed while confirming live insertion")
+                }
+                pasteboard.clearContents()
+                pasteboard.setString(text, forType: .string)
+                return .clipboardOnly("Live text was sent, but the target did not confirm insertion")
+            }
+            if restoreClipboard {
+                TextInjector.restoreLiveClipboard(active)
+            } else {
+                let pasteboard = NSPasteboard.general
+                if active.lastClipboardChangeCount == nil || pasteboard.changeCount == active.lastClipboardChangeCount {
+                    pasteboard.clearContents()
+                    pasteboard.setString(text, forType: .string)
+                }
+            }
+            return .inserted
+        }) ?? .manualFallback("Live insertion cancelled — no further text was sent")
     }
 
     func cancel() {
         guard let active = session else { return }
-        TextInjector.cancelLiveSession(active)
         session = nil
+        TextInjector.cancelLiveSession(active)
     }
 }
 
@@ -1036,7 +1159,8 @@ struct PasteboardSnapshot {
         return PasteboardSnapshot(items: items)
     }
 
-    func restore(to pasteboard: NSPasteboard, ifCurrentStringIs expected: String) {
+    func restore(to pasteboard: NSPasteboard, ifCurrentStringIs expected: String, changeCount: Int? = nil) {
+        if let changeCount, pasteboard.changeCount != changeCount { return }
         guard pasteboard.string(forType: .string) == expected else { return }
         pasteboard.clearContents()
         let restoredItems = items.map { item in
@@ -1053,5 +1177,32 @@ struct PasteboardSnapshot {
 
     private struct Item {
         let types: [(NSPasteboard.PasteboardType, Data)]
+    }
+}
+
+/// Serializes native output across suspension points and session replacements.
+@MainActor
+final class TextInsertionQueue {
+    static let shared = TextInsertionQueue()
+    private var tail: Task<Void, Never>?
+
+    func enqueue<Value>(_ operation: @escaping @MainActor () async throws -> Value) -> Task<Value, Error> {
+        let predecessor = tail
+        let work = Task { @MainActor in
+            await predecessor?.value
+            try Task.checkCancellation()
+            return try await operation()
+        }
+        tail = Task { _ = await work.result }
+        return work
+    }
+
+    func run<Value>(_ operation: @escaping @MainActor () async throws -> Value) async throws -> Value {
+        let work = enqueue(operation)
+        return try await withTaskCancellationHandler {
+            try await work.value
+        } onCancel: {
+            work.cancel()
+        }
     }
 }
