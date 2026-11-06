@@ -33,7 +33,9 @@ codesign -d --entitlements :- build/Nuvi.app
 
 Check the signer, TeamIdentifier, hardened runtime, expected entitlements,
 version, architecture and resource bundle—not just the command's exit status.
-Do not distribute an accidental ad-hoc fallback. See
+The build fails closed rather than falling back to ad-hoc signing or dropping
+entitlements. For an explicit certificate/version/build check, use
+`scripts/verify-app.sh APP --identity SHA1 --version X.Y.Z --build N`. See
 [signing caveats](development.md#signing--local-installation).
 
 Once the intended signed bundle is verified:

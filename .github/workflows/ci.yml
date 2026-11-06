@@ -16,3 +16,5 @@ jobs:
         uses: actions/checkout@v4
       - name: Run tests
         run: swift test
+      - name: Test distribution failure recovery with isolated fixtures
+        run: python3 -m unittest discover -s Tests/ScriptTests -v
